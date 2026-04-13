@@ -12,6 +12,7 @@
 //! | GET    | `/search`          | JSON fulltext search     |
 //! | GET    | `/web/<ts>/<url>`  | Wayback replay           |
 //! | GET    | `/cdx`             | CDX API (JSON)           |
+//! | GET    | `/web/timemap/cdx` | CDX timemap (Zeno/pywb)  |
 //! | GET    | `/healthz`         | Health check             |
 
 use std::sync::{Arc, Mutex};
@@ -85,9 +86,12 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         // ── JSON API ─────────────────────────────────────────────────────
         .route("/api/stats", get(api_stats_handler))
         .route("/search",    get(search_handler))
-        .route("/cdx",       get(cdx_handler))
+        .route("/cdx",               get(cdx_handler))
+        // ── CDX timemap (Zeno / gowarc deduplication) ─────────────────────
+        // Must be registered before /web/*rest so the static path wins.
+        .route("/web/timemap/cdx",   get(cdx_timemap_handler))
         // ── Wayback replay ────────────────────────────────────────────────
-        .route("/web/*rest", get(replay_handler))
+        .route("/web/*rest",         get(replay_handler))
         // ── Health ────────────────────────────────────────────────────────
         .route("/healthz",   get(health_handler))
         .layer(TraceLayer::new_for_http())
@@ -601,4 +605,94 @@ async fn cdx_handler(
     }
 
     Json(rows).into_response()
+}
+
+// ── /web/timemap/cdx — CDX timemap for Zeno/gowarc deduplication ─────────────
+//
+// gowarc's dedupe.go queries:
+//   GET /web/timemap/cdx?url=<url>&limit=-1
+//
+// Response format: space-separated plain-text, one WARC record per line:
+//   {urlkey} {timestamp} {original} {mime} {status} {digest} {length}
+//
+// The digest is returned WITHOUT the hash-algorithm prefix ("sha1:", "sha256:",
+// etc.) because gowarc strips it before comparing:
+//   digest = strings.SplitN(digest, ":", 2)[1]
+//
+// Negative `limit` values follow the pywb convention: limit=-N returns the N
+// most-recent records (tail of the time-ordered result set), most-recent first.
+// limit=-1 therefore returns the single latest capture for the URL.
+
+#[derive(Deserialize)]
+struct TimemapCdxParams {
+    url:   Option<String>,
+    limit: Option<i64>,
+}
+
+async fn cdx_timemap_handler(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<TimemapCdxParams>,
+) -> Response {
+    let raw_url = match params.url.as_deref() {
+        Some(u) if !u.is_empty() => u.to_owned(),
+        _ => return (StatusCode::BAD_REQUEST, "url parameter required").into_response(),
+    };
+
+    let surt = match to_surt(&raw_url) {
+        Ok(s)  => s,
+        Err(e) => return (StatusCode::BAD_REQUEST, format!("invalid url: {e}")).into_response(),
+    };
+
+    debug!(url = %raw_url, surt = %surt, "CDX timemap lookup");
+
+    // Fetch all captures for this SURT URL (ascending timestamp order).
+    let all = {
+        let store = state.cdx.lock().unwrap();
+        store.get_by_surt(&surt)
+    };
+    let all = match all {
+        Ok(r)  => r,
+        Err(e) => {
+            error!(err = %e, "CDX timemap query failed");
+            return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+        }
+    };
+
+    // Apply limit.  Positive N → first N (oldest).  Negative N → last N
+    // (most-recent), returned most-recent-first.
+    let limit = params.limit.unwrap_or(i64::MAX);
+    let records: Vec<_> = if limit < 0 {
+        let n = limit.unsigned_abs() as usize;
+        all.into_iter().rev().take(n).collect()
+    } else {
+        all.into_iter().take(limit as usize).collect()
+    };
+
+    // Serialise as space-separated plain text.
+    // Digest field: strip the hash-algorithm prefix so gowarc can compare it
+    // directly to the raw digest it computed locally.
+    let mut body = String::new();
+    for r in &records {
+        let mime   = r.mime.as_deref().unwrap_or("-");
+        let status = r.status.map(|s| s.to_string()).unwrap_or_else(|| "-".to_owned());
+        let raw_dig = r.digest.as_deref().unwrap_or("-");
+        let digest  = raw_dig.find(':')
+            .map(|i| &raw_dig[i + 1..])
+            .unwrap_or(raw_dig);
+        let _ = std::fmt::write(
+            &mut body,
+            format_args!(
+                "{} {} {} {} {} {} {}\n",
+                r.surt_url, r.timestamp, r.original_url,
+                mime, status, digest, r.length,
+            ),
+        );
+    }
+
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+        body,
+    )
+        .into_response()
 }

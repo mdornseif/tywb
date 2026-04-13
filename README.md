@@ -16,9 +16,12 @@ Commands:
 - **Fulltext search** — Tantivy-powered, ~30 MB idle RAM regardless of index size
 - **Wayback replay** — `GET /web/{timestamp}/{url}` fetches only the relevant bytes via S3 Range GET; a 10 GB WARC costs one small range request per replay
 - **CDX API** — Wayback-compatible `/cdx` endpoint with exact and prefix URL lookup
+- **CDX timemap** — `GET /web/timemap/cdx` compatible with Zeno and gowarc deduplication
+- **Domain browser** — hierarchical TLD → domain → captures navigation at `/ui/browse`
 - **S3-compatible storage** — works with AWS S3, MinIO, Cloudflare R2, Backblaze B2
 - **Incremental indexing** — ETag-based state file skips unchanged objects on re-runs
 - **SQLite CDX index** — WAL-mode, concurrent reads, no daemon overhead
+- **Compressed WARC replay** — per-gzip-member offsets stored in CDX so `.warc.gz` replay is a targeted range GET, not a full decompression
 
 ## Architecture
 
@@ -145,7 +148,7 @@ This is compatible with standard Wayback Machine client tooling and browser exte
 ### CDX API
 
 ```
-GET /cdx?url=<url>[&from=<ts>][&to=<ts>][&limit=<n>]
+GET /cdx?url=<url>[&from=<ts>][&to=<ts>][&limit=<n>][&matchType=prefix]
 ```
 
 Returns index entries as a JSON array of arrays (CDX-API format). Append `*` to `url` for a prefix search over a whole domain.
@@ -167,11 +170,75 @@ curl 'http://localhost:8080/cdx?url=example.com/*&limit=100'
 ]
 ```
 
+### CDX timemap (Zeno / gowarc deduplication)
+
+```
+GET /web/timemap/cdx?url=<url>[&limit=<n>]
+```
+
+Returns captures for a URL as space-separated plain text, one record per line — the format used by [Zeno](https://github.com/internetarchive/Zeno) and [gowarc](https://github.com/internetarchive/gowarc) for CDX-based WARC deduplication.
+
+Each line has seven fields:
+
+```
+{urlkey} {timestamp} {original} {mime} {status} {digest} {length}
+```
+
+The digest is returned **without** the hash-algorithm prefix (`sha1:`, `sha256:`, etc.) to match what gowarc expects.
+
+`limit` follows the pywb convention: positive values return the N oldest captures; negative values return the N most-recent captures (e.g. `limit=-1` returns the single latest capture). gowarc always uses `limit=-1`.
+
+```bash
+# Most recent capture (gowarc dedup query)
+curl 'http://localhost:8080/web/timemap/cdx?url=https://example.com/&limit=-1'
+# → com,example)/ 20240315120000 https://example.com/ text/html 200 ABCDEF1234 8192
+
+# Five oldest captures
+curl 'http://localhost:8080/web/timemap/cdx?url=https://example.com/&limit=5'
+```
+
+To use tywb as a deduplication server with Zeno, pass:
+
+```
+--warc-cdx-dedupe-server http://<tywb-host>:8080
+```
+
+### Domain browser
+
+The web UI at `/ui/browse` provides a three-level hierarchy:
+
+- `/ui/browse` — TLDs sorted by capture count
+- `/ui/browse?tld=de` — domains under a TLD
+- `/ui/browse?domain=example.de` — all captures for a domain
+
 ### Health check
 
 ```
 GET /healthz  →  200 OK
 ```
+
+## SQLite schema
+
+Two tables are maintained in `cdx.db`:
+
+**`cdx`** — one row per indexed WARC record:
+
+| Column | Description |
+|--------|-------------|
+| `surt_url` | SURT-canonicalized URL (primary key component) |
+| `timestamp` | 14-digit capture timestamp (primary key component) |
+| `original` | Original URL |
+| `mime` | HTTP Content-Type of the response body |
+| `status` | HTTP status code |
+| `digest` | `WARC-Block-Digest` (e.g. `sha1:ABC…`) |
+| `s3_key` | S3 object key of the WARC file |
+| `offset` | Byte offset of the record in the uncompressed stream |
+| `length` | Content-Length of the record block |
+| `c_offset` | Compressed byte offset of the gzip member (`.warc.gz` only) |
+
+**`warc_files`** — one row per indexed WARC file with ingest statistics (record counts, date range, MIME histogram, throughput, S3 bucket name).
+
+**`warcinfo`** — the `warcinfo` WARC record from the start of each file, stored verbatim as text plus a JSON-serialized header array. Useful for auditing crawler software versions, operator metadata, etc.
 
 ## Index statistics
 
@@ -205,7 +272,7 @@ Ingest state  (./var/list_state.json)
   Files seen:          42
 ```
 
-Per-file metadata (MIME histogram, date range, throughput, error counts) is also recorded in the `warc_files` table of `cdx.db` after each successful index run.
+Per-file metadata (MIME histogram, date range, throughput, error counts, bucket name) is recorded in the `warc_files` table of `cdx.db` after each successful index run.
 
 ## Configuration reference
 
