@@ -13,10 +13,12 @@ use std::time::Instant;
 
 use anyhow::Context;
 use bytes::Bytes;
+use serde_json;
 use tracing::{info, warn, error};
 
-use warc::WarcIter;
-use warc_search_cdx::{CdxRecord, CdxStore, WarcFileMeta, from_warc_record};
+use warc::{WarcIter, WarcReader};
+use warc_search_cdx::{CdxRecord, CdxStore, WarcFileMeta, WarcInfoRecord, from_warc_record};
+use crate::gz_warc::GzSplitter;
 use warc_search_config::{Config, IndexerConfig};
 use warc_search_s3::{build_client, ListState, Lister, ObjectMeta, default_state_path, get_stream};
 use warc_search_search::{SearchIndex, IndexDoc};
@@ -254,6 +256,7 @@ pub async fn run(cfg: Config, args: IndexArgs) -> anyhow::Result<()> {
                     etag:             obj.etag.clone(),
                     size_bytes:       obj.size,
                     indexed_at:       now_iso,
+                    bucket:           Some(cfg.s3.bucket.clone()),
                     warc_records:     stats.warc_records,
                     cdx_new:          stats.cdx_new,
                     cdx_known:        stats.cdx_known,
@@ -330,6 +333,8 @@ struct ParsedObject {
     warc_date_min: Option<String>,
     warc_date_max: Option<String>,
     mime_counts:  HashMap<String, u64>,
+    /// The first `warcinfo` record encountered in the file, if any.
+    warcinfo:     Option<WarcInfoRecord>,
 }
 
 async fn index_warc_object(
@@ -347,6 +352,7 @@ async fn index_warc_object(
 
     let is_gz = key.to_ascii_lowercase().ends_with(".gz");
     let key_owned = key.to_owned();
+    let bucket_owned = bucket.to_owned();
     let max_text = cfg.max_text_bytes;
     let index_responses = cfg.index_warc_responses;
 
@@ -367,115 +373,205 @@ async fn index_warc_object(
     let parsed: ParsedObject =
         tokio::task::spawn_blocking(move || -> anyhow::Result<ParsedObject> {
             let chan = CountingReader::new(ChannelReader::new(rx), prog_clone);
-            // .warc.gz files are concatenated gzip streams (one per record).
-            // MultiGzDecoder transparently joins all members; GzDecoder stops
-            // at the first member boundary and misses all subsequent records.
-            let reader: Box<dyn Read + Send> = if is_gz {
-                Box::new(flate2::read::MultiGzDecoder::new(chan))
-            } else {
-                Box::new(chan)
-            };
 
-            let mut out           = Vec::new();
-            let mut warc_records  = 0usize;
-            let mut skipped       = 0usize;
-            let mut errors        = 0usize;
-            let mut last_offset   = 0u64;
+            let mut out                  = Vec::new();
+            let mut warc_records         = 0usize;
+            let mut skipped              = 0usize;
+            let mut errors               = 0usize;
             let mut warc_date_min: Option<String> = None;
             let mut warc_date_max: Option<String> = None;
             let mut mime_counts: HashMap<String, u64> = HashMap::new();
+            let mut warcinfo_record: Option<WarcInfoRecord> = None;
 
             const PROGRESS_EVERY: usize = 100;
 
-            for result in WarcIter::new(reader) {
-                match result {
-                    Err(e) => {
-                        warn!(
-                            key         = %key_owned,
-                            last_offset = last_offset,
-                            err         = %e,
-                            "WARC parse error — aborting remainder of object",
-                        );
-                        errors += 1;
-                        break;
+            /// Inner helper: process one parsed WarcRecord, optionally with a
+            /// known compressed offset (`c_offset`).  Updates `out`, counters, and
+            /// shared progress state.
+            #[allow(clippy::too_many_arguments)]
+            fn handle_record(
+                record:      &warc::WarcRecord,
+                c_offset:    Option<u64>,
+                key:         &str,
+                index_resp:  bool,
+                max_text:    usize,
+                out:         &mut Vec<(CdxRecord, Option<warc_search_search::IndexDoc>)>,
+                skipped:     &mut usize,
+                errors:      &mut usize,
+                mime_counts: &mut HashMap<String, u64>,
+                warc_date_min: &mut Option<String>,
+                warc_date_max: &mut Option<String>,
+                progress:    &SharedProgress,
+                warc_records_total: usize,
+            ) {
+                // Track WARC-Date range.
+                if let Some(d) = record.header.get("WARC-Date") {
+                    let d = d.to_owned();
+                    if warc_date_min.as_deref().map_or(true, |m| d.as_str() < m) {
+                        *warc_date_min = Some(d.clone());
                     }
-                    Ok(record) => {
-                        warc_records += 1;
-                        last_offset   = record.offset;
+                    if warc_date_max.as_deref().map_or(true, |m| d.as_str() > m) {
+                        *warc_date_max = Some(d);
+                    }
+                }
 
-                        // Track WARC-Date range.
-                        if let Some(d) = record.header.get("WARC-Date") {
-                            let d = d.to_owned();
-                            if warc_date_min.as_deref().map_or(true, |m| d.as_str() < m) {
-                                warc_date_min = Some(d.clone());
-                            }
-                            if warc_date_max.as_deref().map_or(true, |m| d.as_str() > m) {
-                                warc_date_max = Some(d);
-                            }
-                        }
+                // Periodic progress log.
+                if warc_records_total % PROGRESS_EVERY == 0 {
+                    let bytes_read = progress.bytes_read.load(Ordering::Relaxed);
+                    let elapsed_ms = progress.run_start.elapsed().as_millis() as u64;
+                    let file_start = progress.file_start_ms.load(Ordering::Relaxed);
+                    let file_secs  = (elapsed_ms.saturating_sub(file_start)) as f64 / 1000.0;
+                    let rec_per_sec = if file_secs > 0.0 { warc_records_total as f64 / file_secs } else { 0.0 };
+                    let mb_per_sec  = if file_secs > 0.0 { bytes_read as f64 / 1_048_576.0 / file_secs } else { 0.0 };
+                    progress.warc_records.store(warc_records_total, Ordering::Relaxed);
+                    progress.cdx_found.store(out.len(), Ordering::Relaxed);
+                    info!(
+                        key          = %key,
+                        warc_records = warc_records_total,
+                        cdx_found    = out.len(),
+                        skipped      = *skipped,
+                        errors       = *errors,
+                        rec_per_sec  = format!("{rec_per_sec:.0}"),
+                        mb_per_sec   = format!("{mb_per_sec:.2}"),
+                        "indexing…",
+                    );
+                }
 
-                        if warc_records % PROGRESS_EVERY == 0 {
-                            // Snapshot bytes from the atomic (updated by CountingReader).
-                            let bytes_read = progress.bytes_read.load(Ordering::Relaxed);
-                            let elapsed_ms  = progress.run_start.elapsed().as_millis() as u64;
-                            let file_start  = progress.file_start_ms.load(Ordering::Relaxed);
-                            let file_secs   = (elapsed_ms.saturating_sub(file_start)) as f64 / 1000.0;
-                            let rec_per_sec = if file_secs > 0.0 { warc_records as f64 / file_secs } else { 0.0 };
-                            let mb_per_sec  = if file_secs > 0.0 { bytes_read as f64 / 1_048_576.0 / file_secs } else { 0.0 };
-                            progress.warc_records.store(warc_records, Ordering::Relaxed);
-                            progress.cdx_found.store(out.len(), Ordering::Relaxed);
-                            info!(
-                                key          = %key_owned,
-                                offset       = last_offset,
-                                warc_records = warc_records,
-                                cdx_found    = out.len(),
-                                skipped      = skipped,
-                                errors       = errors,
-                                rec_per_sec  = format!("{rec_per_sec:.0}"),
-                                mb_per_sec   = format!("{mb_per_sec:.2}"),
-                                "indexing…",
+                if !index_resp {
+                    *skipped += 1;
+                    return;
+                }
+
+                match from_warc_record(record, key) {
+                    Err(e) => {
+                        warn!(key, err = %e, "CDX extraction failed — skipping record");
+                        *errors += 1;
+                    }
+                    Ok(None) => { *skipped += 1; }
+                    Ok(Some(mut cdx_rec)) => {
+                        cdx_rec.c_offset = c_offset;
+
+                        let mime_key = cdx_rec.mime
+                            .as_deref()
+                            .map(|m| m.split(';').next().unwrap_or(m).trim())
+                            .unwrap_or("(none)")
+                            .to_owned();
+                        *mime_counts.entry(mime_key).or_insert(0) += 1;
+
+                        *progress.current_url.write().unwrap() =
+                            cdx_rec.original_url.clone();
+
+                        tracing::debug!(
+                            url    = %cdx_rec.original_url,
+                            mime   = cdx_rec.mime.as_deref().unwrap_or("-"),
+                            status = ?cdx_rec.status,
+                            c_offset,
+                            "response record",
+                        );
+                        let doc = build_index_doc(record, &cdx_rec, max_text);
+                        out.push((cdx_rec, doc));
+                    }
+                }
+            }
+
+            /// Build a `WarcInfoRecord` from a parsed warcinfo WARC record.
+            fn make_warcinfo(record: &warc::WarcRecord, s3_key: &str, bucket: &str) -> WarcInfoRecord {
+                let headers_json = serde_json::to_string(
+                    &record.header.iter()
+                        .map(|(k, v)| [k, v])
+                        .collect::<Vec<_>>(),
+                ).ok();
+                let block_text = std::str::from_utf8(&record.block)
+                    .map(|s| s.to_owned())
+                    .unwrap_or_else(|_| String::from_utf8_lossy(&record.block).into_owned());
+                WarcInfoRecord {
+                    s3_key:        s3_key.to_owned(),
+                    bucket:        Some(bucket.to_owned()),
+                    warc_date:     record.header.get("warc-date").map(str::to_owned),
+                    warc_filename: record.header.get("warc-filename").map(str::to_owned),
+                    record_id:     record.header.get("warc-record-id").map(str::to_owned),
+                    headers_json,
+                    block_text:    Some(block_text),
+                }
+            }
+
+            if is_gz {
+                // ── .warc.gz path: one gzip member per WARC record ───────────
+                // GzSplitter reads one member at a time and reports the
+                // compressed byte offset of each member.  We store that as
+                // `c_offset` in the CDX record so replay can do a targeted
+                // S3 Range GET without streaming from the beginning of the file.
+                let mut gz = GzSplitter::new(chan);
+
+                loop {
+                    let (c_offset, decompressed) = match gz.next_member() {
+                        Ok(None) => break,
+                        Ok(Some(pair)) => pair,
+                        Err(e) => {
+                            warn!(
+                                key  = %key_owned,
+                                err  = %e,
+                                "GzSplitter error — aborting remainder of object",
                             );
+                            errors += 1;
+                            break;
                         }
+                    };
 
-                        if !index_responses {
-                            skipped += 1;
+                    warc_records += 1;
+
+                    let mut rdr = WarcReader::new(std::io::Cursor::new(decompressed));
+                    let record = match rdr.next_record() {
+                        Ok(None) => { skipped += 1; continue; }
+                        Ok(Some(r)) => r,
+                        Err(e) => {
+                            warn!(key = %key_owned, c_offset, err = %e, "WARC parse error — skipping member");
+                            errors += 1;
                             continue;
                         }
+                    };
 
-                        match from_warc_record(&record, &key_owned) {
-                            Err(e) => {
-                                warn!(
-                                    key    = %key_owned,
-                                    offset = record.offset,
-                                    err    = %e,
-                                    "CDX extraction failed — skipping record",
-                                );
-                                errors += 1;
+                    if warcinfo_record.is_none() {
+                        if let Ok(warc::RecordType::Warcinfo) = record.header.record_type() {
+                            warcinfo_record = Some(make_warcinfo(&record, &key_owned, &bucket_owned));
+                        }
+                    }
+
+                    handle_record(
+                        &record, Some(c_offset), &key_owned,
+                        index_responses, max_text,
+                        &mut out, &mut skipped, &mut errors,
+                        &mut mime_counts, &mut warc_date_min, &mut warc_date_max,
+                        &progress, warc_records,
+                    );
+                }
+            } else {
+                // ── .warc path: plain stream, record.offset is the file offset
+                for result in WarcIter::new(chan) {
+                    match result {
+                        Err(e) => {
+                            warn!(
+                                key = %key_owned,
+                                err = %e,
+                                "WARC parse error — aborting remainder of object",
+                            );
+                            errors += 1;
+                            break;
+                        }
+                        Ok(record) => {
+                            warc_records += 1;
+                            if warcinfo_record.is_none() {
+                                if let Ok(warc::RecordType::Warcinfo) = record.header.record_type() {
+                                    warcinfo_record = Some(make_warcinfo(&record, &key_owned, &bucket_owned));
+                                }
                             }
-                            Ok(None) => { skipped += 1; }
-                            Ok(Some(cdx_rec)) => {
-                                // Track MIME counts.
-                                let mime_key = cdx_rec.mime
-                                    .as_deref()
-                                    .map(|m| m.split(';').next().unwrap_or(m).trim())
-                                    .unwrap_or("(none)")
-                                    .to_owned();
-                                *mime_counts.entry(mime_key).or_insert(0) += 1;
-
-                                // Update current URL in shared progress.
-                                *progress.current_url.write().unwrap() =
-                                    cdx_rec.original_url.clone();
-
-                                tracing::debug!(
-                                    url    = %cdx_rec.original_url,
-                                    mime   = cdx_rec.mime.as_deref().unwrap_or("-"),
-                                    status = ?cdx_rec.status,
-                                    offset = cdx_rec.offset,
-                                    "response record",
-                                );
-                                let doc = build_index_doc(&record, &cdx_rec, max_text);
-                                out.push((cdx_rec, doc));
-                            }
+                            handle_record(
+                                &record, None, &key_owned,
+                                index_responses, max_text,
+                                &mut out, &mut skipped, &mut errors,
+                                &mut mime_counts, &mut warc_date_min, &mut warc_date_max,
+                                &progress, warc_records,
+                            );
                         }
                     }
                 }
@@ -490,11 +586,19 @@ async fn index_warc_object(
                 warc_date_min,
                 warc_date_max,
                 mime_counts,
+                warcinfo: warcinfo_record,
             })
         })
         .await
         .context("spawn_blocking panicked")?
         .context("WARC parsing failed")?;
+
+    // Store warcinfo record if found.
+    if let Some(wi) = &parsed.warcinfo {
+        if let Err(e) = cdx.upsert_warcinfo(wi) {
+            warn!(key = %key, err = %e, "could not write warcinfo record");
+        }
+    }
 
     let cdx_records: Vec<CdxRecord> = parsed.records.iter().map(|(r, _)| r.clone()).collect();
     let (cdx_new, cdx_known) = cdx
@@ -528,8 +632,19 @@ async fn index_warc_object(
 // ── Text extraction ───────────────────────────────────────────────────────────
 
 fn build_index_doc(record: &warc::WarcRecord, cdx: &CdxRecord, max_bytes: usize) -> Option<IndexDoc> {
+    // Skip non-HTTP URIs (urn:, data:, etc.) — internal crawler bookkeeping,
+    // not real pages.
+    if !cdx.original_url.starts_with("http://") && !cdx.original_url.starts_with("https://") {
+        return None;
+    }
+
     let mime = cdx.mime.as_deref().unwrap_or("");
-    if !mime.starts_with("text/html") && !mime.starts_with("text/plain") {
+    let is_html = mime.starts_with("text/html")
+        || mime.starts_with("application/xhtml")
+        || mime.starts_with("text/xml")   // some sites serve HTML as text/xml
+        || mime.starts_with("application/xml");
+    let is_text = mime.starts_with("text/plain");
+    if !is_html && !is_text {
         return None;
     }
 
@@ -537,8 +652,17 @@ fn build_index_doc(record: &warc::WarcRecord, cdx: &CdxRecord, max_bytes: usize)
     let truncated = if body.len() > max_bytes * 4 { &body[..max_bytes * 4] } else { body };
     let text = String::from_utf8_lossy(truncated);
 
-    let title = extract_title(&text);
-    let body_text = strip_html(&text);
+    let (title, body_text) = if is_html {
+        let t = extract_title(&text);
+        let b = strip_html(&text);
+        (t, b)
+    } else {
+        // text/plain: use first line as title, rest as body
+        let mut lines = text.splitn(2, '\n');
+        let first = lines.next().unwrap_or("").trim().chars().take(256).collect();
+        let rest  = lines.next().unwrap_or("").to_owned();
+        (first, rest)
+    };
     let body_text = if body_text.len() > max_bytes {
         body_text[..max_bytes].to_owned()
     } else {

@@ -20,9 +20,11 @@ use tracing::info;
 
 use warc_search_config::Config;
 
+mod gz_warc;
 mod index;
 mod server;
 mod stats;
+mod ui;
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
 

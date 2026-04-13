@@ -28,6 +28,12 @@ pub struct CdxRecord {
     pub offset: u64,
     /// Byte length of the record block (Content-Length value).
     pub length: u64,
+    /// Compressed byte offset of the gzip member in the `.warc.gz` S3 object.
+    ///
+    /// `None` for uncompressed `.warc` files, or for records indexed before
+    /// this field was introduced.  When `Some`, the replay handler should use
+    /// this offset for the S3 Range GET instead of `offset`.
+    pub c_offset: Option<u64>,
 }
 
 impl CdxRecord {
@@ -79,10 +85,18 @@ pub fn from_warc_record(
     let dt = warc.header.date()?;
     let timestamp = format_timestamp(&dt);
 
-    let mime = warc.header.content_type().map(|s| {
-        // Strip parameters: "text/html; charset=utf-8" → "text/html"
-        s.split(';').next().unwrap_or(s).trim().to_owned()
+    // The WARC Content-Type for response records is usually
+    // "application/http; msgtype=response" — that describes the WARC container,
+    // not the page.  Extract the real MIME from the HTTP response headers inside
+    // the block instead.  Fall back to the WARC Content-Type for resource records
+    // (PDFs, images, etc.) where it IS the actual MIME type.
+    let warc_ct = warc.header.content_type().map(|s| {
+        s.split(';').next().unwrap_or(s).trim().to_ascii_lowercase()
     });
+    let mime = match warc_ct.as_deref() {
+        Some("application/http") | None => extract_http_content_type(&warc.block),
+        Some(_) => warc_ct,
+    };
 
     // Try to extract HTTP status from the response block
     let status = extract_http_status(&warc.block);
@@ -100,6 +114,7 @@ pub fn from_warc_record(
         s3_key: s3_key.to_owned(),
         offset: warc.offset,
         length,
+        c_offset: None, // set by the caller for .warc.gz files
     }))
 }
 
@@ -113,6 +128,36 @@ fn extract_http_status(block: &[u8]) -> Option<u16> {
     let mut parts = line.split_whitespace();
     parts.next()?; // HTTP/1.x
     parts.next()?.parse::<u16>().ok()
+}
+
+/// Extract the `Content-Type` MIME type from HTTP response headers in `block`.
+///
+/// Strips parameters (`text/html; charset=utf-8` → `text/html`) and lower-cases
+/// the result.  Returns `None` if no `Content-Type` header is present.
+fn extract_http_content_type(block: &[u8]) -> Option<String> {
+    // Find end of HTTP header section (\r\n\r\n).
+    let hdr_end = block.windows(4).position(|w| w == b"\r\n\r\n")
+        .unwrap_or(block.len());
+    let hdr_str = std::str::from_utf8(&block[..hdr_end]).ok()?;
+
+    // Skip the HTTP status line and scan headers.
+    for line in hdr_str.lines().skip(1) {
+        if line.is_empty() { break; }
+        if let Some((name, val)) = line.split_once(':') {
+            if name.trim().eq_ignore_ascii_case("content-type") {
+                let mime = val.trim()
+                    .split(';')
+                    .next()
+                    .unwrap_or(val.trim())
+                    .trim()
+                    .to_ascii_lowercase();
+                if !mime.is_empty() {
+                    return Some(mime);
+                }
+            }
+        }
+    }
+    None
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -329,6 +374,49 @@ mod tests {
         );
         let cdx = from_warc_record(&rec, "test.warc").unwrap().unwrap();
         assert_eq!(cdx.mime.as_deref(), Some("text/html"));
+    }
+
+    // When the WARC Content-Type is "application/http" (the standard WARC
+    // container type for response records), we must look inside the HTTP
+    // block to get the real MIME type.
+    #[test]
+    fn from_warc_response_with_application_http_content_type() {
+        let block = b"HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n\r\n<html/>";
+        let rec = make_warc_record(
+            &[
+                ("WARC-Type", "response"),
+                ("WARC-Date", "2024-03-15T12:00:00Z"),
+                ("WARC-Record-ID", "<urn:uuid:test-0010>"),
+                ("WARC-Target-URI", "https://example.com/"),
+                // Standard WARC Content-Type for response records
+                ("Content-Type", "application/http; msgtype=response"),
+                ("Content-Length", &block.len().to_string()),
+            ],
+            block,
+            0,
+        );
+        let cdx = from_warc_record(&rec, "test.warc.gz").unwrap().unwrap();
+        // Must use HTTP Content-Type, not WARC Content-Type
+        assert_eq!(cdx.mime.as_deref(), Some("text/html"));
+    }
+
+    #[test]
+    fn from_warc_response_application_http_json() {
+        let block = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{}";
+        let rec = make_warc_record(
+            &[
+                ("WARC-Type", "response"),
+                ("WARC-Date", "2024-03-15T12:00:00Z"),
+                ("WARC-Record-ID", "<urn:uuid:test-0011>"),
+                ("WARC-Target-URI", "https://api.example.com/data"),
+                ("Content-Type", "application/http; msgtype=response"),
+                ("Content-Length", &block.len().to_string()),
+            ],
+            block,
+            0,
+        );
+        let cdx = from_warc_record(&rec, "test.warc.gz").unwrap().unwrap();
+        assert_eq!(cdx.mime.as_deref(), Some("application/json"));
     }
 
     #[test]

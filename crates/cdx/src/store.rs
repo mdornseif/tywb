@@ -24,6 +24,7 @@ CREATE TABLE IF NOT EXISTS cdx (
     s3_key      TEXT    NOT NULL,
     offset      INTEGER NOT NULL,
     length      INTEGER NOT NULL,
+    c_offset    INTEGER,            -- compressed offset of gzip member (NULL for .warc)
     PRIMARY KEY (surt_url, timestamp)
 );
 
@@ -47,7 +48,18 @@ CREATE TABLE IF NOT EXISTS warc_files (
     records_per_sec  REAL,
     warc_date_min    TEXT,             -- earliest WARC-Date seen in this file
     warc_date_max    TEXT,             -- latest WARC-Date seen in this file
-    mime_summary     TEXT              -- JSON object: {\"text/html\": 42, ...}
+    mime_summary     TEXT,             -- JSON object: {\"text/html\": 42, ...}
+    bucket           TEXT              -- S3 bucket name this file was read from
+);
+
+CREATE TABLE IF NOT EXISTS warcinfo (
+    s3_key        TEXT    NOT NULL PRIMARY KEY,  -- links to warc_files.s3_key
+    bucket        TEXT,                          -- S3 bucket name
+    warc_date     TEXT,                          -- WARC-Date header value
+    warc_filename TEXT,                          -- WARC-Filename header value
+    record_id     TEXT,                          -- WARC-Record-ID header value
+    headers_json  TEXT,                          -- JSON array of [name, value] pairs
+    block_text    TEXT                           -- UTF-8 (lossy) content of the block
 );
 ";
 
@@ -69,6 +81,8 @@ pub struct WarcFileMeta {
     pub size_bytes:       u64,
     /// ISO8601 UTC timestamp of this indexing run.
     pub indexed_at:       String,
+    /// S3 bucket this file was read from.
+    pub bucket:           Option<String>,
     pub warc_records:     usize,
     pub cdx_new:          usize,
     pub cdx_known:        usize,
@@ -84,6 +98,42 @@ pub struct WarcFileMeta {
     pub warc_date_max:    Option<String>,
     /// JSON object mapping MIME type → record count.
     pub mime_summary:     Option<String>,
+}
+
+/// One row of the `warcinfo` table — the parsed `warcinfo` WARC record
+/// from the start of each WARC file.
+#[derive(Debug, Default)]
+pub struct WarcInfoRecord {
+    /// S3 key of the WARC file this record came from.
+    pub s3_key:        String,
+    /// S3 bucket name.
+    pub bucket:        Option<String>,
+    /// `WARC-Date` header value (ISO8601).
+    pub warc_date:     Option<String>,
+    /// `WARC-Filename` header value, if present.
+    pub warc_filename: Option<String>,
+    /// `WARC-Record-ID` header value.
+    pub record_id:     Option<String>,
+    /// All WARC header fields serialized as a JSON array of `[name, value]` pairs.
+    pub headers_json:  Option<String>,
+    /// UTF-8 (lossy) text of the warcinfo block (typically `application/warc-fields`).
+    pub block_text:    Option<String>,
+}
+
+/// Lightweight row returned by [`CdxStore::recent_warc_files`].
+/// All nullable columns from `warc_files` are wrapped in `Option`.
+#[derive(Debug)]
+pub struct WarcFileRow {
+    pub s3_key:           String,
+    pub last_indexed:     String,
+    pub warc_records:     i64,
+    pub cdx_new:          i64,
+    pub cdx_known:        i64,
+    pub fulltext_indexed: i64,
+    pub errors:           i64,
+    pub size_bytes:       Option<i64>,
+    pub duration_secs:    Option<f64>,
+    pub records_per_sec:  Option<f64>,
 }
 
 // ── Stats ─────────────────────────────────────────────────────────────────────
@@ -129,6 +179,9 @@ impl CdxStore {
     fn init(&self) -> Result<()> {
         self.conn.execute_batch(PRAGMAS)?;
         self.conn.execute_batch(SCHEMA)?;
+        // Migrations: ALTER TABLE ADD COLUMN silently fails if column already exists.
+        let _ = self.conn.execute("ALTER TABLE cdx ADD COLUMN c_offset INTEGER", []);
+        let _ = self.conn.execute("ALTER TABLE warc_files ADD COLUMN bucket TEXT", []);
         Ok(())
     }
 
@@ -146,8 +199,8 @@ impl CdxStore {
     pub fn upsert(&self, r: &CdxRecord) -> Result<()> {
         self.conn.execute(
             "INSERT OR REPLACE INTO cdx
-             (surt_url, timestamp, original, mime, status, digest, s3_key, offset, length)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+             (surt_url, timestamp, original, mime, status, digest, s3_key, offset, length, c_offset)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 r.surt_url,
                 r.timestamp,
@@ -158,6 +211,7 @@ impl CdxStore {
                 r.s3_key,
                 r.offset as i64,
                 r.length as i64,
+                r.c_offset.map(|v| v as i64),
             ],
         )?;
         Ok(())
@@ -182,27 +236,27 @@ impl CdxStore {
             // INSERT OR IGNORE: affected rows = 1 for new, 0 for existing.
             let mut insert_stmt = tx.prepare_cached(
                 "INSERT OR IGNORE INTO cdx
-                 (surt_url, timestamp, original, mime, status, digest, s3_key, offset, length)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                 (surt_url, timestamp, original, mime, status, digest, s3_key, offset, length, c_offset)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             )?;
             // UPDATE for rows that already existed so metadata stays current.
             let mut update_stmt = tx.prepare_cached(
                 "UPDATE cdx SET original = ?3, mime = ?4, status = ?5, digest = ?6,
-                 s3_key = ?7, offset = ?8, length = ?9
+                 s3_key = ?7, offset = ?8, length = ?9, c_offset = ?10
                  WHERE surt_url = ?1 AND timestamp = ?2",
             )?;
             for r in records {
-                let p = params![
+                let c_off = r.c_offset.map(|v| v as i64);
+                let inserted = insert_stmt.execute(params![
                     r.surt_url, r.timestamp, r.original_url, r.mime,
-                    r.status, r.digest, r.s3_key, r.offset as i64, r.length as i64,
-                ];
-                let inserted = insert_stmt.execute(p)?;
+                    r.status, r.digest, r.s3_key, r.offset as i64, r.length as i64, c_off,
+                ])?;
                 if inserted == 1 {
                     new_count += 1;
                 } else {
                     update_stmt.execute(params![
                         r.surt_url, r.timestamp, r.original_url, r.mime,
-                        r.status, r.digest, r.s3_key, r.offset as i64, r.length as i64,
+                        r.status, r.digest, r.s3_key, r.offset as i64, r.length as i64, c_off,
                     ])?;
                     existing_count += 1;
                 }
@@ -226,7 +280,7 @@ impl CdxStore {
     /// Look up records for an exact SURT URL, ordered by timestamp ascending.
     pub fn get_by_surt(&self, surt_url: &str) -> Result<Vec<CdxRecord>> {
         let mut stmt = self.conn.prepare_cached(
-            "SELECT surt_url, timestamp, original, mime, status, digest, s3_key, offset, length
+            "SELECT surt_url, timestamp, original, mime, status, digest, s3_key, offset, length, c_offset
              FROM cdx WHERE surt_url = ?1 ORDER BY timestamp ASC",
         )?;
         let rows = stmt.query_map(params![surt_url], row_to_record)?;
@@ -242,7 +296,7 @@ impl CdxStore {
         to: &str,
     ) -> Result<Vec<CdxRecord>> {
         let mut stmt = self.conn.prepare_cached(
-            "SELECT surt_url, timestamp, original, mime, status, digest, s3_key, offset, length
+            "SELECT surt_url, timestamp, original, mime, status, digest, s3_key, offset, length, c_offset
              FROM cdx
              WHERE surt_url = ?1 AND timestamp >= ?2 AND timestamp <= ?3
              ORDER BY timestamp ASC",
@@ -268,7 +322,7 @@ impl CdxStore {
         let before: Option<CdxRecord> = self
             .conn
             .query_row(
-                "SELECT surt_url, timestamp, original, mime, status, digest, s3_key, offset, length
+                "SELECT surt_url, timestamp, original, mime, status, digest, s3_key, offset, length, c_offset
                  FROM cdx
                  WHERE surt_url = ?1 AND timestamp <= ?2
                  ORDER BY timestamp DESC LIMIT 1",
@@ -281,7 +335,7 @@ impl CdxStore {
         let after: Option<CdxRecord> = self
             .conn
             .query_row(
-                "SELECT surt_url, timestamp, original, mime, status, digest, s3_key, offset, length
+                "SELECT surt_url, timestamp, original, mime, status, digest, s3_key, offset, length, c_offset
                  FROM cdx
                  WHERE surt_url = ?1 AND timestamp > ?2
                  ORDER BY timestamp ASC LIMIT 1",
@@ -314,7 +368,7 @@ impl CdxStore {
         // and avoids LIKE special-character escaping.
         let end = next_prefix(prefix);
         let mut stmt = self.conn.prepare_cached(
-            "SELECT surt_url, timestamp, original, mime, status, digest, s3_key, offset, length
+            "SELECT surt_url, timestamp, original, mime, status, digest, s3_key, offset, length, c_offset
              FROM cdx
              WHERE surt_url >= ?1 AND surt_url < ?2
              ORDER BY surt_url ASC, timestamp ASC
@@ -378,6 +432,35 @@ impl CdxStore {
         })
     }
 
+    /// Return the most-recently-indexed WARC files (up to `limit`).
+    ///
+    /// Returns a lightweight row type suitable for display; columns that may be
+    /// NULL are returned as `Option`.
+    pub fn recent_warc_files(&self, limit: usize) -> Result<Vec<WarcFileRow>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT s3_key, last_indexed, warc_records, cdx_new, cdx_known,
+                    fulltext_indexed, errors, size_bytes, duration_secs, records_per_sec
+             FROM warc_files
+             ORDER BY last_indexed DESC
+             LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit as i64], |row| {
+            Ok(WarcFileRow {
+                s3_key:           row.get(0)?,
+                last_indexed:     row.get(1)?,
+                warc_records:     row.get(2)?,
+                cdx_new:          row.get(3)?,
+                cdx_known:        row.get(4)?,
+                fulltext_indexed: row.get(5)?,
+                errors:           row.get(6)?,
+                size_bytes:       row.get(7)?,
+                duration_secs:    row.get(8)?,
+                records_per_sec:  row.get(9)?,
+            })
+        })?;
+        rows.map(|r| r.map_err(CdxError::from)).collect()
+    }
+
     /// Upsert a `WarcFileMeta` row into the `warc_files` table.
     ///
     /// `first_seen` is preserved from any existing row; only `last_indexed`
@@ -386,17 +469,18 @@ impl CdxStore {
         self.conn.execute(
             "INSERT INTO warc_files
              (s3_key, etag, size_bytes, first_seen, last_indexed,
-              warc_records, cdx_new, cdx_known, fulltext_indexed, skipped, errors,
+              bucket, warc_records, cdx_new, cdx_known, fulltext_indexed, skipped, errors,
               duration_secs, bytes_per_sec, records_per_sec,
               warc_date_min, warc_date_max, mime_summary)
              VALUES (?1, ?2, ?3, ?4, ?4,
-                     ?5, ?6, ?7, ?8, ?9, ?10,
-                     ?11, ?12, ?13,
-                     ?14, ?15, ?16)
+                     ?5, ?6, ?7, ?8, ?9, ?10, ?11,
+                     ?12, ?13, ?14,
+                     ?15, ?16, ?17)
              ON CONFLICT(s3_key) DO UPDATE SET
                etag             = excluded.etag,
                size_bytes       = excluded.size_bytes,
                last_indexed     = excluded.last_indexed,
+               bucket           = excluded.bucket,
                warc_records     = excluded.warc_records,
                cdx_new          = excluded.cdx_new,
                cdx_known        = excluded.cdx_known,
@@ -414,6 +498,7 @@ impl CdxStore {
                 meta.etag,
                 meta.size_bytes as i64,
                 meta.indexed_at,
+                meta.bucket,
                 meta.warc_records as i64,
                 meta.cdx_new as i64,
                 meta.cdx_known as i64,
@@ -429,6 +514,67 @@ impl CdxStore {
             ],
         )?;
         Ok(())
+    }
+
+    /// Insert or replace a `warcinfo` record.
+    pub fn upsert_warcinfo(&self, wi: &WarcInfoRecord) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO warcinfo
+             (s3_key, bucket, warc_date, warc_filename, record_id, headers_json, block_text)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                wi.s3_key,
+                wi.bucket,
+                wi.warc_date,
+                wi.warc_filename,
+                wi.record_id,
+                wi.headers_json,
+                wi.block_text,
+            ],
+        )?;
+        Ok(())
+    }
+
+    // ── Domain browsing ───────────────────────────────────────────────────────
+
+    /// Return TLDs (first SURT component, e.g. `com`, `de`) with record counts,
+    /// sorted descending by count.
+    pub fn browse_tlds(&self, limit: usize) -> Result<Vec<(String, u64)>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT substr(surt_url, 1, instr(surt_url, ',') - 1) AS tld,
+                    COUNT(*) AS n
+             FROM   cdx
+             GROUP  BY tld
+             ORDER  BY n DESC
+             LIMIT  ?1",
+        )?;
+        let rows = stmt.query_map(params![limit as i64], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64))
+        })?;
+        rows.map(|r| r.map_err(CdxError::from)).collect()
+    }
+
+    /// Return all unique SURT domain prefixes (everything before `)`) that fall
+    /// under `tld`, with record counts sorted descending.
+    ///
+    /// E.g. for `tld = "com"` returns `("com,example", 5000)`, `("com,example,www", 1000)`, …
+    pub fn browse_domains(&self, tld: &str, limit: usize) -> Result<Vec<(String, u64)>> {
+        // Lower bound: "com,"  Upper bound: "com-" (ASCII 0x2D = 0x2C + 1)
+        let lower = format!("{},", tld);
+        let upper = next_prefix(&lower);
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT substr(surt_url, 1, instr(surt_url, ')') - 1) AS surt_domain,
+                    COUNT(*) AS n
+             FROM   cdx
+             WHERE  surt_url >= ?1 AND surt_url < ?2
+             GROUP  BY surt_domain
+             ORDER  BY n DESC
+             LIMIT  ?3",
+        )?;
+        let rows = stmt.query_map(params![lower, upper, limit as i64], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64))
+        })?;
+        rows.map(|r| r.map_err(CdxError::from)).collect()
     }
 
     /// Check whether a record exists for this (surt_url, timestamp) pair.
@@ -455,6 +601,7 @@ fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<CdxRecord> {
         s3_key:       row.get(6)?,
         offset:       row.get::<_, i64>(7)? as u64,
         length:       row.get::<_, i64>(8)? as u64,
+        c_offset:     row.get::<_, Option<i64>>(9)?.map(|v| v as u64),
     })
 }
 
@@ -502,6 +649,7 @@ mod tests {
             s3_key:       "test/archive.warc.gz".to_owned(),
             offset:       1024,
             length:       512,
+            c_offset:     None,
         }
     }
 
