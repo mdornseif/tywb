@@ -1,0 +1,23 @@
+# Rust build artifacts
+/target/
+
+# Local runtime data (index, CDX database, ingest state)
+/var/
+*.db
+*.db-wal
+*.db-shm
+
+# Local config overrides (never commit real credentials)
+config.local.yaml
+
+# macOS finder metadata
+.DS_Store
+
+# Editor / IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Log files
+*.log

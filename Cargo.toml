@@ -1,0 +1,54 @@
+[workspace]
+members = [
+    "crates/warc",
+    "crates/config",
+    "crates/cdx",
+    "crates/s3_store",
+    "crates/search",
+    "crates/tywb",
+]
+resolver = "2"
+
+[workspace.package]
+version     = "0.1.0"
+edition     = "2021"
+authors     = ["tiny-wayback contributors"]
+license     = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+# async runtime
+tokio        = { version = "1", features = ["full"] }
+# HTTP server
+axum         = { version = "0.7" }
+tower        = { version = "0.4" }
+tower-http   = { version = "0.5", features = ["trace", "cors"] }
+# S3
+aws-sdk-s3           = { version = "1" }
+aws-config           = { version = "1" }
+aws-credential-types = { version = "1" }
+# compression
+async-compression = { version = "0.4", features = ["tokio", "gzip"] }
+flate2            = { version = "1" }
+# storage
+rusqlite = { version = "0.31", features = ["bundled"] }
+# search
+tantivy = { version = "0.22" }
+# serialization
+serde       = { version = "1", features = ["derive"] }
+serde_json  = { version = "1" }
+serde_yaml  = { version = "0.9" }
+# error handling
+thiserror = { version = "1" }
+anyhow    = { version = "1" }
+# logging
+tracing            = { version = "0.1" }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# misc
+bytes    = { version = "1" }
+chrono   = { version = "0.4", features = ["serde"] }
+url      = { version = "2" }
+uuid     = { version = "1", features = ["v4"] }
+config   = { version = "0.14" }
+tempfile = { version = "3" }
+futures-util = { version = "0.3" }
+clap         = { version = "4", features = ["derive"] }

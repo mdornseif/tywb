@@ -1,0 +1,90 @@
+# warc-search configuration
+# All values here can be overridden by environment variables.
+# See the mapping in config/src/lib.rs for the full list.
+#
+# AWS credentials follow standard AWS SDK precedence:
+#   1. Environment variables (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, etc.)
+#   2. Values in this file (only if env vars are absent)
+#   3. ~/.aws/credentials / instance metadata (standard SDK fallback)
+
+# ── S3 / Object Storage ──────────────────────────────────────────────────────
+s3:
+  # Required: bucket containing WARC and PDF files.
+  bucket: "warc"
+
+  # AWS region (or S3-compatible region string).
+  region: "garage"
+
+  # Optional: custom endpoint for MinIO, Cloudflare R2, Backblaze B2, etc.
+  # Leave unset to use standard AWS S3.
+  endpoint_url: "https://s3.dornseif.cloud"
+
+  # Optional: force path-style addressing (required for MinIO / some S3-compat).
+  force_path_style: true
+
+  # Credentials — prefer env vars (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY).
+  # Only set here if you cannot use environment variables.
+  # access_key_id:     ""
+  # secret_access_key: ""
+
+  # Optional: prefix to scope bucket listing (e.g. "crawls/2024/")
+  # prefix: ""
+
+  # Concurrency for S3 listing / parallel ingest workers.
+  concurrency: 4
+
+# ── Index Storage (local) ────────────────────────────────────────────────────
+storage:
+  # Directory for Tantivy fulltext index.
+  # index_path: "/var/lib/warc-search/index"
+  index_path: "./var/index"
+
+  # Path to SQLite CDX database.
+  # cdx_db_path: "/var/lib/warc-search/cdx.db"
+  cdx_db_path: "./var/cdx.db"
+
+  # SQLite page cache size in KiB (negative = number of pages × page_size).
+  # 8192 KiB = 8 MiB — intentionally small to stay RAM-friendly.
+  sqlite_cache_kib: 8192
+
+# ── Indexer ───────────────────────────────────────────────────────────────────
+indexer:
+  # How many Tantivy documents to accumulate before committing to disk.
+  # Larger batches = faster ingest, more peak RAM during ingest.
+  batch_size: 5000
+
+  # Maximum body text length to extract per record (bytes).
+  # Prevents huge documents from dominating index memory.
+  max_text_bytes: 524288  # 512 KiB
+
+  # Whether to index PDF files found in the bucket.
+  index_pdfs: true
+
+  # Whether to index WARC response records.
+  index_warc_responses: true
+
+  # Glob patterns to skip (matched against WARC-Target-URI or S3 key).
+  # skip_patterns:
+  #   - "*.css"
+  #   - "*.js"
+
+# ── Server ────────────────────────────────────────────────────────────────────
+server:
+  # Address and port to bind the HTTP server.
+  bind: "0.0.0.0:8080"
+
+  # Maximum number of search results to return per query.
+  max_results: 50
+
+  # Enable the Wayback-compatible replay API at /web/{timestamp}/{url}.
+  enable_replay: true
+
+  # Optional: static files directory for the web UI.
+  # Leave unset to serve only the JSON API.
+  # static_dir: "/var/lib/warc-search/ui"
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+log:
+  # Tracing filter — same syntax as RUST_LOG.
+  # Can be overridden with the RUST_LOG environment variable.
+  level: "info"

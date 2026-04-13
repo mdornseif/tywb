@@ -1,0 +1,50 @@
+[package]
+name        = "tywb"
+description = "Tiny Wayback — WARC fulltext search and Wayback-compatible replay"
+version.workspace     = true
+edition.workspace     = true
+authors.workspace     = true
+license.workspace     = true
+
+[[bin]]
+name = "tywb"
+path = "src/main.rs"
+
+[dependencies]
+# internal
+warc                = { path = "../warc" }
+warc-search-config  = { path = "../config" }
+warc-search-cdx     = { path = "../cdx" }
+warc-search-s3      = { path = "../s3_store" }
+warc-search-search  = { path = "../search" }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# async
+tokio        = { workspace = true }
+futures-util = { workspace = true, features = ["std"] }
+
+# HTTP server
+axum       = { workspace = true }
+tower-http = { workspace = true }
+
+# S3
+aws-sdk-s3 = { workspace = true }
+
+# compression
+flate2 = { workspace = true }
+
+# serialization
+serde      = { workspace = true }
+serde_json = { workspace = true }
+
+# error handling
+anyhow = { workspace = true }
+
+# logging
+tracing            = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# misc
+bytes = { workspace = true }

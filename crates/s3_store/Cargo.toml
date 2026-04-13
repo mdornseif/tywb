@@ -1,0 +1,25 @@
+[package]
+name        = "warc-search-s3"
+description = "S3 object storage access: listing, streaming GET, Range GET for WARC replay"
+version.workspace    = true
+edition.workspace    = true
+authors.workspace    = true
+license.workspace    = true
+
+[dependencies]
+warc-search-config = { path = "../config" }
+thiserror          = { workspace = true }
+tokio              = { workspace = true }
+bytes              = { workspace = true }
+aws-sdk-s3         = { workspace = true }
+aws-config         = { workspace = true }
+aws-credential-types = { workspace = true }
+async-compression  = { workspace = true }
+tracing            = { workspace = true }
+serde              = { workspace = true }
+serde_json         = { workspace = true }
+futures-util       = "0.3"
+
+[dev-dependencies]
+tokio    = { workspace = true }
+tempfile = { workspace = true }

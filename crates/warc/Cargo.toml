@@ -1,0 +1,16 @@
+[package]
+name        = "warc"
+description = "Streaming WARC (Web ARChive) parser — no_std compatible core types"
+version.workspace    = true
+edition.workspace    = true
+authors.workspace    = true
+license.workspace    = true
+
+[dependencies]
+thiserror = { workspace = true }
+chrono    = { workspace = true }
+bytes     = { workspace = true }
+
+[dev-dependencies]
+# for async tests
+tokio = { workspace = true }

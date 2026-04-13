@@ -1,0 +1,584 @@
+//! Tantivy fulltext index wrapper for warc-search.
+//!
+//! Provides two types:
+//! - [`SearchIndex`]: open/create, add documents, commit.  Used by the indexer.
+//! - [`SearchReader`]: open an existing index read-only.  Used by the server.
+
+use std::path::Path;
+use tantivy::{
+    Index, IndexWriter, IndexReader, ReloadPolicy, TantivyDocument,
+    schema::{Schema, Field, NumericOptions, STRING, TEXT, STORED},
+    directory::MmapDirectory,
+    query::QueryParser,
+    collector::TopDocs,
+};
+use thiserror::Error;
+
+// ── Error ─────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Error)]
+pub enum SearchError {
+    #[error("tantivy error: {0}")]
+    Tantivy(#[from] tantivy::TantivyError),
+    #[error("query parse error: {0}")]
+    QueryParse(#[from] tantivy::query::QueryParserError),
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("schema field not found: {0}")]
+    FieldNotFound(String),
+}
+
+pub type Result<T> = std::result::Result<T, SearchError>;
+
+// ── Document types ────────────────────────────────────────────────────────────
+
+/// A document to add to the fulltext index.
+#[derive(Debug, Clone)]
+pub struct IndexDoc {
+    /// Original URL (e.g. `https://example.com/page`).
+    pub url: String,
+    /// 14-digit capture timestamp as u64 (e.g. `20240315120000`).
+    pub timestamp: u64,
+    /// Page title (extracted from `<title>` or similar).
+    pub title: String,
+    /// Page body text, HTML-stripped and truncated to `max_text_bytes`.
+    pub body: String,
+    /// MIME type (e.g. `text/html`), if known.
+    pub mime: Option<String>,
+    /// S3 object key of the source WARC file.
+    pub s3_key: String,
+    /// Byte offset of the WARC record within the uncompressed stream.
+    pub offset: u64,
+    /// Byte length of the WARC record block.
+    pub length: u64,
+}
+
+/// A single fulltext search result.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SearchHit {
+    pub url: String,
+    /// 14-digit capture timestamp (zero-padded).
+    pub timestamp: String,
+    pub title: String,
+    pub mime: Option<String>,
+    pub s3_key: String,
+    pub offset: u64,
+    pub length: u64,
+    pub score: f32,
+}
+
+// ── Schema internals ──────────────────────────────────────────────────────────
+
+/// Holds all schema field handles.  Field indices must match the order in
+/// `build_schema`, so they stay stable across opens of the same index directory.
+struct Fields {
+    url: Field,
+    timestamp: Field,
+    title: Field,
+    body: Field,
+    mime: Field,
+    s3_key: Field,
+    offset: Field,
+    length: Field,
+}
+
+fn build_schema() -> (Schema, Fields) {
+    let mut b = Schema::builder();
+
+    let url       = b.add_text_field("url",       STRING | STORED);
+    // Timestamp is stored only; range filtering is done post-retrieval.
+    let timestamp = b.add_u64_field("timestamp",  NumericOptions::default().set_stored());
+    let title     = b.add_text_field("title",     TEXT | STORED);
+    // Body is indexed but not stored to save space.
+    let body      = b.add_text_field("body",      TEXT);
+    let mime      = b.add_text_field("mime",      STRING | STORED);
+    let s3_key    = b.add_text_field("s3_key",    STRING | STORED);
+    let offset    = b.add_u64_field("offset",     NumericOptions::default().set_stored());
+    let length    = b.add_u64_field("length",     NumericOptions::default().set_stored());
+
+    let schema = b.build();
+    let fields = Fields { url, timestamp, title, body, mime, s3_key, offset, length };
+    (schema, fields)
+}
+
+/// Read field handles from an already-opened index schema.
+fn fields_from_index_schema(schema: &Schema) -> Result<Fields> {
+    let f = |name: &str| {
+        schema
+            .get_field(name)
+            .map_err(|_| SearchError::FieldNotFound(name.to_owned()))
+    };
+    Ok(Fields {
+        url:       f("url")?,
+        timestamp: f("timestamp")?,
+        title:     f("title")?,
+        body:      f("body")?,
+        mime:      f("mime")?,
+        s3_key:    f("s3_key")?,
+        offset:    f("offset")?,
+        length:    f("length")?,
+    })
+}
+
+// ── Shared search implementation ──────────────────────────────────────────────
+
+fn search_impl(
+    index: &Index,
+    reader: &IndexReader,
+    fields: &Fields,
+    query_str: &str,
+    limit: usize,
+    from_ts: Option<u64>,
+    to_ts: Option<u64>,
+) -> Result<Vec<SearchHit>> {
+    let searcher = reader.searcher();
+
+    let qp = QueryParser::for_index(index, vec![fields.title, fields.body]);
+    let query = qp.parse_query(query_str)?;
+
+    // Fetch extra results when post-filtering by timestamp is needed.
+    let fetch_limit = if from_ts.is_some() || to_ts.is_some() {
+        (limit * 20).max(200)
+    } else {
+        limit
+    };
+
+    let top_docs = searcher.search(&query, &TopDocs::with_limit(fetch_limit))?;
+
+    let mut hits = Vec::with_capacity(limit);
+    for (score, addr) in top_docs {
+        if hits.len() >= limit {
+            break;
+        }
+        let doc: TantivyDocument = searcher.doc(addr)?;
+
+        let ts = get_u64(&doc, fields.timestamp).unwrap_or(0);
+        if let Some(from) = from_ts {
+            if ts < from {
+                continue;
+            }
+        }
+        if let Some(to) = to_ts {
+            if ts > to {
+                continue;
+            }
+        }
+
+        hits.push(SearchHit {
+            url:       get_str(&doc, fields.url).unwrap_or_default(),
+            timestamp: format!("{ts:014}"),
+            title:     get_str(&doc, fields.title).unwrap_or_default(),
+            mime:      get_str(&doc, fields.mime),
+            s3_key:    get_str(&doc, fields.s3_key).unwrap_or_default(),
+            offset:    get_u64(&doc, fields.offset).unwrap_or(0),
+            length:    get_u64(&doc, fields.length).unwrap_or(0),
+            score,
+        });
+    }
+
+    Ok(hits)
+}
+
+// ── SearchIndex ───────────────────────────────────────────────────────────────
+
+/// Default Tantivy writer heap (50 MiB).
+pub const DEFAULT_HEAP_BYTES: usize = 50 * 1024 * 1024;
+
+/// Fulltext index with a writer — used by the indexer binary.
+///
+/// Holds both the read and write handles.  Only one `SearchIndex` per directory
+/// may exist at a time (Tantivy acquires a file lock for the writer).
+pub struct SearchIndex {
+    index: Index,
+    writer: IndexWriter,
+    reader: IndexReader,
+    fields: Fields,
+}
+
+impl SearchIndex {
+    /// Open an existing index at `path`, or create a new one.
+    pub fn open_or_create(path: impl AsRef<Path>) -> Result<Self> {
+        Self::with_heap(path, DEFAULT_HEAP_BYTES)
+    }
+
+    /// Open/create with a custom writer heap size in bytes.
+    pub fn with_heap(path: impl AsRef<Path>, heap_bytes: usize) -> Result<Self> {
+        let path = path.as_ref();
+        std::fs::create_dir_all(path)?;
+
+        let (schema, fields) = build_schema();
+        let dir = MmapDirectory::open(path)
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        let index = Index::open_or_create(dir, schema)?;
+
+        let writer = index.writer(heap_bytes)?;
+        let reader = index
+            .reader_builder()
+            .reload_policy(ReloadPolicy::OnCommitWithDelay)
+            .try_into()?;
+
+        Ok(Self { index, writer, reader, fields })
+    }
+
+    // ── Writes ────────────────────────────────────────────────────────────────
+
+    /// Queue a document for indexing.  Not visible until [`commit`] is called.
+    pub fn add_document(&mut self, doc: &IndexDoc) -> Result<()> {
+        let mut d = TantivyDocument::default();
+        d.add_text(self.fields.url,       &doc.url);
+        d.add_u64( self.fields.timestamp, doc.timestamp);
+        d.add_text(self.fields.title,     &doc.title);
+        d.add_text(self.fields.body,      &doc.body);
+        if let Some(m) = &doc.mime {
+            d.add_text(self.fields.mime, m);
+        }
+        d.add_text(self.fields.s3_key, &doc.s3_key);
+        d.add_u64( self.fields.offset, doc.offset);
+        d.add_u64( self.fields.length, doc.length);
+        self.writer.add_document(d)?;
+        Ok(())
+    }
+
+    /// Commit buffered documents to disk and expose them for searching.
+    pub fn commit(&mut self) -> Result<()> {
+        self.writer.commit()?;
+        // Force the reader to pick up the new segment immediately rather than
+        // waiting for the async reload delay.
+        self.reader.reload()?;
+        Ok(())
+    }
+
+    // ── Reads ─────────────────────────────────────────────────────────────────
+
+    /// Fulltext search.
+    ///
+    /// `from_ts` / `to_ts` are optional 14-digit timestamps (as u64) to filter
+    /// by capture date.  Filtering is applied post-retrieval.
+    pub fn search(
+        &self,
+        query_str: &str,
+        limit: usize,
+        from_ts: Option<u64>,
+        to_ts: Option<u64>,
+    ) -> Result<Vec<SearchHit>> {
+        search_impl(&self.index, &self.reader, &self.fields, query_str, limit, from_ts, to_ts)
+    }
+
+    /// Total number of documents visible to the current reader.
+    pub fn num_docs(&self) -> u64 {
+        self.reader.searcher().num_docs()
+    }
+}
+
+// ── SearchReader ──────────────────────────────────────────────────────────────
+
+/// Read-only handle to a Tantivy index — used by the server binary.
+///
+/// Does not acquire a writer lock, so it can coexist with a running indexer.
+/// The reader picks up new segments whenever the indexer commits.
+pub struct SearchReader {
+    index: Index,
+    reader: IndexReader,
+    fields: Fields,
+}
+
+impl SearchReader {
+    /// Open an existing index at `path` for reading.
+    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        let dir = MmapDirectory::open(path.as_ref())
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        let index = Index::open(dir)?;
+        let fields = fields_from_index_schema(&index.schema())?;
+        let reader = index
+            .reader_builder()
+            .reload_policy(ReloadPolicy::OnCommitWithDelay)
+            .try_into()?;
+        Ok(Self { index, reader, fields })
+    }
+
+    /// Fulltext search (same semantics as [`SearchIndex::search`]).
+    pub fn search(
+        &self,
+        query_str: &str,
+        limit: usize,
+        from_ts: Option<u64>,
+        to_ts: Option<u64>,
+    ) -> Result<Vec<SearchHit>> {
+        search_impl(&self.index, &self.reader, &self.fields, query_str, limit, from_ts, to_ts)
+    }
+
+    /// Total number of indexed documents.
+    pub fn num_docs(&self) -> u64 {
+        self.reader.searcher().num_docs()
+    }
+}
+
+// ── Document field helpers ────────────────────────────────────────────────────
+
+fn get_str(doc: &TantivyDocument, field: Field) -> Option<String> {
+    doc.get_first(field).and_then(|v| {
+        if let tantivy::schema::OwnedValue::Str(s) = v {
+            Some(s.clone())
+        } else {
+            None
+        }
+    })
+}
+
+fn get_u64(doc: &TantivyDocument, field: Field) -> Option<u64> {
+    doc.get_first(field).and_then(|v| {
+        if let tantivy::schema::OwnedValue::U64(n) = v {
+            Some(*n)
+        } else {
+            None
+        }
+    })
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    fn doc(url: &str, title: &str, body: &str, ts: u64) -> IndexDoc {
+        IndexDoc {
+            url:       url.to_owned(),
+            timestamp: ts,
+            title:     title.to_owned(),
+            body:      body.to_owned(),
+            mime:      Some("text/html".to_owned()),
+            s3_key:    "test/archive.warc.gz".to_owned(),
+            offset:    1024,
+            length:    512,
+        }
+    }
+
+    // ── Construction ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn open_or_create_empty() {
+        let dir = tempdir().unwrap();
+        let idx = SearchIndex::open_or_create(dir.path()).unwrap();
+        assert_eq!(idx.num_docs(), 0);
+    }
+
+    #[test]
+    fn add_and_commit_single_doc() {
+        let dir = tempdir().unwrap();
+        let mut idx = SearchIndex::open_or_create(dir.path()).unwrap();
+        idx.add_document(&doc(
+            "https://example.com/",
+            "Example Domain",
+            "This domain is for illustrative examples in documentation",
+            20240315120000,
+        ))
+        .unwrap();
+        idx.commit().unwrap();
+        assert_eq!(idx.num_docs(), 1);
+    }
+
+    // ── Search ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn search_finds_body_match() {
+        let dir = tempdir().unwrap();
+        let mut idx = SearchIndex::open_or_create(dir.path()).unwrap();
+        idx.add_document(&doc(
+            "https://example.com/",
+            "Example",
+            "illustrative documentation examples",
+            20240315120000,
+        ))
+        .unwrap();
+        idx.commit().unwrap();
+
+        let hits = idx.search("illustrative", 10, None, None).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].url, "https://example.com/");
+    }
+
+    #[test]
+    fn search_finds_title_match() {
+        let dir = tempdir().unwrap();
+        let mut idx = SearchIndex::open_or_create(dir.path()).unwrap();
+        idx.add_document(&doc(
+            "https://example.com/",
+            "UniqueXYZTitle",
+            "ordinary body",
+            20240315120000,
+        ))
+        .unwrap();
+        idx.commit().unwrap();
+
+        let hits = idx.search("UniqueXYZTitle", 10, None, None).unwrap();
+        assert_eq!(hits.len(), 1);
+    }
+
+    #[test]
+    fn search_empty_for_no_match() {
+        let dir = tempdir().unwrap();
+        let mut idx = SearchIndex::open_or_create(dir.path()).unwrap();
+        idx.add_document(&doc("https://a.com/", "Title", "content here", 20240101120000))
+            .unwrap();
+        idx.commit().unwrap();
+
+        let hits = idx.search("xyzzy_nonexistent_term", 10, None, None).unwrap();
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn search_respects_limit() {
+        let dir = tempdir().unwrap();
+        let mut idx = SearchIndex::open_or_create(dir.path()).unwrap();
+        for i in 0..10u64 {
+            idx.add_document(&doc(
+                &format!("https://example.com/{i}"),
+                &format!("Page {i}"),
+                "rust programming language tutorial",
+                20240101000000 + i * 10000,
+            ))
+            .unwrap();
+        }
+        idx.commit().unwrap();
+
+        let hits = idx.search("rust", 3, None, None).unwrap();
+        assert!(hits.len() <= 3);
+    }
+
+    // ── Timestamp filtering ───────────────────────────────────────────────────
+
+    #[test]
+    fn search_filter_from_ts() {
+        let dir = tempdir().unwrap();
+        let mut idx = SearchIndex::open_or_create(dir.path()).unwrap();
+        idx.add_document(&doc("https://a.com/", "A", "rust search", 20240101120000))
+            .unwrap();
+        idx.add_document(&doc("https://b.com/", "B", "rust search", 20240601120000))
+            .unwrap();
+        idx.add_document(&doc("https://c.com/", "C", "rust search", 20241201120000))
+            .unwrap();
+        idx.commit().unwrap();
+
+        let hits = idx.search("rust", 10, Some(20240601000000), None).unwrap();
+        assert_eq!(hits.len(), 2);
+        for h in &hits {
+            let ts: u64 = h.timestamp.parse().unwrap();
+            assert!(ts >= 20240601000000);
+        }
+    }
+
+    #[test]
+    fn search_filter_to_ts() {
+        let dir = tempdir().unwrap();
+        let mut idx = SearchIndex::open_or_create(dir.path()).unwrap();
+        idx.add_document(&doc("https://a.com/", "A", "rust search", 20240101120000))
+            .unwrap();
+        idx.add_document(&doc("https://b.com/", "B", "rust search", 20240601120000))
+            .unwrap();
+        idx.add_document(&doc("https://c.com/", "C", "rust search", 20241201120000))
+            .unwrap();
+        idx.commit().unwrap();
+
+        let hits = idx.search("rust", 10, None, Some(20240601235959)).unwrap();
+        assert_eq!(hits.len(), 2);
+    }
+
+    #[test]
+    fn search_filter_ts_range() {
+        let dir = tempdir().unwrap();
+        let mut idx = SearchIndex::open_or_create(dir.path()).unwrap();
+        idx.add_document(&doc("https://a.com/", "A", "rust search", 20240101120000))
+            .unwrap();
+        idx.add_document(&doc("https://b.com/", "B", "rust search", 20240601120000))
+            .unwrap();
+        idx.add_document(&doc("https://c.com/", "C", "rust search", 20241201120000))
+            .unwrap();
+        idx.commit().unwrap();
+
+        let hits = idx
+            .search("rust", 10, Some(20240601000000), Some(20240701000000))
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].url, "https://b.com/");
+    }
+
+    // ── Persistence ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn index_survives_reopen() {
+        let dir = tempdir().unwrap();
+        {
+            let mut idx = SearchIndex::open_or_create(dir.path()).unwrap();
+            idx.add_document(&doc("https://persist.com/", "Persisted", "content here", 20240101120000))
+                .unwrap();
+            idx.commit().unwrap();
+        }
+        let idx = SearchIndex::open_or_create(dir.path()).unwrap();
+        assert_eq!(idx.num_docs(), 1);
+        let hits = idx.search("content", 10, None, None).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].url, "https://persist.com/");
+    }
+
+    #[test]
+    fn search_reader_reads_existing_index() {
+        let dir = tempdir().unwrap();
+        {
+            let mut idx = SearchIndex::open_or_create(dir.path()).unwrap();
+            idx.add_document(&doc("https://reader-test.com/", "Reader Test", "content here", 20240101120000))
+                .unwrap();
+            idx.commit().unwrap();
+        }
+        let reader = SearchReader::open(dir.path()).unwrap();
+        assert_eq!(reader.num_docs(), 1);
+        let hits = reader.search("content", 10, None, None).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].url, "https://reader-test.com/");
+    }
+
+    // ── SearchHit fields ──────────────────────────────────────────────────────
+
+    #[test]
+    fn hit_fields_are_populated() {
+        let dir = tempdir().unwrap();
+        let mut idx = SearchIndex::open_or_create(dir.path()).unwrap();
+        idx.add_document(&IndexDoc {
+            url:       "https://full.com/page".to_owned(),
+            timestamp: 20240315120000,
+            title:     "Full Page".to_owned(),
+            body:      "complete body text".to_owned(),
+            mime:      Some("text/html".to_owned()),
+            s3_key:    "crawls/full.warc.gz".to_owned(),
+            offset:    2048,
+            length:    4096,
+        })
+        .unwrap();
+        idx.commit().unwrap();
+
+        let hits = idx.search("complete", 1, None, None).unwrap();
+        assert_eq!(hits.len(), 1);
+        let h = &hits[0];
+        assert_eq!(h.url, "https://full.com/page");
+        assert_eq!(h.timestamp, "20240315120000");
+        assert_eq!(h.title, "Full Page");
+        assert_eq!(h.mime.as_deref(), Some("text/html"));
+        assert_eq!(h.s3_key, "crawls/full.warc.gz");
+        assert_eq!(h.offset, 2048);
+        assert_eq!(h.length, 4096);
+        assert!(h.score > 0.0);
+    }
+
+    #[test]
+    fn hit_timestamp_is_zero_padded() {
+        let dir = tempdir().unwrap();
+        let mut idx = SearchIndex::open_or_create(dir.path()).unwrap();
+        idx.add_document(&doc("https://a.com/", "A", "test keyword", 20240101090501))
+            .unwrap();
+        idx.commit().unwrap();
+
+        let hits = idx.search("keyword", 1, None, None).unwrap();
+        assert_eq!(hits[0].timestamp, "20240101090501");
+    }
+}

@@ -1,0 +1,15 @@
+[package]
+name        = "warc-search-config"
+description = "Configuration loading for warc-search (YAML + env vars)"
+version.workspace    = true
+edition.workspace    = true
+authors.workspace    = true
+license.workspace    = true
+
+[dependencies]
+serde      = { workspace = true }
+serde_yaml = { workspace = true }
+thiserror  = { workspace = true }
+
+[dev-dependencies]
+# nothing extra needed

@@ -1,0 +1,15 @@
+[package]
+name        = "warc-search-search"
+description = "Tantivy fulltext index wrapper for warc-search"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+tantivy   = { workspace = true }
+thiserror = { workspace = true }
+serde     = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

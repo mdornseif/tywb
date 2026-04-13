@@ -1,0 +1,17 @@
+[package]
+name        = "warc-search-cdx"
+description = "CDX index: SURT canonicalization, SQLite storage, record lookup"
+version.workspace    = true
+edition.workspace    = true
+authors.workspace    = true
+license.workspace    = true
+
+[dependencies]
+warc      = { path = "../warc" }
+thiserror = { workspace = true }
+rusqlite  = { workspace = true }
+chrono    = { workspace = true }
+url       = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
