@@ -132,6 +132,7 @@ td{padding:.5rem .875rem;font-size:.875rem;
 tr:last-child td{border-bottom:none}
 .ts{font-family:ui-monospace,SFMono-Regular,monospace;
   font-size:.8rem;white-space:nowrap}
+.num{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
 .s200{color:var(--green);font-weight:600}
 .s3xx{color:var(--amber);font-weight:600}
 .s4xx,.s5xx{color:var(--red);font-weight:600}
@@ -767,7 +768,7 @@ pub fn browse_captures_html(
     records: &[CdxRecord],
     truncated: bool,
 ) -> String {
-    let mut c = String::with_capacity(2048 + records.len() * 256);
+    let mut c = String::with_capacity(2048 + records.len() * 128);
 
     // Breadcrumb
     c.push_str("<div class=\"breadcrumb\">\n");
@@ -790,41 +791,44 @@ pub fn browse_captures_html(
         return page_html(&title, "browse", &c);
     }
 
-    c.push_str("<p class=\"cap-count\">");
-    push_esc(&mut c, &fmt_count(records.len() as u64));
-    if truncated {
-        c.push_str("+ ");
+    // Deduplicate: count captures per unique URL, preserving first-seen order.
+    let mut urls: Vec<(&str, usize)> = Vec::new();
+    let mut last: Option<&str> = None;
+    for rec in records {
+        if last == Some(rec.original_url.as_str()) {
+            urls.last_mut().unwrap().1 += 1;
+        } else {
+            urls.push((rec.original_url.as_str(), 1));
+            last = Some(rec.original_url.as_str());
+        }
     }
+
+    c.push_str("<p class=\"cap-count\">");
+    push_esc(&mut c, &fmt_count(urls.len() as u64));
+    if truncated { c.push_str("+"); }
+    c.push_str(if urls.len() == 1 { " URL" } else { " URLs" });
+    c.push_str(" &nbsp;·&nbsp; ");
+    push_esc(&mut c, &fmt_count(records.len() as u64));
+    if truncated { c.push_str("+"); }
     c.push_str(if records.len() == 1 { " capture" } else { " captures" });
     c.push_str(" under <strong>");
     push_esc(&mut c, domain);
     c.push_str("</strong></p>\n");
 
-    // Table: URL | date | status | type | replay
+    // Table: URL | captures
     c.push_str("<div class=\"table-wrap\">\n<table>\n");
-    c.push_str("<thead><tr><th>URL</th><th>Date / time</th><th>Status</th><th>Type</th><th></th></tr></thead>\n<tbody>\n");
+    c.push_str("<thead><tr><th>URL</th><th class=\"num\">Captures</th></tr></thead>\n<tbody>\n");
 
-    for rec in records.iter().rev() {
-        let sc     = status_class(rec.status);
-        let ss     = status_str(rec.status);
-        let mime   = short_mime(rec.mime.as_deref());
-        let replay = format!("/web/{}/{}", rec.timestamp, rec.original_url);
-
-        c.push_str("<tr>\n  <td style=\"max-width:340px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap\" title=\"");
-        push_esc(&mut c, &rec.original_url);
+    for (url, count) in &urls {
+        c.push_str("<tr>\n  <td style=\"max-width:520px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap\" title=\"");
+        push_esc(&mut c, url);
+        c.push_str("\"><a href=\"/ui/url?url=");
+        push_url_encoded(&mut c, url);
         c.push_str("\">");
-        push_esc(&mut c, &rec.original_url);
-        c.push_str("</td>\n  <td class=\"ts\">");
-        push_esc(&mut c, &fmt_ts(&rec.timestamp));
-        c.push_str("</td>\n  <td class=\"");
-        c.push_str(sc);
-        c.push_str("\">");
-        push_esc(&mut c, &ss);
-        c.push_str("</td>\n  <td>");
-        push_esc(&mut c, mime);
-        c.push_str("</td>\n  <td><a class=\"replay-btn\" href=\"");
-        push_esc(&mut c, &replay);
-        c.push_str("\">Replay \u{2197}</a></td>\n</tr>\n");
+        push_esc(&mut c, url);
+        c.push_str("</a></td>\n  <td class=\"num\">");
+        c.push_str(&count.to_string());
+        c.push_str("</td>\n</tr>\n");
     }
 
     c.push_str("</tbody>\n</table>\n</div>\n");
@@ -835,6 +839,24 @@ pub fn browse_captures_html(
 
     page_html(&title, "browse", &c)
 }
+
+/// Percent-encode a string for use as a URL query-parameter value.
+/// Encodes everything except unreserved characters (A–Z a–z 0–9 - _ . ~).
+fn push_url_encoded(out: &mut String, s: &str) {
+    for byte in s.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9'
+            | b'-' | b'_' | b'.' | b'~' => out.push(byte as char),
+            b => {
+                out.push('%');
+                out.push(HEX[(b >> 4) as usize] as char);
+                out.push(HEX[(b & 0xf) as usize] as char);
+            }
+        }
+    }
+}
+
+const HEX: &[u8; 16] = b"0123456789ABCDEF";
 
 // ── API stats response struct (re-exported for server.rs) ─────────────────────
 
