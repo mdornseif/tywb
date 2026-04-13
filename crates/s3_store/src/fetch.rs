@@ -213,6 +213,33 @@ pub async fn head_object(
     })
 }
 
+// ── PUT ───────────────────────────────────────────────────────────────────────
+
+/// Upload `body` to `s3://{bucket}/{key}` with the given `content_type`.
+pub async fn put_object(
+    client: &Client,
+    bucket: &str,
+    key: &str,
+    body: Bytes,
+    content_type: &str,
+) -> Result<()> {
+    debug!(bucket, key, bytes = body.len(), "S3 PUT");
+    client
+        .put_object()
+        .bucket(bucket)
+        .key(key)
+        .body(ByteStream::from(body))
+        .content_type(content_type)
+        .send()
+        .await
+        .map_err(|e| S3Error::Put {
+            bucket: bucket.to_owned(),
+            key:    key.to_owned(),
+            reason: e.to_string(),
+        })?;
+    Ok(())
+}
+
 // ── Range header helpers ──────────────────────────────────────────────────────
 
 /// Format a `Range: bytes=X-Y` header value.

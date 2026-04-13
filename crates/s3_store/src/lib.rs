@@ -20,7 +20,7 @@ pub mod list;
 pub use client::build_client;
 pub use error::{S3Error, Result};
 pub use fetch::{
-    get_bytes, get_range, get_range_stream, get_stream, head_object,
+    get_bytes, get_range, get_range_stream, get_stream, head_object, put_object,
     parse_content_range, range_header, ObjectHead,
 };
 pub use list::{default_state_path, ListState, Lister, ObjectMeta};

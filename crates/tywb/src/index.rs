@@ -20,7 +20,10 @@ use warc::{WarcIter, WarcReader};
 use warc_search_cdx::{CdxRecord, CdxStore, WarcFileMeta, WarcInfoRecord, from_warc_record};
 use crate::gz_warc::GzSplitter;
 use warc_search_config::{Config, IndexerConfig};
-use warc_search_s3::{build_client, ListState, Lister, ObjectMeta, default_state_path, get_stream};
+use warc_search_s3::{
+    build_client, ListState, Lister, ObjectMeta, S3Error,
+    default_state_path, get_stream, head_object, put_object,
+};
 use warc_search_search::{SearchIndex, IndexDoc};
 
 // ── CLI arguments ─────────────────────────────────────────────────────────────
@@ -605,6 +608,18 @@ async fn index_warc_object(
         .upsert_batch_counted(&cdx_records)
         .context("CDX upsert_batch")?;
 
+    // Spawn a background task to write a CDX sidecar file into the bucket
+    // alongside the WARC, skipping if the file already exists.
+    {
+        let s3_clone  = s3.clone();
+        let bucket    = bucket.to_owned();
+        let key       = key.to_owned();
+        let recs      = cdx_records.clone();
+        tokio::spawn(async move {
+            write_cdx_sidecar(&s3_clone, &bucket, &key, &recs).await;
+        });
+    }
+
     let mut indexed = 0usize;
     for (_, doc_opt) in &parsed.records {
         if let Some(doc) = doc_opt {
@@ -799,6 +814,105 @@ fn days_in_month(y: u32, m: u32) -> u32 {
         4|6|9|11        => 30,
         2 => if days_in_year(y) == 366 { 29 } else { 28 },
         _ => 30,
+    }
+}
+
+// ── CDX sidecar writer ────────────────────────────────────────────────────────
+
+/// Write a CDX-11 sidecar file to S3 alongside `warc_key` unless one already
+/// exists.  The sidecar key is `{warc_key}.cdx`.
+///
+/// CDX-11 format (space-separated, one record per line):
+/// ```
+///  CDX N b a m s k r M S V g
+/// ```
+/// Fields: SURT, timestamp, original URL, MIME, HTTP status, digest, redirect
+/// (-), meta (-), record length, byte offset, WARC filename (basename).
+///
+/// For `.warc.gz` files the offset field (`V`) is the compressed gzip-member
+/// offset (`c_offset`).  For plain `.warc` files it is the uncompressed stream
+/// offset.  Records without `c_offset` in a `.warc.gz` fall back to the
+/// uncompressed offset and are still included.
+///
+/// Errors are logged as warnings; they never abort the indexing run.
+async fn write_cdx_sidecar(
+    s3:      &aws_sdk_s3::Client,
+    bucket:  &str,
+    warc_key: &str,
+    records: &[CdxRecord],
+) {
+    let cdx_key = format!("{warc_key}.cdx");
+
+    // Skip if the sidecar already exists.
+    match head_object(s3, bucket, &cdx_key).await {
+        Ok(_) => {
+            info!(key = %cdx_key, "CDX sidecar already exists — skipping");
+            return;
+        }
+        Err(S3Error::NotFound { .. }) => {} // expected — proceed to write
+        Err(e) => {
+            warn!(key = %cdx_key, err = %e, "HEAD failed for CDX sidecar — skipping write");
+            return;
+        }
+    }
+
+    if records.is_empty() {
+        info!(key = %cdx_key, "no CDX records — skipping empty sidecar");
+        return;
+    }
+
+    let basename = warc_key.rsplit('/').next().unwrap_or(warc_key);
+    let is_gz    = warc_key.to_ascii_lowercase().ends_with(".gz");
+
+    // Build CDX-11 content.
+    let mut body = String::with_capacity(records.len() * 200);
+    body.push_str(" CDX N b a m s k r M S V g\n");
+
+    for r in records {
+        let mime   = r.mime.as_deref().unwrap_or("-");
+        let status = r.status.map(|s| s.to_string()).unwrap_or_else(|| "-".to_owned());
+        let digest = r.digest.as_deref().unwrap_or("-");
+        let length = r.length;
+        let offset = if is_gz {
+            r.c_offset.unwrap_or(r.offset)
+        } else {
+            r.offset
+        };
+
+        body.push_str(&r.surt_url);
+        body.push(' ');
+        body.push_str(&r.timestamp);
+        body.push(' ');
+        body.push_str(&r.original_url);
+        body.push(' ');
+        body.push_str(mime);
+        body.push(' ');
+        body.push_str(&status);
+        body.push(' ');
+        body.push_str(digest);
+        body.push_str(" - -");
+        body.push(' ');
+        body.push_str(&length.to_string());
+        body.push(' ');
+        body.push_str(&offset.to_string());
+        body.push(' ');
+        body.push_str(basename);
+        body.push('\n');
+    }
+
+    let bytes = bytes::Bytes::from(body.into_bytes());
+    match put_object(s3, bucket, &cdx_key, bytes, "text/plain; charset=utf-8").await {
+        Ok(()) => info!(
+            key    = %cdx_key,
+            bucket = %bucket,
+            "CDX sidecar written",
+        ),
+        Err(e) => warn!(
+            key    = %cdx_key,
+            bucket = %bucket,
+            err    = %e,
+            "failed to write CDX sidecar",
+        ),
     }
 }
 

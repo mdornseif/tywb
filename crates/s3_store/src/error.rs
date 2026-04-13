@@ -8,6 +8,9 @@ pub enum S3Error {
     #[error("S3 error getting object s3://{bucket}/{key}: {reason}")]
     Get { bucket: String, key: String, reason: String },
 
+    #[error("S3 error putting object s3://{bucket}/{key}: {reason}")]
+    Put { bucket: String, key: String, reason: String },
+
     #[error("S3 object not found: s3://{bucket}/{key}")]
     NotFound { bucket: String, key: String },
 
