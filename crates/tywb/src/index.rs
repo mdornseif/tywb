@@ -36,6 +36,8 @@ pub struct IndexArgs {
     pub max_files: Option<usize>,
     /// Stop after accumulating at least this many new CDX entries.
     pub max_urls: Option<u64>,
+    /// Re-process all objects regardless of saved ETag state.
+    pub force: bool,
 }
 
 // ── Statistics ────────────────────────────────────────────────────────────────
@@ -139,6 +141,55 @@ impl SharedProgress {
     }
 }
 
+// ── Domain blacklist helpers ──────────────────────────────────────────────────
+
+/// Convert a plain domain name to its SURT host form (reversed labels, no `)`).
+/// `"example.com"` → `"com,example"`.  Used as a prefix for CDX lookups.
+fn domain_to_surt_host(domain: &str) -> String {
+    domain
+        .trim()
+        .to_ascii_lowercase()
+        .split('.')
+        .rev()
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// Remove all entries for `domain` (apex + subdomains) from both the CDX SQLite
+/// store and the Tantivy fulltext index, then commit the fulltext changes.
+fn purge_domain(
+    domain: &str,
+    cdx: &CdxStore,
+    search: &mut SearchIndex,
+) -> anyhow::Result<()> {
+    let surt_host = domain_to_surt_host(domain);
+
+    // Collect all original URLs before touching CDX, because we need them to
+    // drive the Tantivy deletion.
+    let urls = cdx
+        .original_urls_for_domain_surt(&surt_host)
+        .with_context(|| format!("fetching URLs for domain {domain}"))?;
+
+    let cdx_deleted = cdx
+        .delete_by_domain_surt(&surt_host)
+        .with_context(|| format!("deleting CDX records for domain {domain}"))?;
+
+    let search_queued = search
+        .delete_urls(&urls)
+        .with_context(|| format!("queuing search deletions for domain {domain}"))?;
+
+    if cdx_deleted > 0 || search_queued > 0 {
+        info!(
+            domain,
+            cdx_deleted,
+            search_queued,
+            "purged blacklisted domain"
+        );
+    }
+
+    Ok(())
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 pub async fn run(cfg: Config, args: IndexArgs) -> anyhow::Result<()> {
@@ -153,6 +204,19 @@ pub async fn run(cfg: Config, args: IndexArgs) -> anyhow::Result<()> {
 
     let mut search = SearchIndex::open_or_create(&cfg.storage.index_path)
         .with_context(|| format!("opening search index at {}", cfg.storage.index_path))?;
+
+    // ── Purge blacklisted domains ─────────────────────────────────────────────
+    // Runs before any new ingest so blacklisted data is cleaned up even when
+    // there are no new WARC files to process.
+
+    if !cfg.indexer.blacklisted_domains.is_empty() {
+        let domains: Vec<String> = cfg.indexer.blacklisted_domains.clone();
+        for domain in &domains {
+            purge_domain(domain, &cdx, &mut search)?;
+        }
+        // Commit fulltext deletions in one pass.
+        search.commit().context("committing fulltext deletions for blacklisted domains")?;
+    }
 
     // ── S3 ────────────────────────────────────────────────────────────────────
 
@@ -178,10 +242,12 @@ pub async fn run(cfg: Config, args: IndexArgs) -> anyhow::Result<()> {
             }
             l
         };
-        lister
-            .list_new_or_changed(&state)
-            .await
-            .context("listing S3 objects")?
+        if args.force {
+            info!("--force: ignoring saved ETag state, all objects will be re-processed");
+            lister.list_all().await.context("listing S3 objects")?
+        } else {
+            lister.list_new_or_changed(&state).await.context("listing S3 objects")?
+        }
     };
 
     if objects.is_empty() {
@@ -358,6 +424,7 @@ async fn index_warc_object(
     let bucket_owned = bucket.to_owned();
     let max_text = cfg.max_text_bytes;
     let index_responses = cfg.index_warc_responses;
+    let cfg_owned = cfg.clone();
 
     let (tx, rx) = mpsc::sync_channel::<Bytes>(16);
 
@@ -398,6 +465,7 @@ async fn index_warc_object(
                 key:         &str,
                 index_resp:  bool,
                 max_text:    usize,
+                blacklist:   &warc_search_config::IndexerConfig,
                 out:         &mut Vec<(CdxRecord, Option<warc_search_search::IndexDoc>)>,
                 skipped:     &mut usize,
                 errors:      &mut usize,
@@ -452,6 +520,16 @@ async fn index_warc_object(
                     }
                     Ok(None) => { *skipped += 1; }
                     Ok(Some(mut cdx_rec)) => {
+                        // Skip blacklisted domains.
+                        if blacklist.is_url_blacklisted(&cdx_rec.original_url) {
+                            tracing::debug!(
+                                url = %cdx_rec.original_url,
+                                "skipping blacklisted URL"
+                            );
+                            *skipped += 1;
+                            return;
+                        }
+
                         cdx_rec.c_offset = c_offset;
 
                         let mime_key = cdx_rec.mime
@@ -542,7 +620,7 @@ async fn index_warc_object(
 
                     handle_record(
                         &record, Some(c_offset), &key_owned,
-                        index_responses, max_text,
+                        index_responses, max_text, &cfg_owned,
                         &mut out, &mut skipped, &mut errors,
                         &mut mime_counts, &mut warc_date_min, &mut warc_date_max,
                         &progress, warc_records,
@@ -570,7 +648,7 @@ async fn index_warc_object(
                             }
                             handle_record(
                                 &record, None, &key_owned,
-                                index_responses, max_text,
+                                index_responses, max_text, &cfg_owned,
                                 &mut out, &mut skipped, &mut errors,
                                 &mut mime_counts, &mut warc_date_min, &mut warc_date_max,
                                 &progress, warc_records,

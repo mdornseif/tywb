@@ -98,6 +98,48 @@ pub struct IndexerConfig {
     pub index_warc_responses: bool,
     #[serde(default)]
     pub skip_patterns: Vec<String>,
+    /// Domains (and all their subdomains) to exclude from indexing and remove
+    /// from any existing index.  Plain hostnames without scheme or path, e.g.
+    /// `example.com`.  Subdomains are matched automatically: listing `example.com`
+    /// also excludes `www.example.com`, `cdn.example.com`, etc.
+    #[serde(default)]
+    pub blacklisted_domains: Vec<String>,
+}
+
+impl IndexerConfig {
+    /// Return `true` if `host` (a bare hostname, lower-cased) is covered by
+    /// the domain blacklist — i.e. it equals a blacklisted domain or is a
+    /// subdomain of one.
+    pub fn is_host_blacklisted(&self, host: &str) -> bool {
+        let h = host.to_ascii_lowercase();
+        for blocked in &self.blacklisted_domains {
+            let b = blocked.trim().to_ascii_lowercase();
+            if h == b || h.ends_with(&format!(".{b}")) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Return `true` if the URL's host is covered by the domain blacklist.
+    /// Non-HTTP/HTTPS URLs are never blacklisted.
+    pub fn is_url_blacklisted(&self, url: &str) -> bool {
+        if self.blacklisted_domains.is_empty() {
+            return false;
+        }
+        // Fast path: extract host without full URL parsing.
+        let after_scheme = if let Some(pos) = url.find("://") {
+            &url[pos + 3..]
+        } else {
+            return false;
+        };
+        let host = after_scheme
+            .split(['/', ':', '?', '#'])
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        self.is_host_blacklisted(&host)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -236,6 +278,7 @@ impl Default for IndexerConfig {
             index_pdfs: true,
             index_warc_responses: true,
             skip_patterns: vec![],
+            blacklisted_domains: vec![],
         }
     }
 }

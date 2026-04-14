@@ -1,9 +1,10 @@
-# warc-search configuration
-# All values here can be overridden by environment variables.
-# See the mapping in config/src/lib.rs for the full list.
+# tywb — Tiny Wayback configuration
+#
+# All values here can be overridden by environment variables (env vars win).
+# See the configuration reference in README.md for the full mapping.
 #
 # AWS credentials follow standard AWS SDK precedence:
-#   1. Environment variables (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, etc.)
+#   1. Environment variables (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY)
 #   2. Values in this file (only if env vars are absent)
 #   3. ~/.aws/credentials / instance metadata (standard SDK fallback)
 
@@ -13,10 +14,12 @@ s3:
   bucket: "warc"
 
   # AWS region (or S3-compatible region string).
+  # Override with: AWS_DEFAULT_REGION
   region: "garage"
 
   # Optional: custom endpoint for MinIO, Cloudflare R2, Backblaze B2, etc.
   # Leave unset to use standard AWS S3.
+  # Override with: AWS_ENDPOINT_URL
   endpoint_url: "https://s3.dornseif.cloud"
 
   # Optional: force path-style addressing (required for MinIO / some S3-compat).
@@ -27,64 +30,96 @@ s3:
   # access_key_id:     ""
   # secret_access_key: ""
 
-  # Optional: prefix to scope bucket listing (e.g. "crawls/2024/")
-  # prefix: ""
+  # Optional: restrict bucket listing to keys under this prefix.
+  # Override with: WARC_S3_PREFIX
+  # prefix: "crawls/2024/"
 
-  # Concurrency for S3 listing / parallel ingest workers.
+  # Number of parallel S3 listing / download workers.
+  # Override with: WARC_S3_CONCURRENCY
   concurrency: 4
 
 # ── Index Storage (local) ────────────────────────────────────────────────────
 storage:
-  # Directory for Tantivy fulltext index.
+  # Directory for Tantivy fulltext index segments.
+  # Override with: WARC_INDEX_PATH
   # index_path: "/var/lib/warc-search/index"
   index_path: "./var/index"
 
-  # Path to SQLite CDX database.
+  # Path to the SQLite CDX database.
+  # Override with: WARC_CDX_DB_PATH
   # cdx_db_path: "/var/lib/warc-search/cdx.db"
   cdx_db_path: "./var/cdx.db"
 
-  # SQLite page cache size in KiB (negative = number of pages × page_size).
-  # 8192 KiB = 8 MiB — intentionally small to stay RAM-friendly.
+  # SQLite page-cache size in KiB.  8 MiB is intentionally small to stay
+  # within the 1–2 GB RAM budget.  Increase for faster CDX queries on large
+  # archives if RAM allows.
   sqlite_cache_kib: 8192
 
 # ── Indexer ───────────────────────────────────────────────────────────────────
 indexer:
-  # How many Tantivy documents to accumulate before committing to disk.
-  # Larger batches = faster ingest, more peak RAM during ingest.
+  # How many Tantivy documents to accumulate before flushing to disk.
+  # Larger batches = faster ingest, higher peak RAM during ingest.
+  # Reduce if the indexer runs out of memory on a small machine.
   batch_size: 5000
 
-  # Maximum body text length to extract per record (bytes).
-  # Prevents huge documents from dominating index memory.
+  # Maximum body-text length extracted from each HTML/PDF record (bytes).
+  # Prevents very large pages from dominating index RAM during ingest.
   max_text_bytes: 524288  # 512 KiB
 
-  # Whether to index PDF files found in the bucket.
+  # Index PDF files found in the S3 bucket.
   index_pdfs: true
 
-  # Whether to index WARC response records.
+  # Index WARC response records (HTML, text, etc.).
+  # Set to false to build a CDX-only index without fulltext search.
   index_warc_responses: true
 
-  # Glob patterns to skip (matched against WARC-Target-URI or S3 key).
+  # URL glob patterns to skip during ingest (matched against WARC-Target-URI).
+  # Useful for excluding static assets that add noise to the fulltext index.
   # skip_patterns:
   #   - "*.css"
   #   - "*.js"
+  #   - "*.png"
+  #   - "*.jpg"
+
+  # Domains to exclude from indexing.
+  #
+  # Records whose WARC-Target-URI belongs to a listed domain — or any of its
+  # subdomains — are silently skipped during ingest.  In addition, each time
+  # `tywb index` runs it removes all existing CDX and fulltext entries for
+  # these domains before processing new WARC files.  Adding a domain here and
+  # running `tywb index` is sufficient to scrub it from the index entirely.
+  #
+  # Subdomain matching is automatic: "example.com" also covers
+  # "www.example.com", "cdn.example.com", "deep.sub.example.com", etc.
+  #
+  # blacklisted_domains:
+  #   - spam-site.example.com
+  #   - ads.example.net
 
 # ── Server ────────────────────────────────────────────────────────────────────
 server:
-  # Address and port to bind the HTTP server.
+  # Address and port for the HTTP server.
+  # Override with: WARC_SERVER_BIND
   bind: "0.0.0.0:8080"
 
-  # Maximum number of search results to return per query.
+  # Maximum number of fulltext search results returned per query.
+  # The /search JSON API and /ui/search HTML page both respect this limit.
+  # Requests may ask for fewer via the `limit` parameter (capped at 500).
   max_results: 50
 
   # Enable the Wayback-compatible replay API at /web/{timestamp}/{url}.
+  # When enabled, replayed HTML pages receive a sticky toolbar and wombat.js
+  # URL rewriting automatically.  Disable only if you need a CDX/search-only
+  # deployment without serving archived content.
   enable_replay: true
 
-  # Optional: static files directory for the web UI.
-  # Leave unset to serve only the JSON API.
+  # Optional: directory of static files to serve under /_static/.
+  # Leave unset unless you are customising the web UI.
   # static_dir: "/var/lib/warc-search/ui"
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 log:
   # Tracing filter — same syntax as RUST_LOG.
-  # Can be overridden with the RUST_LOG environment variable.
+  # Examples: "info", "debug", "tywb=debug,info", "warn"
+  # Override with: RUST_LOG
   level: "info"

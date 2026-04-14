@@ -5,3 +5,5 @@
 - Implement the concept of different collections
 - index PDFs
 - Allow to blacklist domains in the config file. They will be not indexed, and removed from the index.
+- In the UI browse suppress all non 2xx URLs unless there is an checkmark is set
+- Allow more than a single buxket to lk for WARC files

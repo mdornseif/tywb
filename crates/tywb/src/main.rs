@@ -56,6 +56,10 @@ enum Command {
         /// Stop after this many new CDX entries have been written.
         #[arg(long)]
         max_urls: Option<u64>,
+        /// Re-process all WARC files even if their ETag matches the saved state.
+        /// Use this to update existing CDX records (e.g. after a bug fix).
+        #[arg(long)]
+        force: bool,
     },
     /// Run the HTTP search and replay server.
     Server,
@@ -90,8 +94,8 @@ async fn main() -> anyhow::Result<()> {
     info!(config = %cli.config.display(), "tywb starting");
 
     match cli.command {
-        Command::Index { file, max_files, max_urls } =>
-            index::run(cfg, index::IndexArgs { file, max_files, max_urls }).await,
+        Command::Index { file, max_files, max_urls, force } =>
+            index::run(cfg, index::IndexArgs { file, max_files, max_urls, force }).await,
         Command::Server => server::run(cfg).await,
         Command::Stats  => unreachable!(),
     }

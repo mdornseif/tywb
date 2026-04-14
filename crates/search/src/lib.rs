@@ -248,6 +248,18 @@ impl SearchIndex {
         Ok(())
     }
 
+    /// Queue deletion of all documents whose `url` field exactly matches one of
+    /// the given URLs.  Changes are not visible until [`commit`] is called.
+    ///
+    /// Returns the number of delete operations queued (one per distinct URL).
+    pub fn delete_urls(&mut self, urls: &[String]) -> Result<usize> {
+        for url in urls {
+            let term = tantivy::Term::from_field_text(self.fields.url, url);
+            self.writer.delete_term(term);
+        }
+        Ok(urls.len())
+    }
+
     // ── Reads ─────────────────────────────────────────────────────────────────
 
     /// Fulltext search.

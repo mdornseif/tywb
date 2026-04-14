@@ -15,13 +15,17 @@ Commands:
 
 - **Fulltext search** — Tantivy-powered, ~30 MB idle RAM regardless of index size
 - **Wayback replay** — `GET /web/{timestamp}/{url}` fetches only the relevant bytes via S3 Range GET; a 10 GB WARC costs one small range request per replay
+- **Wayback toolbar** — sticky archive bar injected into replayed HTML pages showing the capture date, original URL, and a link to other captures; uses [wombat.js](https://github.com/webrecorder/wombat) for client-side URL rewriting
 - **CDX API** — Wayback-compatible `/cdx` endpoint with exact and prefix URL lookup
 - **CDX timemap** — `GET /web/timemap/cdx` compatible with Zeno and gowarc deduplication
 - **Domain browser** — hierarchical TLD → domain → captures navigation at `/ui/browse`
+- **URL captures page** — `/ui/url?url=<url>` lists all captures for a specific URL
 - **S3-compatible storage** — works with AWS S3, MinIO, Cloudflare R2, Backblaze B2
 - **Incremental indexing** — ETag-based state file skips unchanged objects on re-runs
 - **SQLite CDX index** — WAL-mode, concurrent reads, no daemon overhead
 - **Compressed WARC replay** — per-gzip-member offsets stored in CDX so `.warc.gz` replay is a targeted range GET, not a full decompression
+- **Domain blacklist** — exclude domains (and their subdomains) from indexing; existing entries are purged automatically on next run
+- **warcinfo storage** — the `warcinfo` record from each WARC file is stored in SQLite for audit and provenance tracking
 
 ## Architecture
 
@@ -77,6 +81,8 @@ cargo run --release -p tywb -- --config config.local.yaml index
 
 Streams each WARC file from S3, parses it record-by-record, writes CDX entries to SQLite, and adds extracted text to the Tantivy index. Saves progress after each file, so a crash on a large bucket is safe to resume.
 
+After each WARC file is indexed, a CDX sidecar file is written to the same S3 bucket alongside the WARC (see [CDX sidecar files](#cdx-sidecar-files) below). If the sidecar already exists it is left untouched.
+
 **Indexer options:**
 
 | Flag | Description |
@@ -84,8 +90,28 @@ Streams each WARC file from S3, parses it record-by-record, writes CDX entries t
 | `--file <KEY>` | Index only this S3 key (bypasses listing) |
 | `--max-files <N>` | Stop after processing N WARC files |
 | `--max-urls <N>` | Stop after writing N new CDX entries |
+| `--force` | Re-process all WARC files even if their ETag matches the saved state (use to repair existing index data) |
 
 **Live status:** press **Ctrl+T** (macOS/BSD) or send **SIGUSR1** (Linux) to print current file, URL, throughput (rec/s, MB/s) to stderr without interrupting indexing.
+
+### Domain blacklist
+
+Domains (and all their subdomains) can be excluded from indexing by listing them under `indexer.blacklisted_domains` in `config.yaml`:
+
+```yaml
+indexer:
+  blacklisted_domains:
+    - spam-site.example.com
+    - ads.example.net
+```
+
+Two things happen automatically each time `tywb index` runs:
+
+1. **Skip during ingest** — any WARC record whose `WARC-Target-URI` belongs to a blacklisted domain (or one of its subdomains) is silently skipped; nothing is written to the CDX or fulltext index for that record.
+
+2. **Purge existing data** — before processing new files, tywb removes all CDX records and fulltext index entries for every blacklisted domain from the current index.  This means adding a domain to the blacklist and re-running `tywb index` is sufficient to clean up previously-indexed data — no manual database surgery required.
+
+Subdomain matching is automatic: `example.com` in the blacklist covers `www.example.com`, `cdn.example.com`, `deep.sub.example.com`, etc.
 
 ### 3. Serve
 
@@ -145,6 +171,13 @@ curl 'http://localhost:8080/web/20240315120000/https://example.com/'
 
 This is compatible with standard Wayback Machine client tooling and browser extensions.
 
+**Wayback toolbar** — for `text/html` responses tywb automatically injects:
+
+1. A sticky dark toolbar at the top of the page showing the archive date, the original URL, and a link to all captures of that URL (`/ui/url?url=…`).
+2. [wombat.js](https://github.com/webrecorder/wombat) — Webrecorder's client-side URL rewriting library — loaded from `/_wb/wombat.js` and initialized so that links and resources resolve correctly within the archive context.
+
+No configuration is required; the toolbar is always active for HTML replay responses.
+
 ### CDX API
 
 ```
@@ -203,13 +236,27 @@ To use tywb as a deduplication server with Zeno, pass:
 --warc-cdx-dedupe-server http://<tywb-host>:8080
 ```
 
-### Domain browser
+### Web UI
 
-The web UI at `/ui/browse` provides a three-level hierarchy:
+| Path | Description |
+|------|-------------|
+| `/` | Homepage with index statistics (record count, date range, MIME breakdown) |
+| `/ui/search` | HTML fulltext search form |
+| `/ui/browse` | Domain browser — TLD → domain → captures hierarchy |
+| `/ui/url?url=<url>` | All archived captures for a specific URL, sorted by date |
+| `/ui/files` | List of indexed WARC files with per-file statistics |
+
+#### Domain browser
+
+`/ui/browse` provides a three-level hierarchy:
 
 - `/ui/browse` — TLDs sorted by capture count
 - `/ui/browse?tld=de` — domains under a TLD
-- `/ui/browse?domain=example.de` — all captures for a domain
+- `/ui/browse?domain=example.de` — all captures for a domain, deduplicated by URL (each URL appears once, with a count of how many captures exist; clicking links to `/ui/url`)
+
+#### URL captures page
+
+`/ui/url?url=<url>` shows every archived capture of the given URL in chronological order. Each row links directly to the Wayback replay at `/web/<timestamp>/<url>`. Accepts optional `from` and `to` parameters (14-digit timestamps) to filter by date range.
 
 ### Health check
 
@@ -219,7 +266,7 @@ GET /healthz  →  200 OK
 
 ## SQLite schema
 
-Two tables are maintained in `cdx.db`:
+Four tables are maintained in `cdx.db`:
 
 **`cdx`** — one row per indexed WARC record:
 
@@ -228,17 +275,88 @@ Two tables are maintained in `cdx.db`:
 | `surt_url` | SURT-canonicalized URL (primary key component) |
 | `timestamp` | 14-digit capture timestamp (primary key component) |
 | `original` | Original URL |
-| `mime` | HTTP Content-Type of the response body |
+| `mime` | HTTP Content-Type of the response body (extracted from HTTP headers, not the WARC envelope) |
 | `status` | HTTP status code |
 | `digest` | `WARC-Block-Digest` (e.g. `sha1:ABC…`) |
 | `s3_key` | S3 object key of the WARC file |
 | `offset` | Byte offset of the record in the uncompressed stream |
 | `length` | Content-Length of the record block |
-| `c_offset` | Compressed byte offset of the gzip member (`.warc.gz` only) |
+| `c_offset` | Compressed byte offset of the gzip member (`.warc.gz` only; `NULL` for plain `.warc`) |
 
-**`warc_files`** — one row per indexed WARC file with ingest statistics (record counts, date range, MIME histogram, throughput, S3 bucket name).
+**`warc_files`** — one row per indexed WARC file:
 
-**`warcinfo`** — the `warcinfo` WARC record from the start of each file, stored verbatim as text plus a JSON-serialized header array. Useful for auditing crawler software versions, operator metadata, etc.
+| Column | Description |
+|--------|-------------|
+| `s3_key` | S3 object key (primary key) |
+| `etag` | S3 ETag, used for incremental skip logic |
+| `bucket` | S3 bucket name |
+| `first_seen` / `last_indexed` | ISO-8601 UTC timestamps |
+| `warc_records` | Total WARC records parsed |
+| `cdx_new` / `cdx_known` | New vs. updated CDX entries written |
+| `fulltext_indexed` | Documents added to the Tantivy index |
+| `skipped` / `errors` | Non-indexed records and parse errors |
+| `duration_secs` / `bytes_per_sec` / `records_per_sec` | Throughput metrics |
+| `warc_date_min` / `warc_date_max` | Earliest and latest `WARC-Date` values seen |
+| `mime_summary` | JSON object mapping MIME type → record count |
+
+**`warcinfo`** — the `warcinfo` WARC record from the start of each file:
+
+| Column | Description |
+|--------|-------------|
+| `s3_key` | S3 key of the source WARC (primary key) |
+| `bucket` | S3 bucket name |
+| `warc_date` | `WARC-Date` from the warcinfo record |
+| `warc_filename` | `WARC-Filename` header value |
+| `record_id` | `WARC-Record-ID` header value |
+| `headers_json` | All WARC headers serialized as a JSON array of `[name, value]` pairs |
+| `block_text` | Raw text content of the warcinfo block (crawler metadata, operator info, etc.) |
+
+Useful for auditing crawler software versions and operator metadata across a large archive.
+
+## CDX sidecar files
+
+After each WARC file is successfully indexed, tywb writes a CDX sidecar file into the same S3 bucket alongside the WARC. The sidecar key is the WARC key with `.cdx` appended:
+
+```
+crawls/2024/archive.warc.gz   →   crawls/2024/archive.warc.gz.cdx
+crawls/2024/archive.warc      →   crawls/2024/archive.warc.cdx
+```
+
+If a sidecar already exists (detected via a HEAD request) it is left untouched. The write runs as a background task so it never slows down the main indexing loop.
+
+### Format
+
+Sidecar files use the standard CDX-11 plain-text format (`Content-Type: text/plain`):
+
+```
+ CDX N b a m s k r M S V g
+com,example)/ 20240315120000 https://example.com/ text/html 200 sha1:ABC… - - 8192 0 archive.warc.gz
+com,example)/page 20240315120001 https://example.com/page text/html 200 sha1:DEF… - - 4096 8192 archive.warc.gz
+```
+
+| Field | Header char | Content |
+|-------|-------------|---------|
+| SURT URL | `N` | Canonicalized, sort-friendly URL |
+| Timestamp | `b` | 14-digit `YYYYMMDDHHmmss` |
+| Original URL | `a` | Verbatim `WARC-Target-URI` |
+| MIME type | `m` | HTTP `Content-Type` of the response body |
+| HTTP status | `s` | e.g. `200`, `301` |
+| Digest | `k` | `WARC-Block-Digest`, e.g. `sha1:ABC…` |
+| Redirect | `r` | Always `-` (not captured) |
+| Meta | `M` | Always `-` |
+| Record length | `S` | `Content-Length` of the WARC block in bytes |
+| Byte offset | `V` | For `.warc.gz`: compressed gzip-member offset (`c_offset`). For `.warc`: uncompressed stream offset. |
+| Filename | `g` | Basename of the WARC file |
+
+The byte offset field (`V`) matches what is stored in the CDX SQLite database and is suitable for S3 Range GET requests for replay.
+
+### Why
+
+CDX sidecar files make the archived content independently usable without tywb's SQLite database:
+
+- Standard CDX consumers (pywb, OpenWayback, CDX server tools) can read them directly
+- Provides a backup index that lives with the data in S3
+- Enables other tools to locate and replay individual WARC records without running tywb
 
 ## Index statistics
 

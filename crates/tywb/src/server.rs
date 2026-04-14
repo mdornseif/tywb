@@ -92,6 +92,8 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         .route("/web/timemap/cdx",   get(cdx_timemap_handler))
         // ── Wayback replay ────────────────────────────────────────────────
         .route("/web/*rest",         get(replay_handler))
+        // ── Static assets ─────────────────────────────────────────────────
+        .route("/_wb/wombat.js",     get(wombat_js_handler))
         // ── Health ────────────────────────────────────────────────────────
         .route("/healthz",   get(health_handler))
         .layer(TraceLayer::new_for_http())
@@ -456,7 +458,7 @@ async fn replay_handler(
     // `warc_bytes` begins at the WARC record (WARC/1.0\r\n...).
     // Skip the WARC header block to get the HTTP response block.
     let http_block = extract_warc_http_block(&warc_bytes);
-    serve_warc_response(http_block, &cdx_rec.original_url)
+    serve_warc_response(http_block, &cdx_rec.original_url, &cdx_rec.timestamp)
 }
 
 /// Skip WARC headers (everything up to and including the first `\r\n\r\n`) and
@@ -474,8 +476,9 @@ fn extract_warc_http_block(warc_bytes: &[u8]) -> &[u8] {
 ///
 /// `block` must start with the HTTP status line (`HTTP/1.x NNN ...`).
 /// The function extracts status code, Content-Type, Location (for redirects),
-/// and the response body.
-fn serve_warc_response(block: &[u8], original_url: &str) -> Response {
+/// and the response body.  For HTML responses a Wayback toolbar and wombat.js
+/// URL-rewriting shim are injected.
+fn serve_warc_response(block: &[u8], original_url: &str, timestamp: &str) -> Response {
     let sep = b"\r\n\r\n";
     let body_start = block.windows(4).position(|w| w == sep).map(|i| i + 4).unwrap_or(block.len());
     let header_bytes = &block[..body_start.saturating_sub(4)];
@@ -491,13 +494,15 @@ fn serve_warc_response(block: &[u8], original_url: &str) -> Response {
         .unwrap_or(200);
     let status = StatusCode::from_u16(status_code).unwrap_or(StatusCode::OK);
 
+    let mut content_type_val = String::new();
     let mut headers = HeaderMap::new();
     for line in lines {
         if line.is_empty() { break; }
         if let Some((name, val)) = line.split_once(':') {
             match name.trim().to_ascii_lowercase().as_str() {
                 "content-type" => {
-                    if let Ok(hv) = HeaderValue::from_str(val.trim()) {
+                    content_type_val = val.trim().to_owned();
+                    if let Ok(hv) = HeaderValue::from_str(&content_type_val) {
                         headers.insert(header::CONTENT_TYPE, hv);
                     }
                 }
@@ -515,7 +520,212 @@ fn serve_warc_response(block: &[u8], original_url: &str) -> Response {
         headers.insert("X-Archive-Orig-URL", hv);
     }
 
-    (status, headers, body.to_vec()).into_response()
+    let is_html = content_type_val
+        .split(';')
+        .next()
+        .map(|t| t.trim().eq_ignore_ascii_case("text/html"))
+        .unwrap_or(false);
+
+    let final_body: Vec<u8> = if is_html {
+        inject_wayback_ui(body.to_vec(), original_url, timestamp)
+    } else {
+        body.to_vec()
+    };
+
+    (status, headers, final_body).into_response()
+}
+
+// ── Wayback UI injection ──────────────────────────────────────────────────────
+
+/// Inject the Wayback toolbar and wombat.js initializer into an HTML page.
+///
+/// Two injections are made:
+///  1. Before `</head>` — wombat.js `<script>` tag + initialization block.
+///  2. After the opening `<body …>` tag — sticky toolbar banner.
+///
+/// If neither injection point is found the document is returned unchanged.
+fn inject_wayback_ui(mut html: Vec<u8>, original_url: &str, timestamp: &str) -> Vec<u8> {
+    // Build the wombat init block.
+    // wombat_sec = Unix seconds for the timestamp (approximate; we parse YYYYMMDDHHMMSS).
+    let wombat_sec = timestamp_to_unix(timestamp);
+    let scheme = if original_url.starts_with("https") { "https" } else { "http" };
+    let host = {
+        let after_scheme = original_url.find("://").map(|i| &original_url[i + 3..]).unwrap_or(original_url);
+        after_scheme.split('/').next().unwrap_or("")
+    };
+
+    // Percent-encode the original URL for use in the toolbar link.
+    let mut encoded_url = String::new();
+    ui::push_url_encoded(&mut encoded_url, original_url);
+
+    // Human-readable date from timestamp (YYYYMMDDHHMMSS → YYYY-MM-DD HH:MM:SS)
+    let display_date = format_timestamp_display(timestamp);
+
+    let head_injection = format!(
+        r#"<script src="/_wb/wombat.js"></script>
+<script>
+(function() {{
+  var wbinfo = {{
+    "url": {url_json},
+    "timestamp": {ts_json},
+    "request_ts": {ts_json},
+    "prefix": "/web/",
+    "mod": "",
+    "is_framed": false,
+    "is_live": false,
+    "static_prefix": "/_wb/",
+    "enable_auto_fetch": false,
+    "wombat_ts": {ts_json},
+    "wombat_sec": {wombat_sec},
+    "wombat_scheme": {scheme_json},
+    "wombat_host": {host_json},
+    "wombat_opts": {{}}
+  }};
+  if (window._WBWombatInit) {{ window._WBWombatInit(wbinfo); }}
+}})();
+</script>
+"#,
+        url_json    = json_str(original_url),
+        ts_json     = json_str(timestamp),
+        wombat_sec  = wombat_sec,
+        scheme_json = json_str(scheme),
+        host_json   = json_str(host),
+    );
+
+    let toolbar_html = format!(
+        r#"<div id="__tywb_bar" style="position:fixed;top:0;left:0;right:0;z-index:2147483647;background:#2b2b2b;color:#eee;font:13px/1.4 sans-serif;padding:4px 12px;display:flex;align-items:center;gap:12px;box-shadow:0 2px 6px rgba(0,0,0,.4)">
+  <span style="font-weight:bold;color:#f90">tywb</span>
+  <span>Archived: <b>{date}</b></span>
+  <span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"><a href="{orig_url}" style="color:#8cf">{orig_url_display}</a></span>
+  <a href="/ui/url?url={encoded_url}" style="color:#fc8;white-space:nowrap">other captures</a>
+</div>
+<div style="height:32px"></div>
+"#,
+        date             = html_escape(&display_date),
+        orig_url         = html_escape(original_url),
+        orig_url_display = html_escape(truncate_url(original_url, 80)),
+        encoded_url      = encoded_url,
+    );
+
+    // ── Inject before </head> ─────────────────────────────────────────────────
+    if let Some(pos) = find_case_insensitive(&html, b"</head>") {
+        let injection = head_injection.as_bytes();
+        html.splice(pos..pos, injection.iter().copied());
+    }
+
+    // ── Inject after <body ...> ───────────────────────────────────────────────
+    if let Some(pos) = find_body_open(&html) {
+        let injection = toolbar_html.as_bytes();
+        html.splice(pos..pos, injection.iter().copied());
+    }
+
+    html
+}
+
+/// Case-insensitive forward search for `needle` in `haystack`.
+/// Returns the byte position of the first match, or `None`.
+fn find_case_insensitive(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() { return None; }
+    haystack.windows(needle.len()).position(|w| {
+        w.iter().zip(needle.iter()).all(|(a, b)| a.to_ascii_lowercase() == b.to_ascii_lowercase())
+    })
+}
+
+/// Find the position immediately after the `>` that closes the opening `<body` tag.
+fn find_body_open(haystack: &[u8]) -> Option<usize> {
+    let body_pos = find_case_insensitive(haystack, b"<body")?;
+    // Scan forward from `<body` to find the closing `>`.
+    let close = haystack[body_pos..].iter().position(|&b| b == b'>')?;
+    Some(body_pos + close + 1)
+}
+
+/// Escape `<`, `>`, `&`, and `"` for embedding in HTML attribute or text.
+fn html_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&'  => out.push_str("&amp;"),
+            '<'  => out.push_str("&lt;"),
+            '>'  => out.push_str("&gt;"),
+            '"'  => out.push_str("&quot;"),
+            _    => out.push(c),
+        }
+    }
+    out
+}
+
+/// Wrap a string in JSON double quotes with minimal escaping (for JS literals).
+fn json_str(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"'  => out.push_str(r#"\""#),
+            '\\' => out.push_str(r"\\"),
+            '\n' => out.push_str(r"\n"),
+            '\r' => out.push_str(r"\r"),
+            _    => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Truncate a URL to at most `max` characters, appending `…` if truncated.
+fn truncate_url(url: &str, max: usize) -> &str {
+    if url.len() <= max { url } else { &url[..max] }
+}
+
+/// Convert a 14-digit WARC timestamp (YYYYMMDDHHMMSS) to approximate Unix seconds.
+/// Returns 0 if the timestamp cannot be parsed.
+fn timestamp_to_unix(ts: &str) -> i64 {
+    if ts.len() < 14 { return 0; }
+    let year:  i64 = ts[0..4].parse().unwrap_or(1970);
+    let month: i64 = ts[4..6].parse().unwrap_or(1);
+    let day:   i64 = ts[6..8].parse().unwrap_or(1);
+    let hour:  i64 = ts[8..10].parse().unwrap_or(0);
+    let min:   i64 = ts[10..12].parse().unwrap_or(0);
+    let sec:   i64 = ts[12..14].parse().unwrap_or(0);
+
+    // Days since Unix epoch (Jan 1 1970).  Approximate — ignores leap seconds.
+    let days = days_from_civil(year, month, day);
+    days * 86400 + hour * 3600 + min * 60 + sec
+}
+
+/// Days since 1970-01-01 for a proleptic Gregorian date (Howard Hinnant algorithm).
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;                            // [0, 399]
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1; // [0, 365]
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;  // [0, 146096]
+    era * 146097 + doe - 719468
+}
+
+/// Format a 14-digit timestamp as `YYYY-MM-DD HH:MM:SS`.
+fn format_timestamp_display(ts: &str) -> String {
+    if ts.len() < 14 {
+        return ts.to_owned();
+    }
+    format!(
+        "{}-{}-{} {}:{}:{}",
+        &ts[0..4], &ts[4..6], &ts[6..8],
+        &ts[8..10], &ts[10..12], &ts[12..14],
+    )
+}
+
+// ── /_wb/wombat.js — embedded static asset ───────────────────────────────────
+
+async fn wombat_js_handler() -> impl IntoResponse {
+    static WOMBAT_JS: &[u8] = include_bytes!("wombat.js");
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE,  "application/javascript; charset=utf-8"),
+            (header::CACHE_CONTROL, "public, max-age=86400"),
+        ],
+        WOMBAT_JS,
+    )
 }
 
 // ── /cdx — CDX API ───────────────────────────────────────────────────────────

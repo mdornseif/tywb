@@ -275,6 +275,41 @@ impl CdxStore {
         Ok(n)
     }
 
+    /// Return all distinct `original` URLs whose SURT key belongs to a domain.
+    ///
+    /// `surt_host` is the reversed-label form of the domain **without** the
+    /// trailing `)`, e.g. `"com,example"` for `example.com`.  The query matches
+    /// both the apex domain (`com,example)/…`) and any subdomain
+    /// (`com,example,www)/…`, `com,example,cdn)/…`, etc.).
+    pub fn original_urls_for_domain_surt(&self, surt_host: &str) -> Result<Vec<String>> {
+        let apex_pat = format!("{surt_host})%");
+        let sub_pat  = format!("{surt_host},%");
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT DISTINCT original FROM cdx
+             WHERE surt_url LIKE ?1 OR surt_url LIKE ?2",
+        )?;
+        let rows = stmt.query_map(params![apex_pat, sub_pat], |row| row.get(0))?;
+        let mut urls = Vec::new();
+        for r in rows {
+            urls.push(r?);
+        }
+        Ok(urls)
+    }
+
+    /// Delete all CDX records for a domain (apex + all subdomains).
+    ///
+    /// `surt_host` — same format as [`original_urls_for_domain_surt`].
+    /// Returns the number of rows deleted.
+    pub fn delete_by_domain_surt(&self, surt_host: &str) -> Result<usize> {
+        let apex_pat = format!("{surt_host})%");
+        let sub_pat  = format!("{surt_host},%");
+        let n = self.conn.execute(
+            "DELETE FROM cdx WHERE surt_url LIKE ?1 OR surt_url LIKE ?2",
+            params![apex_pat, sub_pat],
+        )?;
+        Ok(n)
+    }
+
     // ── Reads ─────────────────────────────────────────────────────────────────
 
     /// Look up records for an exact SURT URL, ordered by timestamp ascending.

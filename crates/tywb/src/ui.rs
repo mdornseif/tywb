@@ -842,7 +842,7 @@ pub fn browse_captures_html(
 
 /// Percent-encode a string for use as a URL query-parameter value.
 /// Encodes everything except unreserved characters (A–Z a–z 0–9 - _ . ~).
-fn push_url_encoded(out: &mut String, s: &str) {
+pub fn push_url_encoded(out: &mut String, s: &str) {
     for byte in s.bytes() {
         match byte {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9'
