@@ -64,9 +64,10 @@ CREATE TABLE IF NOT EXISTS warcinfo (
 ";
 
 const PRAGMAS: &str = "
-PRAGMA journal_mode = WAL;
-PRAGMA synchronous  = NORMAL;
-PRAGMA foreign_keys = ON;
+PRAGMA journal_mode       = WAL;
+PRAGMA synchronous        = NORMAL;
+PRAGMA foreign_keys       = ON;
+PRAGMA wal_autocheckpoint = 0;
 ";
 
 // ── WARC file metadata ────────────────────────────────────────────────────────
@@ -589,14 +590,51 @@ impl CdxStore {
         rows.map(|r| r.map_err(CdxError::from)).collect()
     }
 
-    /// Return all unique SURT domain prefixes (everything before `)`) that fall
-    /// under `tld`, with record counts sorted descending.
+    /// Return all unique registered-domain SURT prefixes (`tld,name`) under
+    /// `tld`, with record counts summed across all subdomains, sorted descending.
     ///
-    /// E.g. for `tld = "com"` returns `("com,example", 5000)`, `("com,example,www", 1000)`, …
+    /// E.g. for `tld = "de"` returns `("de,obstsortendatenbank", 42)` where 42
+    /// is the total count for both `obstsortendatenbank.de` and
+    /// `www.obstsortendatenbank.de`.
     pub fn browse_domains(&self, tld: &str, limit: usize) -> Result<Vec<(String, u64)>> {
-        // Lower bound: "com,"  Upper bound: "com-" (ASCII 0x2D = 0x2C + 1)
         let lower = format!("{},", tld);
         let upper = next_prefix(&lower);
+        // Extract only the first two SURT labels (tld,name) so all subdomains
+        // of the same registered domain collapse into one row.
+        // length(?1) is len("de,") = len(tld)+1; the label starts at position
+        // length(?1)+1.  If a second comma exists in that suffix the label ends
+        // just before it; otherwise we take everything up to ')'.
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT CASE
+                      WHEN instr(substr(surt_url, length(?1)+1), ',') > 0
+                      THEN substr(surt_url, 1,
+                                  length(?1) + instr(substr(surt_url, length(?1)+1), ',') - 1)
+                      ELSE substr(surt_url, 1, instr(surt_url, ')') - 1)
+                    END AS surt_domain,
+                    COUNT(*) AS n
+             FROM   cdx
+             WHERE  surt_url >= ?1 AND surt_url < ?2
+             GROUP  BY surt_domain
+             ORDER  BY n DESC
+             LIMIT  ?3",
+        )?;
+        let rows = stmt.query_map(params![lower, upper, limit as i64], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64))
+        })?;
+        rows.map(|r| r.map_err(CdxError::from)).collect()
+    }
+
+    /// Return all distinct hostnames (full SURT domain prefix, before `)`) under
+    /// a registered-domain SURT prefix, with record counts sorted descending.
+    ///
+    /// `surt_prefix` should be the two-label form, e.g. `"de,obstsortendatenbank"`.
+    /// Returns both the apex (`de,obstsortendatenbank`) and all subdomains
+    /// (`de,obstsortendatenbank,www`, …).
+    pub fn browse_subdomains(&self, surt_prefix: &str, limit: usize) -> Result<Vec<(String, u64)>> {
+        // ')' (0x29) < ',' (0x2C), so apex records sort before subdomain records.
+        // Range [surt_prefix+")", next_prefix(surt_prefix+",")] covers both.
+        let lower = format!("{})", surt_prefix);
+        let upper = next_prefix(&format!("{},", surt_prefix));
         let mut stmt = self.conn.prepare_cached(
             "SELECT substr(surt_url, 1, instr(surt_url, ')') - 1) AS surt_domain,
                     COUNT(*) AS n

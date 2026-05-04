@@ -170,6 +170,24 @@ tr:last-child td{border-bottom:none}
 .section-head{font-size:.95rem;font-weight:600;margin-bottom:.75rem;color:var(--text)}
 .more-note{font-size:.8rem;color:var(--muted);margin-top:.5rem}
 
+/* ── query language help ── */
+.ql-help{background:var(--card);border:1px solid var(--border);
+  border-radius:10px;padding:.65rem 1.1rem;margin-bottom:1rem;font-size:.875rem}
+.ql-help summary{cursor:pointer;color:var(--muted);user-select:none;
+  font-size:.82rem;padding:.15rem 0}
+.ql-help summary:hover{color:var(--text)}
+.ql-body{margin-top:.75rem}
+.ql-table{width:100%;border-collapse:collapse;margin-bottom:.6rem}
+.ql-table th{padding:.3rem .65rem;text-align:left;font-size:.7rem;
+  text-transform:uppercase;letter-spacing:.5px;color:var(--muted);
+  border-bottom:2px solid var(--border)}
+.ql-table td{padding:.3rem .65rem;font-size:.8rem;
+  border-bottom:1px solid var(--border);vertical-align:top}
+.ql-table tr:last-child td{border-bottom:none}
+.ql-table code{background:var(--bg);padding:.05rem .3rem;border-radius:4px;
+  font-size:.8rem}
+.ql-note{font-size:.78rem;color:var(--muted);margin-top:.4rem}
+
 /* ── empty / error states ── */
 .empty{text-align:center;padding:3rem 1rem;color:var(--muted)}
 .empty-icon{font-size:2rem;margin-bottom:.5rem}
@@ -420,6 +438,28 @@ pub fn search_html(
     push_esc(&mut c, to.unwrap_or(""));
     c.push_str("\">\n");
     c.push_str("  </div>\n</form>\n</div>\n");
+
+    // ── Query language help ───────────────────────────────────────────────
+    c.push_str(r#"<details class="ql-help">
+<summary>Query language</summary>
+<div class="ql-body">
+<table class="ql-table">
+<tr><th>Syntax</th><th>Meaning</th><th>Example</th></tr>
+<tr><td><code>word</code></td><td>Match either word in title or body (OR)</td><td><code>apple orange</code></td></tr>
+<tr><td><code>word1 AND word2</code></td><td>Both words must appear</td><td><code>climate AND policy</code></td></tr>
+<tr><td><code>word1 OR word2</code></td><td>Either word (explicit)</td><td><code>colour OR color</code></td></tr>
+<tr><td><code>NOT word</code></td><td>Exclude word</td><td><code>python NOT snake</code></td></tr>
+<tr><td><code>+word</code></td><td>Word must appear</td><td><code>+rust programming</code></td></tr>
+<tr><td><code>-word</code></td><td>Word must not appear</td><td><code>java -coffee</code></td></tr>
+<tr><td><code>"phrase"</code></td><td>Exact phrase</td><td><code>"machine learning"</code></td></tr>
+<tr><td><code>title:word</code></td><td>Search in page title only</td><td><code>title:homepage</code></td></tr>
+<tr><td><code>body:word</code></td><td>Search in page body only</td><td><code>body:contact</code></td></tr>
+<tr><td><code>mime:type</code></td><td>Filter by MIME type (exact)</td><td><code>mime:text/html</code></td></tr>
+</table>
+<p class="ql-note">Use the <strong>From</strong> / <strong>To</strong> fields to restrict by capture date (YYYYMMDD). Default fields searched are <em>title</em> and <em>body</em>.</p>
+</div>
+</details>
+"#);
 
     if q.is_empty() {
         return page_html("Search", "search", &c);
@@ -760,13 +800,82 @@ pub fn browse_domains_html(tld: &str, domains: &[(String, u64)], truncated: bool
     page_html(&title, "browse", &c)
 }
 
+/// Level 2b — list of specific hostnames under a registered domain.
+/// `tld`: e.g. `"de"`, `registered_domain`: e.g. `"obstsortendatenbank.de"`.
+/// Each entry links to the captures page for that exact hostname.
+pub fn browse_subdomains_html(
+    tld: &str,
+    registered_domain: &str,
+    hostnames: &[(String, u64)],
+    truncated: bool,
+) -> String {
+    let mut c = String::with_capacity(2048 + hostnames.len() * 120);
+
+    c.push_str("<div class=\"breadcrumb\">\n");
+    c.push_str("  <a href=\"/ui/browse\">Browse</a>\n");
+    c.push_str("  <span class=\"sep\">/</span>\n");
+    c.push_str("  <a href=\"/ui/browse?tld=");
+    push_esc(&mut c, tld);
+    c.push_str("\">.");
+    push_esc(&mut c, tld);
+    c.push_str("</a>\n");
+    c.push_str("  <span class=\"sep\">/</span>\n");
+    c.push_str("  <strong>");
+    push_esc(&mut c, registered_domain);
+    c.push_str("</strong>\n</div>\n");
+
+    let title = registered_domain.to_owned();
+
+    if hostnames.is_empty() {
+        c.push_str("<div class=\"empty\">No hostnames found.</div>\n");
+        return page_html(&title, "browse", &c);
+    }
+
+    c.push_str("<p style=\"font-size:.85rem;color:var(--muted);margin-bottom:.875rem\">");
+    push_esc(&mut c, &fmt_count(hostnames.len() as u64));
+    c.push_str(" hostname");
+    if hostnames.len() != 1 { c.push('s'); }
+    c.push_str(" under <strong>");
+    push_esc(&mut c, registered_domain);
+    c.push_str("</strong> — click to view captures.</p>\n");
+
+    c.push_str("<div class=\"browse-grid\">\n");
+    for (surt_domain, n) in hostnames {
+        let hostname = surt_to_domain(surt_domain);
+        c.push_str("  <a class=\"browse-card\" href=\"/ui/browse?domain=");
+        for ch in hostname.chars() {
+            if ch.is_alphanumeric() || ch == '.' || ch == '-' {
+                c.push(ch);
+            } else {
+                c.push_str(&format!("%{:02X}", ch as u32));
+            }
+        }
+        c.push_str("\">\n    <span class=\"domain\">");
+        push_esc(&mut c, &hostname);
+        c.push_str("</span>\n    <span class=\"cnt\">");
+        push_esc(&mut c, &fmt_count(*n));
+        c.push_str("</span>\n  </a>\n");
+    }
+    c.push_str("</div>\n");
+
+    if truncated {
+        c.push_str("<p class=\"more-note\">Showing top 500 hostnames by record count.</p>\n");
+    }
+
+    page_html(&title, "browse", &c)
+}
+
 /// Level 3 — captures under a specific hostname/domain prefix.
 /// Reuses the captures table layout from url_html.
+///
+/// `show_all`: when false (default) URLs whose every capture has a non-2xx
+/// status code are hidden.  When true all URLs are shown.
 pub fn browse_captures_html(
     domain: &str,
     tld: &str,
     records: &[CdxRecord],
     truncated: bool,
+    show_all: bool,
 ) -> String {
     let mut c = String::with_capacity(2048 + records.len() * 128);
 
@@ -792,21 +901,47 @@ pub fn browse_captures_html(
     }
 
     // Deduplicate: count captures per unique URL, preserving first-seen order.
-    let mut urls: Vec<(&str, usize)> = Vec::new();
+    // Also track whether any capture for a URL returned a 2xx status.
+    struct UrlEntry<'a> {
+        url: &'a str,
+        count: usize,
+        has_2xx: bool,
+    }
+    let mut all_urls: Vec<UrlEntry> = Vec::new();
     let mut last: Option<&str> = None;
     for rec in records {
+        let is_2xx = rec.status.map_or(false, |s| s >= 200 && s < 300);
         if last == Some(rec.original_url.as_str()) {
-            urls.last_mut().unwrap().1 += 1;
+            let e = all_urls.last_mut().unwrap();
+            e.count += 1;
+            e.has_2xx |= is_2xx;
         } else {
-            urls.push((rec.original_url.as_str(), 1));
+            all_urls.push(UrlEntry { url: rec.original_url.as_str(), count: 1, has_2xx: is_2xx });
             last = Some(rec.original_url.as_str());
         }
     }
 
-    c.push_str("<p class=\"cap-count\">");
-    push_esc(&mut c, &fmt_count(urls.len() as u64));
+    let suppressed = all_urls.iter().filter(|e| !e.has_2xx).count();
+    let visible: Vec<&UrlEntry> = all_urls
+        .iter()
+        .filter(|e| show_all || e.has_2xx)
+        .collect();
+
+    // Build the toggle URL: /ui/browse?domain=<domain>[&all=1]
+    let mut base_url = String::from("/ui/browse?domain=");
+    push_url_encoded(&mut base_url, domain);
+    let toggle_url = if show_all {
+        base_url.clone()                 // uncheck → remove &all=1
+    } else {
+        format!("{base_url}&all=1")       // check → add &all=1
+    };
+
+    // Summary line + checkbox toggle
+    c.push_str("<div style=\"display:flex;align-items:baseline;gap:1.2rem;flex-wrap:wrap;margin-bottom:.7rem\">\n");
+    c.push_str("<p class=\"cap-count\" style=\"margin:0\">");
+    push_esc(&mut c, &fmt_count(visible.len() as u64));
     if truncated { c.push_str("+"); }
-    c.push_str(if urls.len() == 1 { " URL" } else { " URLs" });
+    c.push_str(if visible.len() == 1 { " URL" } else { " URLs" });
     c.push_str(" &nbsp;·&nbsp; ");
     push_esc(&mut c, &fmt_count(records.len() as u64));
     if truncated { c.push_str("+"); }
@@ -815,19 +950,39 @@ pub fn browse_captures_html(
     push_esc(&mut c, domain);
     c.push_str("</strong></p>\n");
 
+    // Checkbox — navigates to toggle URL on change (no form needed)
+    c.push_str("<label style=\"font-size:.85rem;color:var(--muted);cursor:pointer;white-space:nowrap\">\n");
+    c.push_str("  <input type=\"checkbox\" onchange=\"location.href='");
+    push_esc(&mut c, &toggle_url);
+    c.push_str("'\"");
+    if show_all { c.push_str(" checked"); }
+    c.push_str("> Show non-2xx");
+    if suppressed > 0 && !show_all {
+        c.push_str(" <span style=\"color:var(--muted)\">(");
+        c.push_str(&suppressed.to_string());
+        c.push_str(" hidden)</span>");
+    }
+    c.push_str("\n</label>\n");
+    c.push_str("</div>\n");
+
+    if visible.is_empty() {
+        c.push_str("<div class=\"empty\"><div class=\"empty-icon\">\u{2139}\u{fe0f}</div>All captures for this domain returned non-2xx status codes. Check \u{201c}Show non-2xx\u{201d} above to see them.</div>\n");
+        return page_html(&title, "browse", &c);
+    }
+
     // Table: URL | captures
     c.push_str("<div class=\"table-wrap\">\n<table>\n");
     c.push_str("<thead><tr><th>URL</th><th class=\"num\">Captures</th></tr></thead>\n<tbody>\n");
 
-    for (url, count) in &urls {
+    for entry in &visible {
         c.push_str("<tr>\n  <td style=\"max-width:520px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap\" title=\"");
-        push_esc(&mut c, url);
+        push_esc(&mut c, entry.url);
         c.push_str("\"><a href=\"/ui/url?url=");
-        push_url_encoded(&mut c, url);
+        push_url_encoded(&mut c, entry.url);
         c.push_str("\">");
-        push_esc(&mut c, url);
+        push_esc(&mut c, entry.url);
         c.push_str("</a></td>\n  <td class=\"num\">");
-        c.push_str(&count.to_string());
+        c.push_str(&entry.count.to_string());
         c.push_str("</td>\n</tr>\n");
     }
 

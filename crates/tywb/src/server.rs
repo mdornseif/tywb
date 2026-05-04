@@ -239,6 +239,8 @@ async fn ui_files_handler(State(state): State<Arc<AppState>>) -> Response {
 struct BrowseParams {
     tld:    Option<String>,
     domain: Option<String>,
+    /// When present and non-zero, show non-2xx URLs too.
+    all:    Option<u8>,
 }
 
 async fn browse_handler(
@@ -246,27 +248,52 @@ async fn browse_handler(
     Query(params): Query<BrowseParams>,
 ) -> Response {
     if let Some(domain) = &params.domain {
-        // Level 3: captures under a domain name (e.g. "example.com")
         let domain = domain.trim().to_owned();
-        let surt_prefix = ui::domain_to_surt_prefix(&domain);
-
-        // Extract TLD for the back-link breadcrumb
         let tld = domain.rsplit('.').next().unwrap_or("").to_owned();
+        let dot_count = domain.chars().filter(|&c| c == '.').count();
 
-        const MAX_CAPTURES: usize = 5000;
-        let records = {
-            state.cdx.lock().unwrap()
-                .get_by_surt_prefix(&surt_prefix, MAX_CAPTURES + 1)
-        };
-        match records {
-            Ok(mut recs) => {
-                let truncated = recs.len() > MAX_CAPTURES;
-                if truncated { recs.truncate(MAX_CAPTURES); }
-                Html(ui::browse_captures_html(&domain, &tld, &recs, truncated)).into_response()
+        if dot_count == 1 {
+            // Level 2b: registered domain (e.g. "obstsortendatenbank.de") —
+            // show all hostnames under it before diving into captures.
+            let surt_prefix = {
+                // domain_to_surt_prefix appends ')'; strip it to get the bare prefix.
+                let p = ui::domain_to_surt_prefix(&domain);
+                p[..p.len() - 1].to_owned()
+            };
+            const MAX_HOSTS: usize = 500;
+            let hosts = {
+                state.cdx.lock().unwrap().browse_subdomains(&surt_prefix, MAX_HOSTS + 1)
+            };
+            match hosts {
+                Ok(mut rows) => {
+                    let truncated = rows.len() > MAX_HOSTS;
+                    if truncated { rows.truncate(MAX_HOSTS); }
+                    Html(ui::browse_subdomains_html(&tld, &domain, &rows, truncated)).into_response()
+                }
+                Err(e) => {
+                    error!(err = %e, "browse subdomains query failed");
+                    (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+                }
             }
-            Err(e) => {
-                error!(err = %e, "browse captures query failed");
-                (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+        } else {
+            // Level 3: specific hostname (e.g. "www.obstsortendatenbank.de") — captures.
+            let surt_prefix = ui::domain_to_surt_prefix(&domain);
+            let show_all = params.all.unwrap_or(0) != 0;
+            const MAX_CAPTURES: usize = 5000;
+            let records = {
+                state.cdx.lock().unwrap()
+                    .get_by_surt_prefix(&surt_prefix, MAX_CAPTURES + 1)
+            };
+            match records {
+                Ok(mut recs) => {
+                    let truncated = recs.len() > MAX_CAPTURES;
+                    if truncated { recs.truncate(MAX_CAPTURES); }
+                    Html(ui::browse_captures_html(&domain, &tld, &recs, truncated, show_all)).into_response()
+                }
+                Err(e) => {
+                    error!(err = %e, "browse captures query failed");
+                    (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+                }
             }
         }
     } else if let Some(tld) = &params.tld {
@@ -411,7 +438,7 @@ async fn replay_handler(
                 return (
                     StatusCode::SERVICE_UNAVAILABLE,
                     "This record predates compressed-offset indexing. \
-                     Re-index to enable replay (tywb index).",
+                     Re-index (tywb index --force) then restart the server.",
                 )
                     .into_response();
             }
