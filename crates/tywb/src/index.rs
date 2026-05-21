@@ -486,6 +486,10 @@ async fn index_warc_object(
                     }
                 }
 
+                // Always keep atomics current so Ctrl-T / SIGINFO is accurate.
+                progress.warc_records.store(warc_records_total, Ordering::Relaxed);
+                progress.cdx_found.store(out.len(), Ordering::Relaxed);
+
                 // Periodic progress log.
                 if warc_records_total % PROGRESS_EVERY == 0 {
                     let bytes_read = progress.bytes_read.load(Ordering::Relaxed);
@@ -494,8 +498,6 @@ async fn index_warc_object(
                     let file_secs  = (elapsed_ms.saturating_sub(file_start)) as f64 / 1000.0;
                     let rec_per_sec = if file_secs > 0.0 { warc_records_total as f64 / file_secs } else { 0.0 };
                     let mb_per_sec  = if file_secs > 0.0 { bytes_read as f64 / 1_048_576.0 / file_secs } else { 0.0 };
-                    progress.warc_records.store(warc_records_total, Ordering::Relaxed);
-                    progress.cdx_found.store(out.len(), Ordering::Relaxed);
                     info!(
                         key          = %key,
                         warc_records = warc_records_total,
