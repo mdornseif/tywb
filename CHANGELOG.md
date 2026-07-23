@@ -33,8 +33,16 @@ this project does not yet publish tagged releases, so everything lands under
   - anything structurally unexpected (missing `Content-Length`, truncated
     record, non-WARC content) aborts that object and leaves it untouched.
 
+  `--salvage-truncated` additionally handles sources that simply stop — a gzip
+  stream without its trailer, or a last WARC record cut off mid-block. Every
+  complete record before the break is kept, the incomplete tail is dropped, and
+  the verification invariant weakens from "payload is identical" to "payload is
+  an exact prefix of the source" — still byte-for-byte over everything kept.
+  Without the flag such files are reported and left alone, so bytes are never
+  dropped silently.
+
   Flags: `--file`, `--limit`, `--jobs`, `--workdir`, `--dry-run`, `--scan-only`,
-  `--backup-suffix`.
+  `--backup-suffix`, `--salvage-truncated`.
 
   The rewritten object keeps the content type of the original — only the gzip
   framing changes, so inventing a new one would be a silent metadata change for
@@ -57,6 +65,13 @@ this project does not yet publish tagged releases, so everything lands under
   JSON `/search` endpoint is unchanged.
 
 ### Fixed
+
+- **Large S3 transfers were aborted mid-flight.** The SDK's stalled-stream
+  protection kills a transfer whose throughput drops to 0 B/s for a moment
+  ("dispatch failure: timeout: minimum throughput was specified at 1 B/s").
+  Against a single-node Garage moving several hundred-MB objects at once that
+  is routine, and it failed 28 of 67 objects in the first recompress run. The
+  protection is now disabled and uploads retry like downloads already did.
 
 - **Uploads to Garage failed with `InvalidRequest: Invalid payload signature`.**
   Since AWS SDK 1.72 the default `RequestChecksumCalculation::WhenSupported`

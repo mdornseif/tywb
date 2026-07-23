@@ -96,6 +96,11 @@ enum Command {
         /// Suffix under which the original object is preserved.
         #[arg(long, default_value = ".bak")]
         backup_suffix: String,
+        /// Also rewrite sources whose gzip stream or last record is cut off:
+        /// every complete record before the break is kept, the incomplete tail
+        /// is dropped. Without this such files are reported and left alone.
+        #[arg(long)]
+        salvage_truncated: bool,
     },
 }
 
@@ -130,9 +135,11 @@ async fn main() -> anyhow::Result<()> {
             index::run(cfg, index::IndexArgs { file, max_files, max_urls, force }).await,
         Command::Server => server::run(cfg).await,
         Command::Stats  => unreachable!(),
-        Command::Recompress { files, limit, jobs, workdir, dry_run, scan_only, backup_suffix } =>
+        Command::Recompress {
+            files, limit, jobs, workdir, dry_run, scan_only, backup_suffix, salvage_truncated,
+        } =>
             recompress::run(cfg, recompress::RecompressArgs {
-                files, limit, jobs, workdir, dry_run, scan_only, backup_suffix,
+                files, limit, jobs, workdir, dry_run, scan_only, backup_suffix, salvage_truncated,
             }).await,
     }
 }

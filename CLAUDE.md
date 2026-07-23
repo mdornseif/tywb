@@ -168,6 +168,13 @@ and verifies that the concatenated payload is byte-identical before replacing
 anything. Run `index --force` on the affected keys afterwards so their CDX
 entries pick up the real per-record offsets.
 
+Some archives in the wild simply stop mid-stream (aborted crawl or upload):
+`gzip -t` fails on the object itself. `recompress --salvage-truncated` keeps
+every complete record before the break and drops the incomplete tail; the
+verification then requires the payload to be an exact *prefix* of the source.
+Without the flag those files are reported and left untouched — bytes are never
+dropped silently.
+
 ### No async in `warc/`
 The core parser is sync (`std::io::Read`). Async callers wrap it in
 `tokio::task::spawn_blocking`. This keeps the crate simple and dependency-free.

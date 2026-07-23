@@ -7,7 +7,9 @@
 use aws_config::BehaviorVersion;
 use aws_credential_types::Credentials;
 use aws_sdk_s3::config::Builder as S3ConfigBuilder;
-use aws_sdk_s3::config::{RequestChecksumCalculation, ResponseChecksumValidation};
+use aws_sdk_s3::config::{
+    RequestChecksumCalculation, ResponseChecksumValidation, StalledStreamProtectionConfig,
+};
 use aws_sdk_s3::Client;
 use warc_search_config::S3Config;
 
@@ -25,9 +27,15 @@ pub async fn build_client(cfg: &S3Config) -> Client {
     // `aws-chunked` framing with a trailing checksum.  Garage rejects those
     // requests with `InvalidRequest: Invalid payload signature`, so only send a
     // checksum where the API actually requires one.
+    // Stalled-stream protection aborts a transfer whose throughput drops to
+    // 0 B/s for a few seconds. Against a single-node Garage doing several
+    // hundred-MB transfers at once, brief stalls are normal and this kills
+    // otherwise healthy uploads and downloads
+    // ("dispatch failure: timeout: minimum throughput was specified at 1 B/s").
     let mut builder = S3ConfigBuilder::from(&sdk_config)
         .request_checksum_calculation(RequestChecksumCalculation::WhenRequired)
-        .response_checksum_validation(ResponseChecksumValidation::WhenRequired);
+        .response_checksum_validation(ResponseChecksumValidation::WhenRequired)
+        .stalled_stream_protection(StalledStreamProtectionConfig::disabled());
 
     // Override credentials if explicitly provided
     if let (Some(key), Some(secret)) = (&cfg.access_key_id, &cfg.secret_access_key) {

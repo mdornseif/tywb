@@ -60,6 +60,8 @@ const CLASSIFY_CONCURRENCY: usize = 4;
 const CLASSIFY_ATTEMPTS: usize = 3;
 /// Attempts per object download.
 const DOWNLOAD_ATTEMPTS: usize = 3;
+/// Attempts per object upload.
+const UPLOAD_ATTEMPTS: usize = 3;
 /// Streaming chunk size for the record rewriter.
 const CHUNK: usize = 64 * 1024;
 /// Gzip level for the rewritten members.
@@ -83,14 +85,16 @@ pub struct RecompressArgs {
     pub scan_only: bool,
     /// Suffix for the preserved original.
     pub backup_suffix: String,
+    /// Rewrite sources that end mid-record, keeping the complete records only.
+    pub salvage_truncated: bool,
 }
 
 // ── Outcome ───────────────────────────────────────────────────────────────────
 
 #[derive(Debug)]
 enum Outcome {
-    Rewritten { records: u64, old_size: u64, new_size: u64 },
-    WouldRewrite { records: u64, old_size: u64, new_size: u64 },
+    Rewritten { records: u64, old_size: u64, new_size: u64, dropped: u64 },
+    WouldRewrite { records: u64, old_size: u64, new_size: u64, dropped: u64 },
     Skipped(String),
     Failed(String),
 }
@@ -138,6 +142,7 @@ pub async fn run(cfg: Config, args: RecompressArgs) -> Result<()> {
 
     let mut rewritten = 0usize;
     let mut skipped = Vec::new();
+    let mut salvaged: Vec<(String, u64)> = Vec::new();
     let mut failed = Vec::new();
     let mut bytes_before = 0u64;
     let mut bytes_after = 0u64;
@@ -146,12 +151,15 @@ pub async fn run(cfg: Config, args: RecompressArgs) -> Result<()> {
     for t in tasks {
         let (key, outcome) = t.await?;
         match outcome {
-            Outcome::Rewritten { records, old_size, new_size }
-            | Outcome::WouldRewrite { records, old_size, new_size } => {
+            Outcome::Rewritten { records, old_size, new_size, dropped }
+            | Outcome::WouldRewrite { records, old_size, new_size, dropped } => {
                 rewritten += 1;
                 records_total += records;
                 bytes_before += old_size;
                 bytes_after += new_size;
+                if dropped > 0 {
+                    salvaged.push((key, dropped));
+                }
             }
             Outcome::Skipped(reason) => skipped.push((key, reason)),
             Outcome::Failed(reason) => failed.push((key, reason)),
@@ -162,6 +170,7 @@ pub async fn run(cfg: Config, args: RecompressArgs) -> Result<()> {
         rewritten,
         records = records_total,
         skipped = skipped.len(),
+        salvaged = salvaged.len(),
         failed = failed.len(),
         megabytes_before = format!("{:.1}", bytes_before as f64 / 1e6),
         megabytes_after = format!("{:.1}", bytes_after as f64 / 1e6),
@@ -169,6 +178,9 @@ pub async fn run(cfg: Config, args: RecompressArgs) -> Result<()> {
     );
     for (key, reason) in &skipped {
         info!(key = %key, reason = %reason, "skipped");
+    }
+    for (key, dropped) in &salvaged {
+        warn!(key = %key, dropped_bytes = dropped, "salvaged — incomplete tail dropped");
     }
     for (key, reason) in &failed {
         warn!(key = %key, reason = %reason, "FAILED — object left untouched");
@@ -338,39 +350,64 @@ async fn process_one(
     let orig_c = orig.clone();
     let new_c = new.clone();
     let key_c = key.to_owned();
+    let salvage = args.salvage_truncated;
     let outcome = tokio::task::spawn_blocking(move || -> Result<Outcome> {
-        let members = count_members(&orig_c)?;
-        if members != 1 {
-            return Ok(Outcome::Skipped(format!("already {members} gzip members")));
+        let shape = gz_shape(&orig_c)?;
+        if shape.members() != 1 {
+            return Ok(Outcome::Skipped(format!("already {} gzip members", shape.members())));
         }
-        let (_, payload_len) = sha256_gunzip(&orig_c)?;
+        if shape.truncated_tail && !salvage {
+            bail!("gzip stream is truncated — rerun with --salvage-truncated to keep \
+                   the complete records and drop the incomplete tail");
+        }
+        let (_, payload_len) = sha256_gunzip_limited(&orig_c, None, shape.truncated_tail)?;
         if payload_len == 0 {
             return Ok(Outcome::Skipped("empty after decompression".to_owned()));
         }
 
-        info!(key = %key_c, "rewriting record-per-member");
-        let records = rewrite_records(&orig_c, &new_c)
+        info!(key = %key_c, salvage = shape.truncated_tail, "rewriting record-per-member");
+        let rewrite = rewrite_records(&orig_c, &new_c, salvage)
             .with_context(|| format!("rewriting {key_c}"))?;
 
-        // Verification, independent of the record parser: the concatenated
-        // payload of both files must be bit-identical.
-        let (old_hash, old_len) = sha256_gunzip(&orig_c)?;
-        let (new_hash, new_len) = sha256_gunzip(&new_c)?;
+        // Verification, independent of the record parser: the rewrite's payload
+        // must equal the original's — byte for byte, and for a salvaged file
+        // byte for byte over the prefix that survived.
+        let (new_hash, new_len) = sha256_gunzip_limited(&new_c, None, false)?;
+        let (old_hash, old_len) =
+            sha256_gunzip_limited(&orig_c, Some(new_len), shape.truncated_tail)?;
+        if old_len != new_len {
+            bail!("source holds only {old_len} of the {new_len} bytes written");
+        }
         if old_hash != new_hash {
-            bail!("payload mismatch after rewrite ({old_len} vs {new_len} bytes)");
+            bail!("payload mismatch after rewrite ({new_len} bytes compared)");
         }
-        let new_members = count_members(&new_c)?;
-        if new_members as u64 != records {
-            bail!("member count {new_members} != record count {records}");
+        if new_len != rewrite.payload_bytes {
+            bail!("rewrite wrote {new_len} bytes but accounted for {}", rewrite.payload_bytes);
         }
-        Ok(Outcome::Rewritten { records, old_size: got, new_size: std::fs::metadata(&new_c)?.len() })
+        let new_shape = gz_shape(&new_c)?;
+        if new_shape.truncated_tail || new_shape.complete as u64 != rewrite.records {
+            bail!("rewrite is not {} clean members: {new_shape:?}", rewrite.records);
+        }
+        Ok(Outcome::Rewritten {
+            records:  rewrite.records,
+            old_size: got,
+            new_size: std::fs::metadata(&new_c)?.len(),
+            dropped:  payload_len.saturating_sub(new_len),
+        })
     })
     .await??;
 
-    let (records, old_size, new_size) = match outcome {
-        Outcome::Rewritten { records, old_size, new_size } => (records, old_size, new_size),
+    let (records, old_size, new_size, dropped) = match outcome {
+        Outcome::Rewritten { records, old_size, new_size, dropped } =>
+            (records, old_size, new_size, dropped),
         other => return Ok(other),                 // skipped
     };
+    if dropped > 0 {
+        warn!(
+            key, records, dropped_bytes = dropped,
+            "SALVAGED — source ends mid-record; kept every complete record before the break",
+        );
+    }
     info!(
         key, records,
         megabytes_before = format!("{:.1}", old_size as f64 / 1e6),
@@ -379,7 +416,7 @@ async fn process_one(
     );
 
     if args.dry_run {
-        return Ok(Outcome::WouldRewrite { records, old_size, new_size });
+        return Ok(Outcome::WouldRewrite { records, old_size, new_size, dropped });
     }
 
     // ── replace on S3: back up first, verify, only then overwrite ──
@@ -396,15 +433,28 @@ async fn process_one(
     let content_type = head.content_type.as_deref().unwrap_or("application/octet-stream");
 
     info!(key, content_type, "uploading rewritten object");
-    put_object_from_path(client, bucket, key, &new, content_type).await?;
-    let head = head_object(client, bucket, key).await?;
-    if head.size != new_size {
-        bail!("upload of {key} is {} bytes, expected {new_size} — original preserved at {backup}",
-              head.size);
+    for attempt in 1..=UPLOAD_ATTEMPTS {
+        match put_object_from_path(client, bucket, key, &new, content_type).await {
+            Ok(()) => {
+                let head = head_object(client, bucket, key).await?;
+                if head.size == new_size {
+                    break;
+                }
+                warn!(key, attempt, got = head.size, expected = new_size, "short upload");
+            }
+            Err(e) => warn!(key, attempt, err = %e, "upload failed"),
+        }
+        if attempt == UPLOAD_ATTEMPTS {
+            // The original is still readable at `backup`, and `key` either holds
+            // the untouched original or a rejected upload — never a truncated one,
+            // since S3 PUTs are atomic.
+            bail!("upload failed after {UPLOAD_ATTEMPTS} attempts — original preserved at {backup}");
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(2 * attempt as u64)).await;
     }
 
     info!(key, records, "done");
-    Ok(Outcome::Rewritten { records, old_size, new_size })
+    Ok(Outcome::Rewritten { records, old_size, new_size, dropped })
 }
 
 /// Stream an S3 object to a local file.
@@ -454,37 +504,74 @@ fn first_member_ends_within(data: &[u8]) -> Option<bool> {
     }
 }
 
-/// Count gzip members in a local file without materialising the payload.
-fn count_members(path: &Path) -> Result<usize> {
+/// How a local gzip file is framed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GzShape {
+    /// Members that decompress all the way to their trailer.
+    complete: usize,
+    /// True if the file ends in the middle of a member.
+    truncated_tail: bool,
+}
+
+impl GzShape {
+    /// Members the file *tries* to have — a truncated tail still counts as one,
+    /// which is what the single-member decision is about.
+    fn members(&self) -> usize {
+        self.complete + usize::from(self.truncated_tail)
+    }
+}
+
+/// Determine the member framing of a local file without materialising the payload.
+fn gz_shape(path: &Path) -> Result<GzShape> {
     let file = std::fs::File::open(path)?;
     let mut reader = BufReader::with_capacity(CHUNK, file);
-    let mut members = 0usize;
+    let mut complete = 0usize;
     loop {
         if reader.fill_buf()?.is_empty() {
-            break;
+            return Ok(GzShape { complete, truncated_tail: false });
         }
         // `bufread::GzDecoder` stops at the end of one member and leaves the
         // rest of the stream in the BufReader for the next round.
         let mut dec = flate2::bufread::GzDecoder::new(&mut reader);
-        io::copy(&mut dec, &mut io::sink())?;
-        members += 1;
+        match io::copy(&mut dec, &mut io::sink()) {
+            Ok(_) => complete += 1,
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                return Ok(GzShape { complete, truncated_tail: true })
+            }
+            Err(e) => return Err(e.into()),
+        }
     }
-    Ok(members)
 }
 
-/// SHA-256 and length of the fully decompressed content of a gzip file
-/// (all members concatenated).
-fn sha256_gunzip(path: &Path) -> Result<(String, u64)> {
+/// SHA-256 and length of the decompressed content of a gzip file (all members
+/// concatenated).
+///
+/// `limit` stops after that many bytes — used to compare a salvaged rewrite
+/// against the corresponding *prefix* of the original.  `tolerate_truncation`
+/// accepts a source that ends mid-member instead of erroring, which is exactly
+/// what the damaged archives do.
+fn sha256_gunzip_limited(
+    path: &Path,
+    limit: Option<u64>,
+    tolerate_truncation: bool,
+) -> Result<(String, u64)> {
     let file = std::fs::File::open(path)?;
     let mut dec = flate2::read::MultiGzDecoder::new(BufReader::with_capacity(CHUNK, file));
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; CHUNK];
     let mut total = 0u64;
     loop {
-        let n = dec.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
+        let want = match limit {
+            Some(l) if l - total == 0 => break,
+            Some(l) => ((l - total) as usize).min(CHUNK),
+            None => CHUNK,
+        };
+        let n = match dec.read(&mut buf[..want]) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if tolerate_truncation && e.kind() == io::ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(e.into()),
+        };
         hasher.update(&buf[..n]);
         total += n as u64;
     }
@@ -493,25 +580,71 @@ fn sha256_gunzip(path: &Path) -> Result<(String, u64)> {
 
 // ── the rewriter ──────────────────────────────────────────────────────────────
 
+/// Counts everything written through it, so the rewriter knows the exact file
+/// offset of the last committed record boundary.
+struct Counting<W: Write> {
+    inner: W,
+    count: u64,
+}
+
+impl<W: Write> Write for Counting<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.count += n as u64;
+        Ok(n)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// What a rewrite produced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Rewrite {
+    records: u64,
+    /// Uncompressed WARC bytes written — the prefix of the source that survived.
+    payload_bytes: u64,
+    /// True if the source ended mid-record and the incomplete tail was dropped.
+    salvaged: bool,
+}
+
 /// Read the WARC in `src` (gzip) and write it to `dst` with one gzip member per
 /// record.  Record bytes are copied verbatim — only the gzip framing changes.
 ///
-/// Returns the number of records written.  Any structural surprise is an error,
-/// so a file we do not fully understand is never rewritten.
-fn rewrite_records(src: &Path, dst: &Path) -> Result<u64> {
+/// Any structural surprise is an error, so a file we do not fully understand is
+/// never rewritten.  With `salvage` the two failure modes that mean "the source
+/// simply stops" — a truncated gzip stream and a WARC record cut off mid-way —
+/// end the rewrite cleanly instead: every complete record before the break is
+/// kept, the incomplete tail is dropped, and the caller is told via
+/// [`Rewrite::salvaged`].
+fn rewrite_records(src: &Path, dst: &Path, salvage: bool) -> Result<Rewrite> {
     let file = std::fs::File::open(src)?;
     let mut src = BufReader::with_capacity(CHUNK, flate2::read::MultiGzDecoder::new(
         BufReader::with_capacity(CHUNK, file),
     ));
-    let mut out = io::BufWriter::new(std::fs::File::create(dst)?);
+    let mut out = Counting {
+        inner: io::BufWriter::new(std::fs::File::create(dst)?),
+        count: 0,
+    };
 
     let mut records = 0u64;
+    let mut payload_bytes = 0u64;
+    let mut committed = 0u64;          // output offset after the last whole record
+    let mut salvaged = false;
     let mut line = Vec::with_capacity(256);
 
-    loop {
+    /// `Err` that means "the source ran out", as opposed to a malformed source.
+    fn is_eof(e: &io::Error) -> bool {
+        e.kind() == io::ErrorKind::UnexpectedEof
+    }
+
+    'records: loop {
         line.clear();
-        if src.read_until(b'\n', &mut line)? == 0 {
-            break;                                   // clean EOF between records
+        match src.read_until(b'\n', &mut line) {
+            Ok(0) => break,                          // clean EOF between records
+            Ok(_) => {}
+            Err(ref e) if salvage && is_eof(e) => { salvaged = true; break }
+            Err(e) => return Err(e.into()),
         }
         if line == b"\r\n" || line == b"\n" {
             continue;                                // stray separator — tolerate
@@ -525,8 +658,12 @@ fn rewrite_records(src: &Path, dst: &Path) -> Result<u64> {
         let mut content_length: Option<u64> = None;
         loop {
             line.clear();
-            if src.read_until(b'\n', &mut line)? == 0 {
-                bail!("EOF inside record header");
+            match src.read_until(b'\n', &mut line) {
+                Ok(0) if salvage => { salvaged = true; break 'records }
+                Ok(0) => bail!("EOF inside record header"),
+                Ok(_) => {}
+                Err(ref e) if salvage && is_eof(e) => { salvaged = true; break 'records }
+                Err(e) => return Err(e.into()),
             }
             header.extend_from_slice(&line);
             if line == b"\r\n" || line == b"\n" {
@@ -541,35 +678,51 @@ fn rewrite_records(src: &Path, dst: &Path) -> Result<u64> {
             }
         }
         let mut remaining = content_length.context("record without Content-Length")?;
+        let record_bytes = header.len() as u64 + remaining + 4;
 
+        // From here on the member is half-written; anything that goes wrong
+        // must roll the output back to `committed`.
         let mut enc = GzEncoder::new(&mut out, Compression::new(GZIP_LEVEL));
         enc.write_all(&header)?;
 
         let mut buf = vec![0u8; CHUNK];
         while remaining > 0 {
             let want = remaining.min(CHUNK as u64) as usize;
-            src.read_exact(&mut buf[..want])
-                .map_err(|e| anyhow::anyhow!("EOF inside record block: {e}"))?;
+            match src.read_exact(&mut buf[..want]) {
+                Ok(()) => {}
+                Err(ref e) if salvage && is_eof(e) => { salvaged = true; break 'records }
+                Err(e) => return Err(anyhow::anyhow!("EOF inside record block: {e}")),
+            }
             enc.write_all(&buf[..want])?;
             remaining -= want as u64;
         }
 
         let mut trailer = [0u8; 4];
-        src.read_exact(&mut trailer)
-            .map_err(|e| anyhow::anyhow!("EOF at record trailer: {e}"))?;
+        match src.read_exact(&mut trailer) {
+            Ok(()) => {}
+            Err(ref e) if salvage && is_eof(e) => { salvaged = true; break 'records }
+            Err(e) => return Err(anyhow::anyhow!("EOF at record trailer: {e}")),
+        }
         if &trailer != b"\r\n\r\n" {
             bail!("expected CRLFCRLF record trailer, got {trailer:?}");
         }
         enc.write_all(&trailer)?;
         enc.finish()?;
+
         records += 1;
+        payload_bytes += record_bytes;
+        committed = out.count;
     }
 
     out.flush()?;
-    if records == 0 {
-        bail!("no records parsed");
+    if salvaged {
+        // Drop the partially written member of the record that got cut off.
+        out.inner.get_ref().set_len(committed)?;
     }
-    Ok(records)
+    if records == 0 {
+        bail!("no complete records parsed");
+    }
+    Ok(Rewrite { records, payload_bytes, salvaged })
 }
 
 // ── tests ─────────────────────────────────────────────────────────────────────
@@ -625,15 +778,16 @@ mod tests {
         let payload = sample_warc();
         write_whole_file_gzip(&src, &payload);
 
-        assert_eq!(count_members(&src).unwrap(), 1, "fixture must be single-member");
+        assert_eq!(gz_shape(&src).unwrap(), GzShape { complete: 1, truncated_tail: false });
 
-        let records = rewrite_records(&src, &dst).unwrap();
-        assert_eq!(records, 4);
-        assert_eq!(count_members(&dst).unwrap(), 4, "one member per record");
+        let rewrite = rewrite_records(&src, &dst, false).unwrap();
+        assert_eq!(rewrite.records, 4);
+        assert!(!rewrite.salvaged);
+        assert_eq!(gz_shape(&dst).unwrap(), GzShape { complete: 4, truncated_tail: false });
 
         // Payload must survive bit-for-bit.
-        let (h_src, n_src) = sha256_gunzip(&src).unwrap();
-        let (h_dst, n_dst) = sha256_gunzip(&dst).unwrap();
+        let (h_src, n_src) = sha256_gunzip_limited(&src, None, false).unwrap();
+        let (h_dst, n_dst) = sha256_gunzip_limited(&dst, None, false).unwrap();
         assert_eq!(h_src, h_dst);
         assert_eq!(n_src, payload.len() as u64);
         assert_eq!(n_dst, payload.len() as u64);
@@ -645,7 +799,7 @@ mod tests {
         let src = dir.path().join("in.warc.gz");
         let dst = dir.path().join("out.warc.gz");
         write_whole_file_gzip(&src, &sample_warc());
-        rewrite_records(&src, &dst).unwrap();
+        rewrite_records(&src, &dst, false).unwrap();
 
         // Walk members the way the indexer does and check each one parses as a
         // single record whose length matches its Content-Length.
@@ -667,7 +821,7 @@ mod tests {
         let src = dir.path().join("in.warc.gz");
         let dst = dir.path().join("out.warc.gz");
         write_whole_file_gzip(&src, &sample_warc());
-        rewrite_records(&src, &dst).unwrap();
+        rewrite_records(&src, &dst, false).unwrap();
 
         let whole = std::fs::read(&src).unwrap();
         let split = std::fs::read(&dst).unwrap();
@@ -688,7 +842,7 @@ mod tests {
         payload.truncate(payload.len() - 100_000);     // cut into the large record's block
         write_whole_file_gzip(&src, &payload);
 
-        let err = rewrite_records(&src, &dst).unwrap_err().to_string();
+        let err = rewrite_records(&src, &dst, false).unwrap_err().to_string();
         assert!(err.contains("EOF inside record block"), "unexpected error: {err}");
     }
 
@@ -699,8 +853,99 @@ mod tests {
         let dst = dir.path().join("out.warc.gz");
         write_whole_file_gzip(&src, b"this is not a WARC file at all\r\n\r\n");
 
-        let err = rewrite_records(&src, &dst).unwrap_err().to_string();
+        let err = rewrite_records(&src, &dst, false).unwrap_err().to_string();
         assert!(err.contains("expected WARC version line"), "unexpected error: {err}");
     }
-}
 
+    /// Cut the *compressed* stream short: gzip trailer and part of the deflate
+    /// data are gone, exactly like the damaged archives in the bucket.
+    fn write_truncated_gzip(path: &Path, payload: &[u8], keep_fraction: f64) {
+        let mut enc = GzEncoder::new(Vec::new(), Compression::new(6));
+        enc.write_all(payload).unwrap();
+        let gz = enc.finish().unwrap();
+        let keep = (gz.len() as f64 * keep_fraction) as usize;
+        std::fs::write(path, &gz[..keep]).unwrap();
+    }
+
+    #[test]
+    fn truncated_gzip_is_detected_as_a_single_cut_off_member() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("in.warc.gz");
+        write_truncated_gzip(&src, &sample_warc(), 0.6);
+
+        let shape = gz_shape(&src).unwrap();
+        assert_eq!(shape, GzShape { complete: 0, truncated_tail: true });
+        assert_eq!(shape.members(), 1, "a cut-off member still counts as one");
+    }
+
+    #[test]
+    fn salvage_keeps_complete_records_and_drops_the_cut_off_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("in.warc.gz");
+        let dst = dir.path().join("out.warc.gz");
+        let payload = sample_warc();
+        write_truncated_gzip(&src, &payload, 0.6);
+
+        // Without the flag a truncated source is an error, never a silent partial.
+        assert!(rewrite_records(&src, &dst, false).is_err());
+
+        let rewrite = rewrite_records(&src, &dst, true).unwrap();
+        assert!(rewrite.salvaged);
+        assert!(rewrite.records >= 1 && rewrite.records < 4,
+                "expected some but not all records, got {}", rewrite.records);
+
+        // The output is a well-formed record-per-member file …
+        let shape = gz_shape(&dst).unwrap();
+        assert!(!shape.truncated_tail, "salvaged output must not be truncated");
+        assert_eq!(shape.complete as u64, rewrite.records, "one member per record");
+
+        // … whose payload is an exact prefix of the original, with no partial
+        // record at the end.
+        let (h_new, n_new) = sha256_gunzip_limited(&dst, None, false).unwrap();
+        let (h_old, n_old) = sha256_gunzip_limited(&src, Some(n_new), true).unwrap();
+        assert_eq!(n_old, n_new);
+        assert_eq!(h_old, h_new);
+        assert_eq!(n_new, rewrite.payload_bytes);
+        assert_eq!(&payload[..n_new as usize], &std::fs::read(&dst).map(|_| ()).map(|_| {
+            let mut out = Vec::new();
+            flate2::read::MultiGzDecoder::new(std::fs::File::open(&dst).unwrap())
+                .read_to_end(&mut out).unwrap();
+            out
+        }).unwrap()[..]);
+    }
+
+    #[test]
+    fn salvage_handles_a_complete_gzip_holding_a_cut_off_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("in.warc.gz");
+        let dst = dir.path().join("out.warc.gz");
+        let mut payload = sample_warc();
+        payload.truncate(payload.len() - 100_000);     // last record loses its block
+        write_whole_file_gzip(&src, &payload);         // gzip itself is intact
+
+        let rewrite = rewrite_records(&src, &dst, true).unwrap();
+        assert!(rewrite.salvaged);
+        assert_eq!(rewrite.records, 2, "the two records before the cut survive");
+        assert_eq!(gz_shape(&dst).unwrap(), GzShape { complete: 2, truncated_tail: false });
+
+        let (h_new, n_new) = sha256_gunzip_limited(&dst, None, false).unwrap();
+        let (h_old, _) = sha256_gunzip_limited(&src, Some(n_new), false).unwrap();
+        assert_eq!(h_old, h_new, "kept bytes must match the source prefix exactly");
+    }
+
+    #[test]
+    fn salvage_refuses_a_source_without_a_single_complete_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("in.warc.gz");
+        let dst = dir.path().join("out.warc.gz");
+        // Keep only the gzip header plus a few bytes of deflate data — not even
+        // the first record completes.
+        let mut enc = GzEncoder::new(Vec::new(), Compression::new(6));
+        enc.write_all(&sample_warc()).unwrap();
+        let gz = enc.finish().unwrap();
+        std::fs::write(&src, &gz[..30]).unwrap();
+
+        let err = rewrite_records(&src, &dst, true).unwrap_err().to_string();
+        assert!(err.contains("no complete records parsed"), "unexpected error: {err}");
+    }
+}
