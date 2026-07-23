@@ -11,6 +11,12 @@ pub enum S3Error {
     #[error("S3 error putting object s3://{bucket}/{key}: {reason}")]
     Put { bucket: String, key: String, reason: String },
 
+    #[error("S3 error copying s3://{bucket}/{src} to s3://{bucket}/{dst}: {reason}")]
+    Copy { bucket: String, src: String, dst: String, reason: String },
+
+    #[error("S3 error deleting object s3://{bucket}/{key}: {reason}")]
+    Delete { bucket: String, key: String, reason: String },
+
     #[error("S3 object not found: s3://{bucket}/{key}")]
     NotFound { bucket: String, key: String },
 

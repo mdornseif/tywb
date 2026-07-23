@@ -7,6 +7,7 @@
 use aws_config::BehaviorVersion;
 use aws_credential_types::Credentials;
 use aws_sdk_s3::config::Builder as S3ConfigBuilder;
+use aws_sdk_s3::config::{RequestChecksumCalculation, ResponseChecksumValidation};
 use aws_sdk_s3::Client;
 use warc_search_config::S3Config;
 
@@ -20,7 +21,13 @@ pub async fn build_client(cfg: &S3Config) -> Client {
         .load()
         .await;
 
-    let mut builder = S3ConfigBuilder::from(&sdk_config);
+    // Since SDK 1.72 the default is `WhenSupported`, which wraps uploads in
+    // `aws-chunked` framing with a trailing checksum.  Garage rejects those
+    // requests with `InvalidRequest: Invalid payload signature`, so only send a
+    // checksum where the API actually requires one.
+    let mut builder = S3ConfigBuilder::from(&sdk_config)
+        .request_checksum_calculation(RequestChecksumCalculation::WhenRequired)
+        .response_checksum_validation(ResponseChecksumValidation::WhenRequired);
 
     // Override credentials if explicitly provided
     if let (Some(key), Some(secret)) = (&cfg.access_key_id, &cfg.secret_access_key) {

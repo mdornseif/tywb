@@ -25,6 +25,22 @@ use tracing::debug;
 
 use crate::error::{S3Error, Result};
 
+
+/// Render an error together with its whole `source()` chain.
+///
+/// The AWS SDK's top-level `Display` is famously terse ("service error"); the
+/// useful part — HTTP status, S3 error code, message — lives in the chain.
+fn chain(e: &dyn std::error::Error) -> String {
+    let mut out = e.to_string();
+    let mut src = e.source();
+    while let Some(inner) = src {
+        out.push_str(": ");
+        out.push_str(&inner.to_string());
+        src = inner.source();
+    }
+    out
+}
+
 // ── Full streaming GET ────────────────────────────────────────────────────────
 
 /// Stream all bytes of an S3 object.
@@ -238,6 +254,104 @@ pub async fn put_object(
             reason: e.to_string(),
         })?;
     Ok(())
+}
+
+/// Upload a local file to `s3://{bucket}/{key}`, streaming it from disk.
+///
+/// Unlike [`put_object`] this never holds the whole body in memory, so it is
+/// the right call for multi-hundred-MB WARC files.
+pub async fn put_object_from_path(
+    client: &Client,
+    bucket: &str,
+    key: &str,
+    path: &std::path::Path,
+    content_type: &str,
+) -> Result<()> {
+    debug!(bucket, key, path = %path.display(), "S3 PUT (streaming from file)");
+    let body = ByteStream::from_path(path)
+        .await
+        .map_err(|e| S3Error::Put {
+            bucket: bucket.to_owned(),
+            key:    key.to_owned(),
+            reason: format!("reading {}: {e}", path.display()),
+        })?;
+    client
+        .put_object()
+        .bucket(bucket)
+        .key(key)
+        .body(body)
+        .content_type(content_type)
+        .send()
+        .await
+        .map_err(|e| S3Error::Put {
+            bucket: bucket.to_owned(),
+            key:    key.to_owned(),
+            reason: chain(&e),
+        })?;
+    Ok(())
+}
+
+// ── COPY / DELETE ─────────────────────────────────────────────────────────────
+
+/// Server-side copy within one bucket: `src` → `dst`.
+///
+/// No bytes travel through this process.  Note that plain `CopyObject` is a
+/// single request; S3 implementations cap it at 5 GiB per object.
+pub async fn copy_object(
+    client: &Client,
+    bucket: &str,
+    src: &str,
+    dst: &str,
+) -> Result<()> {
+    debug!(bucket, src, dst, "S3 COPY");
+    client
+        .copy_object()
+        .bucket(bucket)
+        .key(dst)
+        .copy_source(format!("{bucket}/{}", encode_copy_source(src)))
+        .send()
+        .await
+        .map_err(|e| S3Error::Copy {
+            bucket: bucket.to_owned(),
+            src:    src.to_owned(),
+            dst:    dst.to_owned(),
+            reason: chain(&e),
+        })?;
+    Ok(())
+}
+
+/// Delete a single object.
+pub async fn delete_object(client: &Client, bucket: &str, key: &str) -> Result<()> {
+    debug!(bucket, key, "S3 DELETE");
+    client
+        .delete_object()
+        .bucket(bucket)
+        .key(key)
+        .send()
+        .await
+        .map_err(|e| S3Error::Delete {
+            bucket: bucket.to_owned(),
+            key:    key.to_owned(),
+            reason: chain(&e),
+        })?;
+    Ok(())
+}
+
+/// Percent-encode a key for use in the `x-amz-copy-source` header.
+///
+/// `/` stays literal (it separates bucket from key and is legal inside keys);
+/// everything outside the unreserved set is escaped so keys containing `=`,
+/// spaces or non-ASCII survive the round trip.
+fn encode_copy_source(key: &str) -> String {
+    let mut out = String::with_capacity(key.len());
+    for b in key.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9'
+            | b'-' | b'_' | b'.' | b'~' | b'/' => out.push(*b as char),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
 }
 
 // ── Range header helpers ──────────────────────────────────────────────────────
