@@ -147,7 +147,16 @@ async fn ui_search_handler(
             .into_response();
     }
 
-    let limit   = params.limit.unwrap_or(state.config.server.max_results).min(200);
+    // The UI collapses hits to one row per domain, so a plain `max_results`
+    // worth of hits would often boil down to a handful of rows. Pull a deeper
+    // slice and let the grouping thin it out.
+    const GROUPING_FACTOR: usize = 4;
+    const HARD_CAP: usize = 400;
+    let limit = params
+        .limit
+        .unwrap_or(state.config.server.max_results)
+        .saturating_mul(GROUPING_FACTOR)
+        .min(HARD_CAP);
     let from_ts = params.from.as_deref().and_then(|s| {
         // Accept either 8-digit date (YYYYMMDD) or 14-digit timestamp.
         let padded = if s.len() == 8 { format!("{s}000000") } else { s.to_owned() };

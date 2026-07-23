@@ -8,6 +8,8 @@
 //! - Works without JavaScript enabled
 //! - Inspired by Wayback Machine / pywb visual style
 
+use std::collections::HashMap;
+
 use warc_search_cdx::{CdxRecord, CdxStats, WarcFileRow};
 use warc_search_search::SearchHit;
 
@@ -115,6 +117,25 @@ input[type=text]:focus,input[type=search]:focus{
   color:#fff!important;border-radius:6px;font-size:.76rem;font-weight:500;
   text-decoration:none!important;display:inline-block}
 .replay-btn:hover{background:#2d3e7e}
+/* one row per domain — the rest of that domain's hits fold away */
+.result-group{display:flex;flex-direction:column;gap:.25rem}
+.more{margin-left:1.1rem}
+.more>summary{cursor:pointer;font-size:.78rem;color:var(--blue);
+  padding:.15rem .2rem;list-style:none;width:fit-content}
+.more>summary::-webkit-details-marker{display:none}
+.more>summary::before{content:'▸ '}
+.more[open]>summary::before{content:'▾ '}
+.more>summary:hover{text-decoration:underline}
+.more-list{display:flex;flex-direction:column;gap:.15rem;
+  margin:.2rem 0 .3rem;padding-left:.9rem;border-left:2px solid var(--border)}
+.more-item{display:flex;gap:.5rem;align-items:baseline;padding:.2rem .3rem;
+  border-radius:5px;text-decoration:none!important}
+.more-item:hover{background:var(--card)}
+.more-title{font-size:.82rem;color:var(--navy);font-weight:500;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex-shrink:1}
+.more-url{font-size:.72rem;color:var(--green);
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:1;min-width:0}
+.more-ts{font-size:.72rem;color:var(--muted);white-space:nowrap;flex-shrink:0}
 
 /* ── captures table ── */
 .cap-header{margin-bottom:.75rem}
@@ -471,6 +492,10 @@ pub fn search_html(
     }
 
     // ── Result count ──────────────────────────────────────────────────────
+    // One row per domain: the newest capture is shown, the rest of that
+    // domain's hits stay one click away.
+    let groups = group_by_domain(hits);
+
     c.push_str("<p class=\"result-count\">");
     if hits.is_empty() {
         c.push_str("No results for <strong>");
@@ -479,6 +504,9 @@ pub fn search_html(
     } else {
         push_esc(&mut c, &fmt_count(hits.len() as u64));
         c.push_str(if hits.len() == 1 { " result" } else { " results" });
+        c.push_str(" from ");
+        push_esc(&mut c, &fmt_count(groups.len() as u64));
+        c.push_str(if groups.len() == 1 { " domain" } else { " domains" });
         c.push_str(" for <strong>");
         push_esc(&mut c, q);
         c.push_str("</strong>");
@@ -488,13 +516,115 @@ pub fn search_html(
     // ── Results ───────────────────────────────────────────────────────────
     if !hits.is_empty() {
         c.push_str("<div class=\"result-list\">\n");
-        for hit in hits {
-            render_hit(&mut c, hit);
+        for group in &groups {
+            c.push_str("<div class=\"result-group\">\n");
+            render_hit(&mut c, group.newest);
+            render_more(&mut c, group);
+            c.push_str("</div>\n");
         }
         c.push_str("</div>\n");
     }
 
     page_html("Search", "search", &c)
+}
+
+// ── Grouping by domain ────────────────────────────────────────────────────────
+
+/// One domain's hits: the newest capture plus everything else, newest first.
+struct DomainGroup<'a> {
+    domain: String,
+    newest: &'a SearchHit,
+    rest:   Vec<&'a SearchHit>,
+}
+
+/// Collapse hits to one row per domain.
+///
+/// Domains keep the order in which the search engine first mentioned them, so
+/// the most relevant site still comes first. Within a domain the newest capture
+/// is what gets shown; the remaining hits stay available behind "more results".
+///
+/// Subdomains fold into their second-level domain, matching the
+/// TLD → domain → subdomain hierarchy of `/ui/browse`.
+fn group_by_domain(hits: &[SearchHit]) -> Vec<DomainGroup<'_>> {
+    let mut order: Vec<String> = Vec::new();
+    let mut buckets: HashMap<String, Vec<&SearchHit>> = HashMap::new();
+
+    for hit in hits {
+        let domain = url_domain(&hit.url);
+        buckets.entry(domain.clone()).or_insert_with(|| {
+            order.push(domain.clone());
+            Vec::new()
+        }).push(hit);
+    }
+
+    order
+        .into_iter()
+        .map(|domain| {
+            let mut items = buckets.remove(&domain).unwrap_or_default();
+            // Newest capture first, then the rest by descending timestamp.
+            items.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+            let newest = items.remove(0);
+            DomainGroup { domain, newest, rest: items }
+        })
+        .collect()
+}
+
+/// Second-level domain of a URL's host — the group key for search results.
+///
+/// `https://obstsorten.pomologen-verein.de/seite` → `pomologen-verein.de`
+///
+/// Hosts that are bare IP addresses or single labels are returned unchanged.
+pub fn url_domain(url: &str) -> String {
+    let rest = url.split_once("://").map_or(url, |(_, r)| r);
+    let host = rest
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or("")
+        .rsplit_once('@')
+        .map_or_else(|| rest.split(['/', '?', '#']).next().unwrap_or(""), |(_, h)| h);
+    // Strip a :port suffix (but leave bracketed IPv6 literals alone).
+    let host = match host.rsplit_once(':') {
+        Some((h, port)) if !h.ends_with(']') && port.chars().all(|c| c.is_ascii_digit()) => h,
+        _ => host,
+    };
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+
+    let labels: Vec<&str> = host.split('.').collect();
+    let is_ipv4 = labels.len() == 4 && labels.iter().all(|l| l.parse::<u8>().is_ok());
+    if labels.len() < 2 || is_ipv4 || host.starts_with('[') {
+        return host;
+    }
+    labels[labels.len() - 2..].join(".")
+}
+
+/// Render the collapsed remainder of a domain group, if any.
+fn render_more(out: &mut String, group: &DomainGroup<'_>) {
+    if group.rest.is_empty() {
+        return;
+    }
+
+    out.push_str("<details class=\"more\">\n  <summary>");
+    push_esc(out, &fmt_count(group.rest.len() as u64));
+    out.push_str(if group.rest.len() == 1 { " more result from " } else { " more results from " });
+    push_esc(out, &group.domain);
+    out.push_str("</summary>\n  <div class=\"more-list\">\n");
+
+    for hit in &group.rest {
+        let replay = format!("/web/{}/{}", hit.timestamp, hit.url);
+        let title = if hit.title.is_empty() { hit.url.as_str() } else { hit.title.as_str() };
+
+        out.push_str("    <a class=\"more-item\" href=\"");
+        push_esc(out, &replay);
+        out.push_str("\">\n      <span class=\"more-title\">");
+        push_esc(out, title);
+        out.push_str("</span>\n      <span class=\"more-url\">");
+        push_esc(out, &hit.url);
+        out.push_str("</span>\n      <span class=\"more-ts\">");
+        push_esc(out, &fmt_ts(&hit.timestamp));
+        out.push_str("</span>\n    </a>\n");
+    }
+
+    out.push_str("  </div>\n</details>\n");
 }
 
 fn render_hit(out: &mut String, hit: &SearchHit) {
@@ -1033,4 +1163,89 @@ pub struct ApiCdxStats {
 #[derive(serde::Serialize)]
 pub struct ApiSearchStats {
     pub num_docs: u64,
+}
+
+// ── tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hit(url: &str, ts: &str, title: &str) -> SearchHit {
+        SearchHit {
+            url: url.to_owned(),
+            timestamp: ts.to_owned(),
+            title: title.to_owned(),
+            mime: Some("text/html".to_owned()),
+            s3_key: "k".to_owned(),
+            offset: 0,
+            length: 0,
+            score: 1.0,
+        }
+    }
+
+    #[test]
+    fn url_domain_folds_subdomains_into_second_level() {
+        assert_eq!(url_domain("https://obstsorten.pomologen-verein.de/x"), "pomologen-verein.de");
+        assert_eq!(url_domain("http://www.pomologen-verein.de"), "pomologen-verein.de");
+        assert_eq!(url_domain("https://pomologen-verein.de/"), "pomologen-verein.de");
+        assert_eq!(url_domain("https://a.b.c.example.co/page?q=1#frag"), "example.co");
+    }
+
+    #[test]
+    fn url_domain_handles_ports_case_and_odd_hosts() {
+        assert_eq!(url_domain("http://Example.COM:8080/a"), "example.com");
+        assert_eq!(url_domain("https://example.com./"), "example.com");
+        assert_eq!(url_domain("http://192.168.0.7:3900/x"), "192.168.0.7");
+        assert_eq!(url_domain("http://localhost:8080/"), "localhost");
+        assert_eq!(url_domain("example.de/no-scheme"), "example.de");
+    }
+
+    #[test]
+    fn groups_keep_relevance_order_and_show_newest_first() {
+        let hits = vec![
+            hit("https://www.a.de/1", "20240101000000", "a old"),
+            hit("https://b.de/1", "20200101000000", "b only"),
+            hit("https://shop.a.de/2", "20260101000000", "a new"),
+            hit("https://www.a.de/3", "20250101000000", "a mid"),
+        ];
+        let groups = group_by_domain(&hits);
+
+        // Domain order follows the first hit of each domain, not the timestamps.
+        assert_eq!(groups.iter().map(|g| g.domain.as_str()).collect::<Vec<_>>(), ["a.de", "b.de"]);
+
+        // Newest capture represents the domain, the rest descend by date.
+        assert_eq!(groups[0].newest.title, "a new");
+        assert_eq!(
+            groups[0].rest.iter().map(|h| h.title.as_str()).collect::<Vec<_>>(),
+            ["a mid", "a old"],
+        );
+        assert!(groups[1].rest.is_empty());
+    }
+
+    #[test]
+    fn search_page_collapses_domains_and_offers_more() {
+        let hits = vec![
+            hit("https://www.a.de/1", "20240101000000", "a old"),
+            hit("https://obstsorten.a.de/2", "20260101000000", "a new"),
+            hit("https://b.de/1", "20200101000000", "b only"),
+        ];
+        let html = search_html("Roter Berlepsch", &hits, None, None, false);
+
+        assert!(html.contains("3 results from 2 domains"), "count line: {html:.0}");
+        // The newest capture of a.de is the visible row…
+        assert!(html.contains("class=\"result-title\" href=\"/web/20260101000000/https://obstsorten.a.de/2\""));
+        // …and the older one is behind the disclosure, which names the domain.
+        assert!(html.contains("1 more result from a.de"));
+        assert!(html.contains("class=\"more-item\" href=\"/web/20240101000000/https://www.a.de/1\""));
+        // A domain with a single hit gets no disclosure.
+        assert_eq!(html.matches("<details class=\"more\">").count(), 1);
+    }
+
+    #[test]
+    fn empty_result_set_renders_no_groups() {
+        let html = search_html("nothing", &[], None, None, false);
+        assert!(html.contains("No results for"));
+        assert!(!html.contains("class=\"more\""));
+    }
 }

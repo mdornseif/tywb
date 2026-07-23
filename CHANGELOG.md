@@ -43,6 +43,19 @@ this project does not yet publish tagged releases, so everything lands under
 - `s3_store`: `copy_object`, `delete_object` and `put_object_from_path`
   (streams a local file to S3 without buffering it in memory).
 
+- **Search results are collapsed to one row per domain.** `/ui/search` used to
+  list every hit, so a site with many matching pages pushed everything else off
+  the page. Each domain now contributes a single row — its *newest* capture —
+  followed by a `N more results from <domain>` disclosure holding that domain's
+  remaining hits, newest first. Domains keep the order in which the search
+  engine first mentioned them, so the most relevant site still comes first.
+
+  Subdomains fold into their second-level domain, matching the
+  TLD → domain → subdomain hierarchy of `/ui/browse`. The disclosure is plain
+  `<details>` — no JavaScript. Because grouping thins the list out, the UI now
+  retrieves 4× `server.max_results` hits (capped at 400) before grouping; the
+  JSON `/search` endpoint is unchanged.
+
 ### Fixed
 
 - **Uploads to Garage failed with `InvalidRequest: Invalid payload signature`.**
