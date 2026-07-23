@@ -19,7 +19,7 @@ warc-search/
     ├── cdx/                # lib: CDX index, SQLite, SURT canonicalization
     ├── s3_store/           # lib: S3 access, streaming, Range GET
     ├── search/             # lib: Tantivy fulltext index wrapper
-    └── tywb/               # bin: tywb — index, server, stats subcommands
+    └── tywb/               # bin: tywb — index, server, stats, recompress subcommands
 ```
 
 ### Dependency rules (enforce strictly)
@@ -156,6 +156,18 @@ Tantivy uses `mmap` for index segments — the OS page cache manages memory.
 RAM usage at idle is ~30 MB regardless of index size.
 Set `indexer.batch_size` higher to speed up ingest at the cost of peak RAM.
 
+### Record-per-member `.warc.gz`
+Every part of the replay path assumes a `.warc.gz` stores **one gzip member per
+WARC record** — that is what makes a Range GET of a single record possible.
+Files that gzip the whole WARC as one deflate stream cannot be indexed or
+replayed record by record: the indexer sees a single member, takes the first
+record out of it, and drops the rest.
+`tywb recompress` rewrites such files losslessly (record bytes are copied
+verbatim, only the gzip framing changes), keeps the original as `<key>.bak`,
+and verifies that the concatenated payload is byte-identical before replacing
+anything. Run `index --force` on the affected keys afterwards so their CDX
+entries pick up the real per-record offsets.
+
 ### No async in `warc/`
 The core parser is sync (`std::io::Read`). Async callers wrap it in
 `tokio::task::spawn_blocking`. This keeps the crate simple and dependency-free.
@@ -193,6 +205,10 @@ cargo run --release -p tywb -- --config config.local.yaml server
 # Fulltext search:  GET /search?q=<query>&from=20240101&to=20241231
 # Wayback replay:   GET /web/20240315120000/https://example.com/
 # CDX API:          GET /cdx?url=example.com/*&output=json
+
+# 4. Repair whole-file-gzip WARCs (see "Record-per-member .warc.gz" below)
+cargo run --release -p tywb -- --config config.local.yaml recompress --scan-only
+cargo run --release -p tywb -- --config config.local.yaml recompress
 ```
 
 ---
@@ -217,4 +233,4 @@ CI should fail on any clippy warning. Run both before opening a PR.
 | `cdx`              | ✅ complete  | SURT, SQLite store, closest-match lookup, CDX builder from WarcRecord, `warc_files` metadata table |
 | `s3_store`         | ✅ complete  | Client builder, paginated listing, ETag state, streaming GET, Range GET |
 | `search`           | 🔲 stub      | Next: Tantivy schema, index, query      |
-| `tywb`             | 🔄 in progress | `index` working (streaming, throughput, SIGINFO, limits); `server` stub; `stats` complete |
+| `tywb`             | 🔄 in progress | `index` working (streaming, throughput, SIGINFO, limits); `server` stub; `stats` complete; `recompress` complete |

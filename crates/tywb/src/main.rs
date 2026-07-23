@@ -9,8 +9,10 @@
 //! tywb [--config <path>] <COMMAND>
 //!
 //! Commands:
-//!   index   Ingest WARC files from S3 into the fulltext and CDX indexes
-//!   server  Run the HTTP search and replay server
+//!   index       Ingest WARC files from S3 into the fulltext and CDX indexes
+//!   server      Run the HTTP search and replay server
+//!   stats       Print statistics about the current index
+//!   recompress  Rewrite whole-file-gzip WARCs as record-per-member .warc.gz
 //! ```
 
 use std::path::PathBuf;
@@ -22,6 +24,7 @@ use warc_search_config::Config;
 
 mod gz_warc;
 mod index;
+mod recompress;
 mod server;
 mod stats;
 mod ui;
@@ -65,6 +68,35 @@ enum Command {
     Server,
     /// Print statistics about the current index.
     Stats,
+    /// Rewrite whole-file-gzip WARCs as record-per-member `.warc.gz`.
+    ///
+    /// Some producers gzip an entire WARC as one deflate stream instead of one
+    /// member per record.  Such files cannot be indexed or replayed record by
+    /// record.  This rewrites them losslessly, keeping the original as
+    /// `<key>.bak`.  Re-index the affected files afterwards (`index --force`).
+    Recompress {
+        /// Only process these S3 keys (repeatable, bypasses bucket scanning).
+        #[arg(long = "file")]
+        files: Vec<String>,
+        /// Process at most this many objects (smallest first).
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Objects processed concurrently.
+        #[arg(long, default_value_t = 2)]
+        jobs: usize,
+        /// Scratch directory for downloads and rewrites.
+        #[arg(long, default_value = "/var/tmp/tywb-recompress")]
+        workdir: PathBuf,
+        /// Verify everything but never write to S3.
+        #[arg(long)]
+        dry_run: bool,
+        /// Only report which objects would be rewritten, then stop.
+        #[arg(long)]
+        scan_only: bool,
+        /// Suffix under which the original object is preserved.
+        #[arg(long, default_value = ".bak")]
+        backup_suffix: String,
+    },
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -98,5 +130,9 @@ async fn main() -> anyhow::Result<()> {
             index::run(cfg, index::IndexArgs { file, max_files, max_urls, force }).await,
         Command::Server => server::run(cfg).await,
         Command::Stats  => unreachable!(),
+        Command::Recompress { files, limit, jobs, workdir, dry_run, scan_only, backup_suffix } =>
+            recompress::run(cfg, recompress::RecompressArgs {
+                files, limit, jobs, workdir, dry_run, scan_only, backup_suffix,
+            }).await,
     }
 }
