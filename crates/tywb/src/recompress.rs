@@ -24,7 +24,8 @@
 //!    byte-identical to the concatenated members of the rewrite, and the member
 //!    count must equal the record count,
 //! 5. server-side copy `<key>` → `<key>.bak`,
-//! 6. upload the rewrite over `<key>`.
+//! 6. upload the rewrite over `<key>`,
+//! 7. delete the `<key>.cdx` sidecar, whose offsets the rewrite invalidated.
 //!
 //! Nothing on S3 is touched before step 4 passes, and the backup is verified
 //! before the original is overwritten.  Objects that fail any check are left
@@ -48,8 +49,8 @@ use tracing::{info, warn};
 
 use warc_search_config::Config;
 use warc_search_s3::{
-    build_client, copy_object, get_range, get_stream, head_object, put_object_from_path,
-    Lister,
+    build_client, copy_object, delete_object, get_range, get_stream, head_object,
+    put_object_from_path, Lister,
 };
 
 /// Bytes fetched to decide single-member vs. record-per-member.
@@ -451,6 +452,21 @@ async fn process_one(
             bail!("upload failed after {UPLOAD_ATTEMPTS} attempts — original preserved at {backup}");
         }
         tokio::time::sleep(std::time::Duration::from_secs(2 * attempt as u64)).await;
+    }
+
+    // The `<key>.cdx` sidecar (if any) lists compressed member offsets that the
+    // rewrite has just invalidated, and `write_cdx_sidecar` refuses to overwrite
+    // an existing sidecar — so a stale one would survive every future re-index.
+    // Drop it and let the next index run regenerate it.
+    let sidecar = format!("{key}.cdx");
+    match head_object(client, bucket, &sidecar).await {
+        Ok(_) => match delete_object(client, bucket, &sidecar).await {
+            Ok(()) => info!(key, sidecar, "deleted stale CDX sidecar — re-index to regenerate"),
+            Err(e) => warn!(key, sidecar, err = %e,
+                            "could not delete stale CDX sidecar — delete it before re-indexing"),
+        },
+        Err(warc_search_s3::S3Error::NotFound { .. }) => {}
+        Err(e) => warn!(key, sidecar, err = %e, "could not check for a CDX sidecar"),
     }
 
     info!(key, records, "done");

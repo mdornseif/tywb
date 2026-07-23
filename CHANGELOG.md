@@ -41,6 +41,11 @@ this project does not yet publish tagged releases, so everything lands under
   Without the flag such files are reported and left alone, so bytes are never
   dropped silently.
 
+  After replacing an object, recompress deletes its `<key>.cdx` sidecar: the
+  sidecar lists compressed member offsets that the rewrite invalidated, and
+  `write_cdx_sidecar` refuses to overwrite an existing sidecar, so a stale one
+  would otherwise survive every future re-index. Re-indexing regenerates it.
+
   Flags: `--file`, `--limit`, `--jobs`, `--workdir`, `--dry-run`, `--scan-only`,
   `--backup-suffix`, `--salvage-truncated`.
 
