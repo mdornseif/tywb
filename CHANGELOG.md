@@ -71,6 +71,13 @@ this project does not yet publish tagged releases, so everything lands under
 
 ### Fixed
 
+- **Browsing a domain served from its apex led nowhere.** `/ui/browse` decided
+  whether a name was a registered domain or a hostname by counting dots, so for
+  a site without a `www.` host (e.g. `walnussmeisterei.de`) the hostname listing
+  linked back to itself and its 2,874 captures were unreachable. Captures now
+  have an explicit `?host=` route, which cannot be confused with the domain
+  level. Existing `?domain=<hostname>` links keep working.
+
 - **Large S3 transfers were aborted mid-flight.** The SDK's stalled-stream
   protection kills a transfer whose throughput drops to 0 B/s for a moment
   ("dispatch failure: timeout: minimum throughput was specified at 1 B/s").

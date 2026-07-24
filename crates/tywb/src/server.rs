@@ -184,6 +184,31 @@ async fn ui_search_handler(
     }
 }
 
+/// Level 3 — the captures of one hostname.
+async fn browse_captures(
+    state: &Arc<AppState>,
+    host: &str,
+    tld: &str,
+    show_all: bool,
+) -> Response {
+    const MAX_CAPTURES: usize = 5000;
+    let surt_prefix = ui::domain_to_surt_prefix(host);
+    let records = {
+        state.cdx.lock().unwrap().get_by_surt_prefix(&surt_prefix, MAX_CAPTURES + 1)
+    };
+    match records {
+        Ok(mut recs) => {
+            let truncated = recs.len() > MAX_CAPTURES;
+            if truncated { recs.truncate(MAX_CAPTURES); }
+            Html(ui::browse_captures_html(host, tld, &recs, truncated, show_all)).into_response()
+        }
+        Err(e) => {
+            error!(err = %e, "browse captures query failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+        }
+    }
+}
+
 // ── /ui/url — HTML URL captures ───────────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -247,7 +272,16 @@ async fn ui_files_handler(State(state): State<Arc<AppState>>) -> Response {
 #[derive(Deserialize)]
 struct BrowseParams {
     tld:    Option<String>,
+    /// A registered domain — lists the hostnames under it.
     domain: Option<String>,
+    /// An exact hostname — lists its captures.
+    ///
+    /// This exists because the level cannot be derived from the name: for a
+    /// site served from its apex (`example.de` with no `www.`), "registered
+    /// domain" and "hostname" are the same string, and guessing by dot count
+    /// sent every such domain back to the hostname list instead of its
+    /// captures.
+    host:   Option<String>,
     /// When present and non-zero, show non-2xx URLs too.
     all:    Option<u8>,
 }
@@ -256,6 +290,13 @@ async fn browse_handler(
     State(state): State<Arc<AppState>>,
     Query(params): Query<BrowseParams>,
 ) -> Response {
+    // Level 3, explicit: captures of one hostname.
+    if let Some(host) = &params.host {
+        let host = host.trim().to_owned();
+        let tld = host.rsplit('.').next().unwrap_or("").to_owned();
+        return browse_captures(&state, &host, &tld, params.all.unwrap_or(0) != 0).await;
+    }
+
     if let Some(domain) = &params.domain {
         let domain = domain.trim().to_owned();
         let tld = domain.rsplit('.').next().unwrap_or("").to_owned();
@@ -285,25 +326,8 @@ async fn browse_handler(
                 }
             }
         } else {
-            // Level 3: specific hostname (e.g. "www.obstsortendatenbank.de") — captures.
-            let surt_prefix = ui::domain_to_surt_prefix(&domain);
-            let show_all = params.all.unwrap_or(0) != 0;
-            const MAX_CAPTURES: usize = 5000;
-            let records = {
-                state.cdx.lock().unwrap()
-                    .get_by_surt_prefix(&surt_prefix, MAX_CAPTURES + 1)
-            };
-            match records {
-                Ok(mut recs) => {
-                    let truncated = recs.len() > MAX_CAPTURES;
-                    if truncated { recs.truncate(MAX_CAPTURES); }
-                    Html(ui::browse_captures_html(&domain, &tld, &recs, truncated, show_all)).into_response()
-                }
-                Err(e) => {
-                    error!(err = %e, "browse captures query failed");
-                    (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
-                }
-            }
+            // Level 3: a name with subdomains is unambiguously a hostname.
+            browse_captures(&state, &domain, &tld, params.all.unwrap_or(0) != 0).await
         }
     } else if let Some(tld) = &params.tld {
         // Level 2: hostnames under a TLD

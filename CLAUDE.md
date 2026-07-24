@@ -2,7 +2,7 @@
 
 A resource-efficient fulltext search engine and Wayback-compatible replay server
 for WARC and PDF files stored on S3-compatible object storage.
-Written in pure Rust. Designed to run on a 1–2 GB Linux VPS or headless macOS machine.
+Written in Rust. Runs on an ordinary Linux server or a headless macOS machine.
 
 ---
 
@@ -49,15 +49,6 @@ cargo build --release
 
 # build the binary
 cargo build --release -p tywb
-```
-
-Cross-compile for Linux from macOS:
-
-```bash
-# install cross once
-cargo install cross
-
-cross build --release --target x86_64-unknown-linux-musl -p tywb
 ```
 
 ---
@@ -149,7 +140,7 @@ A 10 GB WARC file costs one small Range GET to replay a single page.
 ### SQLite for CDX (not Postgres, not Redis)
 CDX lookups are point queries and small range scans by (surt_url, timestamp).
 SQLite in WAL mode handles concurrent reads with zero daemon overhead.
-Keep `sqlite_cache_kib` small (default 8 MiB) to honour the RAM budget.
+`sqlite_cache_kib` (default 8 MiB) bounds the page cache SQLite keeps in memory.
 
 ### Tantivy for fulltext search
 Tantivy uses `mmap` for index segments — the OS page cache manages memory.

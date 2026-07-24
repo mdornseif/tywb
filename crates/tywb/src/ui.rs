@@ -972,7 +972,9 @@ pub fn browse_subdomains_html(
     c.push_str("<div class=\"browse-grid\">\n");
     for (surt_domain, n) in hostnames {
         let hostname = surt_to_domain(surt_domain);
-        c.push_str("  <a class=\"browse-card\" href=\"/ui/browse?domain=");
+        // `host=`, not `domain=`: for a site served from its apex the two names
+        // are identical, and `domain=` would route straight back to this page.
+        c.push_str("  <a class=\"browse-card\" href=\"/ui/browse?host=");
         for ch in hostname.chars() {
             if ch.is_alphanumeric() || ch == '.' || ch == '-' {
                 c.push(ch);
@@ -1247,5 +1249,34 @@ mod tests {
         let html = search_html("nothing", &[], None, None, false);
         assert!(html.contains("No results for"));
         assert!(!html.contains("class=\"more\""));
+    }
+
+    #[test]
+    fn hostname_listing_links_to_captures_not_back_to_itself() {
+        // The apex host and its registered domain are the same string; linking
+        // it as `domain=` sent the user back to this very page (the bug that
+        // made walnussmeisterei.de unbrowsable).
+        let hosts = vec![
+            ("de,walnussmeisterei".to_owned(), 2874u64),
+            ("de,walnussmeisterei,www".to_owned(), 6u64),
+        ];
+        let html = browse_subdomains_html("de", "walnussmeisterei.de", &hosts, false);
+
+        assert!(html.contains("href=\"/ui/browse?host=walnussmeisterei.de\""),
+                "apex host must link to its captures");
+        assert!(html.contains("href=\"/ui/browse?host=www.walnussmeisterei.de\""));
+        // No hostname card may point back at the hostname listing.
+        assert!(!html.contains("browse-card\" href=\"/ui/browse?domain="),
+                "a hostname card still links to the domain level");
+    }
+
+    #[test]
+    fn surt_and_domain_round_trip() {
+        assert_eq!(surt_to_domain("de,walnussmeisterei"), "walnussmeisterei.de");
+        assert_eq!(surt_to_domain("de,walnussmeisterei,www"), "www.walnussmeisterei.de");
+        assert_eq!(domain_to_surt_prefix("walnussmeisterei.de"), "de,walnussmeisterei)");
+        // The apex prefix must not swallow subdomains: a subdomain SURT continues
+        // with ',' where the apex prefix has ')'.
+        assert!(!"de,walnussmeisterei,www)/".starts_with(&domain_to_surt_prefix("walnussmeisterei.de")));
     }
 }
