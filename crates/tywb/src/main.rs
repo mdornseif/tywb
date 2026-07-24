@@ -22,6 +22,7 @@ use tracing::info;
 
 use warc_search_config::Config;
 
+mod blocklist;
 mod gz_warc;
 mod index;
 mod pdf;

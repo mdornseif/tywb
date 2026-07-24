@@ -192,6 +192,13 @@ pub struct ServerConfig {
     pub enable_replay: bool,
     #[serde(default)]
     pub static_dir: Option<String>,
+    /// Optional path to a static text file of URL prefixes to hide from search
+    /// results (one per line, `#` comments allowed). Unlike
+    /// [`IndexerConfig::blacklisted_domains`], which drops data at ingest time,
+    /// this only suppresses matching URLs from `/search` and `/ui/search` at
+    /// query time — the records stay in the index and remain replayable.
+    #[serde(default)]
+    pub search_blacklist_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -330,6 +337,7 @@ impl Default for ServerConfig {
             max_results: default_max_results(),
             enable_replay: true,
             static_dir: None,
+            search_blacklist_path: None,
         }
     }
 }

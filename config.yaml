@@ -141,6 +141,13 @@ server:
   # Leave unset unless you are customising the web UI.
   # static_dir: "/var/lib/warc-search/ui"
 
+  # Optional: static text file of URL prefixes to hide from search results.
+  # Query-time filter only — matching records stay indexed and replayable.
+  # One prefix per line, '#' comments allowed. Edit + restart to apply; no
+  # re-index needed. Distinct from indexer.blacklisted_domains, which drops
+  # data at ingest time.
+  # search_blacklist_path: "/etc/tywb/search-blacklist.txt"
+
 # ── Logging ───────────────────────────────────────────────────────────────────
 log:
   # Tracing filter — same syntax as RUST_LOG.

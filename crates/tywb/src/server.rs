@@ -45,6 +45,7 @@ pub struct AppState {
     search: Arc<SearchReader>,
     s3:     Arc<aws_sdk_s3::Client>,
     config: Config,
+    blocklist: crate::blocklist::UrlBlocklist,
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -69,11 +70,16 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
 
     let s3 = build_client(&cfg.s3).await;
 
+    let blocklist = crate::blocklist::UrlBlocklist::load(
+        cfg.server.search_blacklist_path.as_deref(),
+    );
+
     let state = Arc::new(AppState {
         cdx:    Arc::new(Mutex::new(cdx_store)),
         search: Arc::new(search_reader),
         s3:     Arc::new(s3),
         config: cfg.clone(),
+        blocklist,
     });
 
     let app = Router::new()
@@ -170,12 +176,15 @@ async fn ui_search_handler(
     debug!(q = %q, from = ?from_ts, to = ?to_ts, limit, "ui search");
 
     match state.search.search(&q, limit, from_ts, to_ts) {
-        Ok(hits) => Html(ui::search_html(
-            &q, &hits,
-            params.from.as_deref(),
-            params.to.as_deref(),
-            false,
-        )).into_response(),
+        Ok(mut hits) => {
+            hits.retain(|h| !state.blocklist.is_blocked(&h.url));
+            Html(ui::search_html(
+                &q, &hits,
+                params.from.as_deref(),
+                params.to.as_deref(),
+                false,
+            )).into_response()
+        }
         Err(e) => {
             error!(err = %e, "search failed");
             Html(ui::search_html(&q, &[], params.from.as_deref(), params.to.as_deref(), true))
@@ -410,7 +419,10 @@ async fn search_handler(
     debug!(q = %params.q, from = ?from_ts, to = ?to_ts, limit, "search");
 
     match state.search.search(&params.q, limit, from_ts, to_ts) {
-        Ok(hits) => Json(hits).into_response(),
+        Ok(mut hits) => {
+            hits.retain(|h| !state.blocklist.is_blocked(&h.url));
+            Json(hits).into_response()
+        }
         Err(e) => {
             error!(err = %e, "search failed");
             (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
