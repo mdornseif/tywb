@@ -10,6 +10,27 @@ this project does not yet publish tagged releases, so everything lands under
 
 ### Added
 
+- **PDF fulltext search via Apache Tika (optional).** When `indexer.tika` points
+  at a `tika-server`, the indexer extracts text from `application/pdf` records
+  and makes them searchable. Tika (PDFBox) reads born-digital PDFs directly; for
+  scans it runs Tesseract OCR (`ocr_strategy`, `ocr_languages`). Measured on the
+  archive, ~96% of PDFs are born-digital with a clean text layer.
+
+  - The whole PDF payload is sent to Tika — never truncated, because the xref
+    table a parser needs lives at the end of the file. Payloads over
+    `max_pdf_bytes` (default 100 MiB) are skipped.
+  - A quality gate (`pdf::looks_like_text`) drops output that does not read like
+    prose, so wrong-language or bad-scan OCR noise never enters the index.
+    Verified: born-digital PDFs score alnum-ratio 0.90–0.98, truncated-PDF
+    garbage 0.03 — the thresholds sit safely in the gap.
+  - Extraction is a blocking localhost call inside the parse loop, so peak
+    memory stays at one PDF and no async plumbing is needed.
+  - Tika absent → PDFs behave exactly as before (browsable, not searchable),
+    so the dependency-free deployment is unaffected. Ops: `playbooks/tika.yml`.
+
+
+### Added
+
 - **`tywb recompress`** — repairs `.warc.gz` files that were gzipped as a single
   deflate stream instead of one gzip member per WARC record.
 

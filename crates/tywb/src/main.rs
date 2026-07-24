@@ -24,6 +24,7 @@ use warc_search_config::Config;
 
 mod gz_warc;
 mod index;
+mod pdf;
 mod recompress;
 mod server;
 mod stats;

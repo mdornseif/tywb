@@ -66,7 +66,8 @@ indexer:
   # Prevents very large pages from dominating index RAM during ingest.
   max_text_bytes: 524288  # 512 KiB
 
-  # Index PDF files found in the S3 bucket.
+  # Extract and index text from PDF records. Requires a Tika backend below;
+  # with `tika` unset this has no effect (PDFs stay browsable but unsearchable).
   index_pdfs: true
 
   # Index WARC response records (HTML, text, etc.).
@@ -95,6 +96,29 @@ indexer:
   # blacklisted_domains:
   #   - spam-site.example.com
   #   - ads.example.net
+
+  # ── PDF text extraction (optional) ─────────────────────────────────────────
+  # An Apache Tika server that turns PDFs into searchable text. Leave the whole
+  # `tika` block out to disable PDF fulltext entirely (the default) — nothing
+  # else changes and no external service is needed.
+  #
+  # Tika (PDFBox) reads the text layer of born-digital PDFs; for pure scans it
+  # runs Tesseract OCR. Extraction happens during `tywb index`, not at query
+  # time. See playbooks/tika.yml in the ops repo for a hardened deployment.
+  #
+  # tika:
+  #   # A running tika-server. Keep it bound to localhost — Tika parses hostile
+  #   # third-party files and must not be exposed on the network.
+  #   url: "http://127.0.0.1:9998"
+  #   # no_ocr = text layer only; auto = OCR only when there is no text layer;
+  #   # ocr_only = always OCR. "auto" suits a mix of digital and scanned PDFs.
+  #   ocr_strategy: "auto"
+  #   # Tesseract languages. frk = Fraktur, for older German prints.
+  #   ocr_languages: "deu+frk+eng"
+  #   # PDFs larger than this are skipped rather than sent to Tika.
+  #   max_pdf_bytes: 104857600  # 100 MiB
+  #   # Per-document timeout; OCR of a big scan can be slow.
+  #   timeout_secs: 300
 
 # ── Server ────────────────────────────────────────────────────────────────────
 server:

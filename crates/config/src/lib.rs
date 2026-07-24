@@ -104,6 +104,46 @@ pub struct IndexerConfig {
     /// also excludes `www.example.com`, `cdn.example.com`, etc.
     #[serde(default)]
     pub blacklisted_domains: Vec<String>,
+    /// Optional Apache Tika backend for extracting text from PDFs. When unset,
+    /// PDFs are not fulltext-indexed (they remain browsable and replayable) —
+    /// this keeps the dependency-free deployment possible. See [`TikaConfig`].
+    #[serde(default)]
+    pub tika: Option<TikaConfig>,
+}
+
+/// Configuration for the optional Apache Tika text-extraction backend.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TikaConfig {
+    /// Base URL of a running `tika-server`, e.g. `http://127.0.0.1:9998`.
+    pub url: String,
+    /// PDF OCR strategy passed to Tika as `X-Tika-PDFOcrStrategy`:
+    /// `no_ocr` (text layer only), `auto` (OCR only when there is no text
+    /// layer), or `ocr_only`. Default `auto`.
+    #[serde(default = "default_tika_ocr_strategy")]
+    pub ocr_strategy: String,
+    /// Tesseract language(s) for OCR, `X-Tika-OCRLanguage`, e.g. `deu+frk+eng`.
+    #[serde(default = "default_tika_ocr_languages")]
+    pub ocr_languages: String,
+    /// PDFs larger than this (uncompressed HTTP payload) are skipped rather than
+    /// sent to Tika, to bound extraction time and JVM heap. Default 100 MiB.
+    #[serde(default = "default_max_pdf_bytes")]
+    pub max_pdf_bytes: usize,
+    /// Per-document timeout for a Tika request, in seconds. OCR of a large scan
+    /// can be slow, so this is generous. Default 300.
+    #[serde(default = "default_tika_timeout_secs")]
+    pub timeout_secs: u64,
+}
+
+impl Default for TikaConfig {
+    fn default() -> Self {
+        Self {
+            url: String::new(),
+            ocr_strategy:  default_tika_ocr_strategy(),
+            ocr_languages: default_tika_ocr_languages(),
+            max_pdf_bytes: default_max_pdf_bytes(),
+            timeout_secs:  default_tika_timeout_secs(),
+        }
+    }
 }
 
 impl IndexerConfig {
@@ -279,6 +319,7 @@ impl Default for IndexerConfig {
             index_warc_responses: true,
             skip_patterns: vec![],
             blacklisted_domains: vec![],
+            tika: None,
         }
     }
 }
@@ -311,6 +352,10 @@ fn default_bind()           -> String  { "0.0.0.0:8080".into() }
 fn default_max_results()    -> usize   { 50 }
 fn default_log_level()      -> String  { "info".into() }
 fn default_true()           -> bool    { true }
+fn default_tika_ocr_strategy()  -> String { "auto".to_owned() }
+fn default_tika_ocr_languages() -> String { "deu+frk+eng".to_owned() }
+fn default_max_pdf_bytes()      -> usize  { 100 * 1024 * 1024 }
+fn default_tika_timeout_secs()  -> u64    { 300 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
@@ -349,6 +394,9 @@ indexer:
   skip_patterns:
     - "*.css"
     - "*.js"
+  tika:
+    url: "http://127.0.0.1:9998"
+    ocr_strategy: "no_ocr"
 
 server:
   bind: "127.0.0.1:9000"
@@ -381,6 +429,7 @@ log:
         assert!(cfg.indexer.index_pdfs);
         assert!(cfg.indexer.index_warc_responses);
         assert!(cfg.indexer.skip_patterns.is_empty());
+        assert!(cfg.indexer.tika.is_none(), "Tika is opt-in — absent by default");
         assert_eq!(cfg.server.bind, "0.0.0.0:8080");
         assert_eq!(cfg.server.max_results, 50);
         assert!(cfg.server.enable_replay);
@@ -408,6 +457,14 @@ log:
         assert!(!cfg.server.enable_replay);
         assert_eq!(cfg.server.static_dir.as_deref(), Some("/opt/ui"));
         assert_eq!(cfg.log.level, "debug");
+
+        let tika = cfg.indexer.tika.as_ref().expect("tika block parsed");
+        assert_eq!(tika.url, "http://127.0.0.1:9998");
+        assert_eq!(tika.ocr_strategy, "no_ocr");
+        // Unspecified Tika fields fall back to their defaults.
+        assert_eq!(tika.ocr_languages, "deu+frk+eng");
+        assert_eq!(tika.max_pdf_bytes, 100 * 1024 * 1024);
+        assert_eq!(tika.timeout_secs, 300);
     }
 
     #[test]

@@ -444,6 +444,15 @@ async fn index_warc_object(
         tokio::task::spawn_blocking(move || -> anyhow::Result<ParsedObject> {
             let chan = CountingReader::new(ChannelReader::new(rx), prog_clone);
 
+            // Build the PDF extractor once for this object. Present only when a
+            // Tika backend is configured and PDF indexing is enabled; otherwise
+            // PDFs are skipped from fulltext exactly as before.
+            let pdf_extractor = if cfg_owned.index_pdfs {
+                cfg_owned.tika.as_ref().map(crate::pdf::PdfExtractor::new)
+            } else {
+                None
+            };
+
             let mut out                  = Vec::new();
             let mut warc_records         = 0usize;
             let mut skipped              = 0usize;
@@ -474,6 +483,7 @@ async fn index_warc_object(
                 warc_date_max: &mut Option<String>,
                 progress:    &SharedProgress,
                 warc_records_total: usize,
+                pdf:         Option<&crate::pdf::PdfExtractor>,
             ) {
                 // Track WARC-Date range.
                 if let Some(d) = record.header.get("WARC-Date") {
@@ -551,7 +561,7 @@ async fn index_warc_object(
                             c_offset,
                             "response record",
                         );
-                        let doc = build_index_doc(record, &cdx_rec, max_text);
+                        let doc = build_index_doc(record, &cdx_rec, max_text, pdf);
                         out.push((cdx_rec, doc));
                     }
                 }
@@ -625,7 +635,7 @@ async fn index_warc_object(
                         index_responses, max_text, &cfg_owned,
                         &mut out, &mut skipped, &mut errors,
                         &mut mime_counts, &mut warc_date_min, &mut warc_date_max,
-                        &progress, warc_records,
+                        &progress, warc_records, pdf_extractor.as_ref(),
                     );
                 }
             } else {
@@ -653,7 +663,7 @@ async fn index_warc_object(
                                 index_responses, max_text, &cfg_owned,
                                 &mut out, &mut skipped, &mut errors,
                                 &mut mime_counts, &mut warc_date_min, &mut warc_date_max,
-                                &progress, warc_records,
+                                &progress, warc_records, pdf_extractor.as_ref(),
                             );
                         }
                     }
@@ -726,7 +736,12 @@ async fn index_warc_object(
 
 // ── Text extraction ───────────────────────────────────────────────────────────
 
-fn build_index_doc(record: &warc::WarcRecord, cdx: &CdxRecord, max_bytes: usize) -> Option<IndexDoc> {
+fn build_index_doc(
+    record: &warc::WarcRecord,
+    cdx: &CdxRecord,
+    max_bytes: usize,
+    pdf: Option<&crate::pdf::PdfExtractor>,
+) -> Option<IndexDoc> {
     // Skip non-HTTP URIs (urn:, data:, etc.) — internal crawler bookkeeping,
     // not real pages.
     if !cdx.original_url.starts_with("http://") && !cdx.original_url.starts_with("https://") {
@@ -739,8 +754,34 @@ fn build_index_doc(record: &warc::WarcRecord, cdx: &CdxRecord, max_bytes: usize)
         || mime.starts_with("text/xml")   // some sites serve HTML as text/xml
         || mime.starts_with("application/xml");
     let is_text = mime.starts_with("text/plain");
-    if !is_html && !is_text {
+    let is_pdf  = mime.starts_with("application/pdf");
+    if !is_html && !is_text && !is_pdf {
         return None;
+    }
+
+    let ts: u64 = cdx.timestamp.parse().unwrap_or(0);
+
+    // ── PDF: hand the whole payload to Tika (never truncate — the xref table a
+    // parser needs lives at the end of the file). Requires a configured backend.
+    if is_pdf {
+        let extractor = pdf?;
+        let body = record.http_body().unwrap_or(record.block.as_ref());
+        let doc = extractor.extract(&cdx.original_url, body)?;
+        let body_text = if doc.body.len() > max_bytes {
+            doc.body[..max_bytes].to_owned()
+        } else {
+            doc.body
+        };
+        return Some(IndexDoc {
+            url:       cdx.original_url.clone(),
+            timestamp: ts,
+            title:     doc.title,
+            body:      body_text,
+            mime:      cdx.mime.clone(),
+            s3_key:    cdx.s3_key.clone(),
+            offset:    cdx.offset,
+            length:    cdx.length,
+        });
     }
 
     let body = record.http_body().unwrap_or(record.block.as_ref());
@@ -763,8 +804,6 @@ fn build_index_doc(record: &warc::WarcRecord, cdx: &CdxRecord, max_bytes: usize)
     } else {
         body_text
     };
-
-    let ts: u64 = cdx.timestamp.parse().unwrap_or(0);
 
     Some(IndexDoc {
         url:       cdx.original_url.clone(),

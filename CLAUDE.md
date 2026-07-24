@@ -166,6 +166,15 @@ verification then requires the payload to be an exact *prefix* of the source.
 Without the flag those files are reported and left untouched — bytes are never
 dropped silently.
 
+### PDF text extraction (optional Tika backend)
+PDFs are not readable by the HTML/text indexer. When `indexer.tika` is set to a
+running `tika-server`, `application/pdf` records are extracted to searchable
+text (PDFBox for born-digital PDFs, Tesseract OCR for scans). The whole payload
+goes to Tika — PDFs must never be truncated, the xref table is at the end. A
+quality gate (`pdf::looks_like_text`) drops OCR noise before it reaches the
+index. With `tika` unset, PDFs stay browsable but unsearchable — no external
+dependency. See `crates/tywb/src/pdf.rs` and `playbooks/tika.yml` (ops repo).
+
 ### No async in `warc/`
 The core parser is sync (`std::io::Read`). Async callers wrap it in
 `tokio::task::spawn_blocking`. This keeps the crate simple and dependency-free.
