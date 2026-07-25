@@ -34,7 +34,14 @@ pub struct CdxRecord {
     /// this field was introduced.  When `Some`, the replay handler should use
     /// this offset for the S3 Range GET instead of `offset`.
     pub c_offset: Option<u64>,
+    /// Name of the collection this record belongs to. `"warc"` is the default
+    /// WARC archive; other values name additional sources (e.g. a bucket of
+    /// standalone PDFs). Determines which bucket replay fetches from.
+    pub collection: String,
 }
+
+/// The default collection name for records from the primary WARC archive.
+pub const DEFAULT_COLLECTION: &str = "warc";
 
 impl CdxRecord {
     /// Parse the 14-digit timestamp into a `DateTime<Utc>`.
@@ -115,6 +122,7 @@ pub fn from_warc_record(
         offset: warc.offset,
         length,
         c_offset: None, // set by the caller for .warc.gz files
+        collection: DEFAULT_COLLECTION.to_owned(), // overridden for non-WARC sources
     }))
 }
 

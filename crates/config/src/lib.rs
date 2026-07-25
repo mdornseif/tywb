@@ -109,6 +109,34 @@ pub struct IndexerConfig {
     /// this keeps the dependency-free deployment possible. See [`TikaConfig`].
     #[serde(default)]
     pub tika: Option<TikaConfig>,
+    /// Additional named sources indexed alongside the primary WARC bucket
+    /// (`s3.bucket`, collection `"warc"`). Currently used for buckets of
+    /// standalone PDFs. See [`CollectionConfig`].
+    #[serde(default)]
+    pub collections: Vec<CollectionConfig>,
+}
+
+/// An additional indexed source beyond the primary WARC archive.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CollectionConfig {
+    /// Unique collection name, stored on every CDX record and used to pick the
+    /// bucket at replay time. Must not be `"warc"` (the primary archive).
+    pub name: String,
+    /// Source kind. `"pdf_bucket"` = a bucket of standalone PDF objects, each
+    /// indexed and replayed directly (no WARC container).
+    #[serde(rename = "type", default = "default_collection_type")]
+    pub kind: String,
+    /// S3 bucket holding the collection's objects. Uses the same endpoint and
+    /// credentials as the primary `s3` block.
+    pub bucket: String,
+    /// Optional key prefix to restrict which objects are indexed.
+    #[serde(default)]
+    pub prefix: Option<String>,
+    /// For `pdf_bucket`: the public base URL an object is reachable at. The
+    /// record's original URL is `public_base_url` + key, e.g.
+    /// `https://obst-pdfs.23.nu/` + `1152-hochstamm.pdf`.
+    #[serde(default)]
+    pub public_base_url: Option<String>,
 }
 
 /// Configuration for the optional Apache Tika text-extraction backend.
@@ -327,6 +355,7 @@ impl Default for IndexerConfig {
             skip_patterns: vec![],
             blacklisted_domains: vec![],
             tika: None,
+            collections: vec![],
         }
     }
 }
@@ -364,6 +393,7 @@ fn default_tika_ocr_strategy()  -> String { "auto".to_owned() }
 fn default_tika_ocr_languages() -> String { "deu+frk+eng".to_owned() }
 fn default_max_pdf_bytes()      -> usize  { 100 * 1024 * 1024 }
 fn default_tika_timeout_secs()  -> u64    { 300 }
+fn default_collection_type()    -> String { "pdf_bucket".to_owned() }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 

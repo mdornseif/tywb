@@ -8,6 +8,15 @@ this project does not yet publish tagged releases, so everything lands under
 
 ## [Unreleased]
 
+- **Collections** — index sources beyond the primary WARC bucket. The archive
+  is the implicit collection `warc`; `indexer.collections` adds more. The first
+  supported type is `pdf_bucket`: a bucket of standalone PDF objects, each
+  indexed as one CDX record (public URL, `collection` name) and its text
+  extracted via the same Tika/OCR path as WARC PDFs. Replay serves such objects
+  straight from their bucket. A `collection` column was added to the CDX table
+  (existing rows default to `warc`; migrated in place).
+
+
 ### Added
 
 - **PDF fulltext search via Apache Tika (optional).** When `indexer.tika` points

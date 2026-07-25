@@ -26,6 +26,7 @@ mod blocklist;
 mod gz_warc;
 mod index;
 mod pdf;
+mod pdf_collection;
 mod recompress;
 mod server;
 mod stats;

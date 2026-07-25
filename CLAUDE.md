@@ -175,6 +175,14 @@ quality gate (`pdf::looks_like_text`) drops OCR noise before it reaches the
 index. With `tika` unset, PDFs stay browsable but unsearchable — no external
 dependency. See `crates/tywb/src/pdf.rs` and `playbooks/tika.yml` (ops repo).
 
+### Collections
+The primary WARC bucket is the implicit collection `warc`. `indexer.collections`
+adds further sources; type `pdf_bucket` indexes a bucket of standalone PDFs
+(each object = one CDX record + one fulltext doc, extracted via Tika). Every
+CDX record carries a `collection` name, which selects the bucket at replay
+time. Non-WARC collections are served directly from their bucket, not from a
+WARC container. See `crates/tywb/src/pdf_collection.rs`.
+
 ### No async in `warc/`
 The core parser is sync (`std::io::Read`). Async callers wrap it in
 `tokio::task::spawn_blocking`. This keeps the crate simple and dependency-free.

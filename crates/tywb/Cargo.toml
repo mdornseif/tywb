@@ -49,6 +49,9 @@ tracing-subscriber = { workspace = true }
 # hashing
 sha2 = { workspace = true }
 
+# time (S3 LastModified -> CDX timestamp)
+chrono = { workspace = true }
+
 # blocking HTTP (Tika client)
 ureq = { workspace = true }
 

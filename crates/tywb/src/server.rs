@@ -430,6 +430,32 @@ async fn search_handler(
     }
 }
 
+/// Serve a standalone collection object (e.g. a PDF) directly from its bucket.
+async fn serve_collection_object(
+    state: &Arc<AppState>,
+    bucket: &str,
+    rec: &warc_search_cdx::CdxRecord,
+) -> Response {
+    match warc_search_s3::get_bytes(&state.s3, bucket, &rec.s3_key).await {
+        Ok(bytes) => {
+            let ctype = rec.mime.as_deref().unwrap_or("application/octet-stream");
+            (
+                [(header::CONTENT_TYPE, HeaderValue::from_str(ctype)
+                    .unwrap_or(HeaderValue::from_static("application/octet-stream")))],
+                bytes.to_vec(),
+            )
+                .into_response()
+        }
+        Err(warc_search_s3::S3Error::NotFound { .. }) => {
+            (StatusCode::NOT_FOUND, "object not found in collection bucket").into_response()
+        }
+        Err(e) => {
+            error!(err = %e, bucket, key = %rec.s3_key, "collection object GET failed");
+            (StatusCode::BAD_GATEWAY, e.to_string()).into_response()
+        }
+    }
+}
+
 // ── /web/<timestamp>/<url> → Wayback replay ───────────────────────────────────
 
 async fn replay_handler(
@@ -469,6 +495,26 @@ async fn replay_handler(
             }
         }
     };
+
+    // Records from a non-WARC collection (e.g. a PDF bucket) are standalone
+    // objects with no WARC container — serve the object straight from its
+    // bucket rather than extracting a record from a WARC.
+    if cdx_rec.collection != warc_search_cdx::DEFAULT_COLLECTION {
+        return match state
+            .config
+            .indexer
+            .collections
+            .iter()
+            .find(|c| c.name == cdx_rec.collection)
+        {
+            Some(coll) => serve_collection_object(&state, &coll.bucket, &cdx_rec).await,
+            None => {
+                error!(collection = %cdx_rec.collection, "replay for unknown collection");
+                (StatusCode::INTERNAL_SERVER_ERROR,
+                 format!("unknown collection: {}", cdx_rec.collection)).into_response()
+            }
+        };
+    }
 
     let is_gz = cdx_rec.s3_key.to_ascii_lowercase().ends_with(".gz");
 

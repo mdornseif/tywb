@@ -25,6 +25,7 @@ CREATE TABLE IF NOT EXISTS cdx (
     offset      INTEGER NOT NULL,
     length      INTEGER NOT NULL,
     c_offset    INTEGER,            -- compressed offset of gzip member (NULL for .warc)
+    collection  TEXT NOT NULL DEFAULT 'warc',  -- source collection; drives replay bucket
     PRIMARY KEY (surt_url, timestamp)
 );
 
@@ -183,6 +184,10 @@ impl CdxStore {
         // Migrations: ALTER TABLE ADD COLUMN silently fails if column already exists.
         let _ = self.conn.execute("ALTER TABLE cdx ADD COLUMN c_offset INTEGER", []);
         let _ = self.conn.execute("ALTER TABLE warc_files ADD COLUMN bucket TEXT", []);
+        // Existing rows predate collections and belong to the primary WARC archive.
+        let _ = self.conn.execute(
+            "ALTER TABLE cdx ADD COLUMN collection TEXT NOT NULL DEFAULT 'warc'", [],
+        );
         Ok(())
     }
 
@@ -200,8 +205,8 @@ impl CdxStore {
     pub fn upsert(&self, r: &CdxRecord) -> Result<()> {
         self.conn.execute(
             "INSERT OR REPLACE INTO cdx
-             (surt_url, timestamp, original, mime, status, digest, s3_key, offset, length, c_offset)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+             (surt_url, timestamp, original, mime, status, digest, s3_key, offset, length, c_offset, collection)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 r.surt_url,
                 r.timestamp,
@@ -213,6 +218,7 @@ impl CdxStore {
                 r.offset as i64,
                 r.length as i64,
                 r.c_offset.map(|v| v as i64),
+                r.collection,
             ],
         )?;
         Ok(())
@@ -237,13 +243,13 @@ impl CdxStore {
             // INSERT OR IGNORE: affected rows = 1 for new, 0 for existing.
             let mut insert_stmt = tx.prepare_cached(
                 "INSERT OR IGNORE INTO cdx
-                 (surt_url, timestamp, original, mime, status, digest, s3_key, offset, length, c_offset)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                 (surt_url, timestamp, original, mime, status, digest, s3_key, offset, length, c_offset, collection)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             )?;
             // UPDATE for rows that already existed so metadata stays current.
             let mut update_stmt = tx.prepare_cached(
                 "UPDATE cdx SET original = ?3, mime = ?4, status = ?5, digest = ?6,
-                 s3_key = ?7, offset = ?8, length = ?9, c_offset = ?10
+                 s3_key = ?7, offset = ?8, length = ?9, c_offset = ?10, collection = ?11
                  WHERE surt_url = ?1 AND timestamp = ?2",
             )?;
             for r in records {
@@ -251,6 +257,7 @@ impl CdxStore {
                 let inserted = insert_stmt.execute(params![
                     r.surt_url, r.timestamp, r.original_url, r.mime,
                     r.status, r.digest, r.s3_key, r.offset as i64, r.length as i64, c_off,
+                    r.collection,
                 ])?;
                 if inserted == 1 {
                     new_count += 1;
@@ -258,6 +265,7 @@ impl CdxStore {
                     update_stmt.execute(params![
                         r.surt_url, r.timestamp, r.original_url, r.mime,
                         r.status, r.digest, r.s3_key, r.offset as i64, r.length as i64, c_off,
+                        r.collection,
                     ])?;
                     existing_count += 1;
                 }
@@ -316,7 +324,7 @@ impl CdxStore {
     /// Look up records for an exact SURT URL, ordered by timestamp ascending.
     pub fn get_by_surt(&self, surt_url: &str) -> Result<Vec<CdxRecord>> {
         let mut stmt = self.conn.prepare_cached(
-            "SELECT surt_url, timestamp, original, mime, status, digest, s3_key, offset, length, c_offset
+            "SELECT surt_url, timestamp, original, mime, status, digest, s3_key, offset, length, c_offset, collection
              FROM cdx WHERE surt_url = ?1 ORDER BY timestamp ASC",
         )?;
         let rows = stmt.query_map(params![surt_url], row_to_record)?;
@@ -332,7 +340,7 @@ impl CdxStore {
         to: &str,
     ) -> Result<Vec<CdxRecord>> {
         let mut stmt = self.conn.prepare_cached(
-            "SELECT surt_url, timestamp, original, mime, status, digest, s3_key, offset, length, c_offset
+            "SELECT surt_url, timestamp, original, mime, status, digest, s3_key, offset, length, c_offset, collection
              FROM cdx
              WHERE surt_url = ?1 AND timestamp >= ?2 AND timestamp <= ?3
              ORDER BY timestamp ASC",
@@ -358,7 +366,7 @@ impl CdxStore {
         let before: Option<CdxRecord> = self
             .conn
             .query_row(
-                "SELECT surt_url, timestamp, original, mime, status, digest, s3_key, offset, length, c_offset
+                "SELECT surt_url, timestamp, original, mime, status, digest, s3_key, offset, length, c_offset, collection
                  FROM cdx
                  WHERE surt_url = ?1 AND timestamp <= ?2
                  ORDER BY timestamp DESC LIMIT 1",
@@ -371,7 +379,7 @@ impl CdxStore {
         let after: Option<CdxRecord> = self
             .conn
             .query_row(
-                "SELECT surt_url, timestamp, original, mime, status, digest, s3_key, offset, length, c_offset
+                "SELECT surt_url, timestamp, original, mime, status, digest, s3_key, offset, length, c_offset, collection
                  FROM cdx
                  WHERE surt_url = ?1 AND timestamp > ?2
                  ORDER BY timestamp ASC LIMIT 1",
@@ -404,7 +412,7 @@ impl CdxStore {
         // and avoids LIKE special-character escaping.
         let end = next_prefix(prefix);
         let mut stmt = self.conn.prepare_cached(
-            "SELECT surt_url, timestamp, original, mime, status, digest, s3_key, offset, length, c_offset
+            "SELECT surt_url, timestamp, original, mime, status, digest, s3_key, offset, length, c_offset, collection
              FROM cdx
              WHERE surt_url >= ?1 AND surt_url < ?2
              ORDER BY surt_url ASC, timestamp ASC
@@ -675,6 +683,7 @@ fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<CdxRecord> {
         offset:       row.get::<_, i64>(7)? as u64,
         length:       row.get::<_, i64>(8)? as u64,
         c_offset:     row.get::<_, Option<i64>>(9)?.map(|v| v as u64),
+        collection:   row.get(10)?,
     })
 }
 
@@ -723,6 +732,7 @@ mod tests {
             offset:       1024,
             length:       512,
             c_offset:     None,
+            collection:   "warc".to_owned(),
         }
     }
 

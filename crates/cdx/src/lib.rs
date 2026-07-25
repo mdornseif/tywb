@@ -11,5 +11,5 @@ pub mod store;
 pub mod surt;
 
 pub use error::{CdxError, Result};
-pub use record::{CdxRecord, format_timestamp, from_warc_record, parse_timestamp};
+pub use record::{CdxRecord, DEFAULT_COLLECTION, format_timestamp, from_warc_record, parse_timestamp};
 pub use store::{CdxStats, CdxStore, WarcFileMeta, WarcFileRow, WarcInfoRecord};

@@ -120,6 +120,23 @@ indexer:
   #   # Per-document timeout; OCR of a big scan can be slow.
   #   timeout_secs: 300
 
+  # ── Extra collections (optional) ───────────────────────────────────────────
+  # Additional sources indexed alongside the primary WARC bucket (which is the
+  # implicit collection "warc"). Each is searched and browsed together with the
+  # archive; the `collection` is recorded per CDX entry and drives which bucket
+  # replay reads from. The Tika/PDF path above applies to every collection.
+  #
+  # Currently supported type: pdf_bucket — a bucket of standalone PDF objects,
+  # each indexed and replayed directly (no WARC container). The object's public
+  # URL is public_base_url + key.
+  #
+  # collections:
+  #   - name: obst-pdfs
+  #     type: pdf_bucket
+  #     bucket: obst-pdfs.23.nu
+  #     public_base_url: "https://obst-pdfs.23.nu/"
+  #     # prefix: ""   # optional key prefix
+
 # ── Server ────────────────────────────────────────────────────────────────────
 server:
   # Address and port for the HTTP server.

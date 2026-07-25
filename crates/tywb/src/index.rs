@@ -367,6 +367,28 @@ pub async fn run(cfg: Config, args: IndexArgs) -> anyhow::Result<()> {
         }
     }
 
+    // ── Extra collections (PDF buckets, …) ────────────────────────────────────
+    // Skipped in single-file mode (--file targets one WARC key). Each collection
+    // shares the primary S3 client, credentials and ETag state.
+    if args.file.is_none() {
+        for coll in &cfg.indexer.collections {
+            match crate::pdf_collection::index_pdf_collection(
+                coll, &s3, &mut cdx, &mut search, &cfg.indexer, &mut state,
+            ).await {
+                Ok(cs) => {
+                    totals.cdx_new += cs.cdx_new;
+                    totals.indexed += cs.indexed;
+                    totals.skipped += cs.skipped;
+                    totals.errors  += cs.errors;
+                }
+                Err(e) => error!(name = %coll.name, err = %format!("{e:#}"), "collection indexing failed"),
+            }
+            if let Err(e) = state.save(&state_path) {
+                warn!(err = %e, "could not save list state after collection");
+            }
+        }
+    }
+
     search.commit().context("final search index commit")?;
 
     let total_secs = progress.run_start.elapsed().as_secs_f64();
