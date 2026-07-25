@@ -8,6 +8,18 @@ this project does not yet publish tagged releases, so everything lands under
 
 ## [Unreleased]
 
+- **Unified domain skip list.** One list of domains now controls skipping
+  everywhere: entries are not indexed, purged from CDX + fulltext on the next
+  `tywb index`, and hidden from search results immediately at query time. This
+  replaces the separate query-time URL-prefix blacklist (`search_blacklist_path`)
+  and folds it together with `blacklisted_domains` — the earlier DuckDuckGo
+  prefix moved in as a domain. Configure via `indexer.blacklisted_domains_path`
+  (a static file, one domain per line; subdomains match automatically) and/or
+  the inline `indexer.blacklisted_domains`; the file is merged into the list at
+  startup. Seeded with instagram/google/pinterest, search engines, social
+  platforms and ad/tracker CDNs.
+
+
 - **Collections** — index sources beyond the primary WARC bucket. The archive
   is the implicit collection `warc`; `indexer.collections` adds more. The first
   supported type is `pdf_bucket`: a bucket of standalone PDF objects, each

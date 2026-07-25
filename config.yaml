@@ -82,20 +82,22 @@ indexer:
   #   - "*.png"
   #   - "*.jpg"
 
-  # Domains to exclude from indexing.
+  # ── Domain skip list ───────────────────────────────────────────────────────
+  # A single list of domains that are skipped everywhere: not indexed, purged
+  # from the index on the next `tywb index` run, AND hidden from search results
+  # immediately (query-time filter). Subdomain matching is automatic —
+  # "google.com" also covers "www.google.com", "maps.google.com", etc.
   #
-  # Records whose WARC-Target-URI belongs to a listed domain — or any of its
-  # subdomains — are silently skipped during ingest.  In addition, each time
-  # `tywb index` runs it removes all existing CDX and fulltext entries for
-  # these domains before processing new WARC files.  Adding a domain here and
-  # running `tywb index` is sufficient to scrub it from the index entirely.
+  # The recommended way is a static file, editable without re-rendering this
+  # config (a server restart applies the display filter; a re-index purges
+  # already-stored entries):
+  #   blacklisted_domains_path: "/etc/tywb/skip-domains.txt"   # one domain per line, # comments
   #
-  # Subdomain matching is automatic: "example.com" also covers
-  # "www.example.com", "cdn.example.com", "deep.sub.example.com", etc.
-  #
-  # blacklisted_domains:
-  #   - spam-site.example.com
-  #   - ads.example.net
+  # An inline list works too and is merged with the file:
+  #   blacklisted_domains:
+  #     - instagram.com
+  #     - google.com
+  #     - pinterest.com
 
   # ── PDF text extraction (optional) ─────────────────────────────────────────
   # An Apache Tika server that turns PDFs into searchable text. Leave the whole
@@ -157,13 +159,9 @@ server:
   # Optional: directory of static files to serve under /_static/.
   # Leave unset unless you are customising the web UI.
   # static_dir: "/var/lib/warc-search/ui"
-
-  # Optional: static text file of URL prefixes to hide from search results.
-  # Query-time filter only — matching records stay indexed and replayable.
-  # One prefix per line, '#' comments allowed. Edit + restart to apply; no
-  # re-index needed. Distinct from indexer.blacklisted_domains, which drops
-  # data at ingest time.
-  # search_blacklist_path: "/etc/tywb/search-blacklist.txt"
+  #
+  # To hide domains from search results, use indexer.blacklisted_domains_path
+  # (the single domain skip list above) — it applies at both index and display.
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 log:

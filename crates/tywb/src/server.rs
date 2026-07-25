@@ -45,7 +45,6 @@ pub struct AppState {
     search: Arc<SearchReader>,
     s3:     Arc<aws_sdk_s3::Client>,
     config: Config,
-    blocklist: crate::blocklist::UrlBlocklist,
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -70,16 +69,11 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
 
     let s3 = build_client(&cfg.s3).await;
 
-    let blocklist = crate::blocklist::UrlBlocklist::load(
-        cfg.server.search_blacklist_path.as_deref(),
-    );
-
     let state = Arc::new(AppState {
         cdx:    Arc::new(Mutex::new(cdx_store)),
         search: Arc::new(search_reader),
         s3:     Arc::new(s3),
         config: cfg.clone(),
-        blocklist,
     });
 
     let app = Router::new()
@@ -177,7 +171,7 @@ async fn ui_search_handler(
 
     match state.search.search(&q, limit, from_ts, to_ts) {
         Ok(mut hits) => {
-            hits.retain(|h| !state.blocklist.is_blocked(&h.url));
+            hits.retain(|h| !state.config.indexer.is_url_blacklisted(&h.url));
             Html(ui::search_html(
                 &q, &hits,
                 params.from.as_deref(),
@@ -420,7 +414,7 @@ async fn search_handler(
 
     match state.search.search(&params.q, limit, from_ts, to_ts) {
         Ok(mut hits) => {
-            hits.retain(|h| !state.blocklist.is_blocked(&h.url));
+            hits.retain(|h| !state.config.indexer.is_url_blacklisted(&h.url));
             Json(hits).into_response()
         }
         Err(e) => {

@@ -104,6 +104,13 @@ pub struct IndexerConfig {
     /// also excludes `www.example.com`, `cdn.example.com`, etc.
     #[serde(default)]
     pub blacklisted_domains: Vec<String>,
+    /// Optional path to a static file of domains to skip, one per line
+    /// (`#` comments allowed). Merged into [`blacklisted_domains`] at load time,
+    /// so it applies at both index time (skip + purge) and — via the server's
+    /// query-time filter — in search results. Editable without re-rendering
+    /// config.yaml; a re-index purges already-stored entries.
+    #[serde(default)]
+    pub blacklisted_domains_path: Option<String>,
     /// Optional Apache Tika backend for extracting text from PDFs. When unset,
     /// PDFs are not fulltext-indexed (they remain browsable and replayable) —
     /// this keeps the dependency-free deployment possible. See [`TikaConfig`].
@@ -175,6 +182,42 @@ impl Default for TikaConfig {
 }
 
 impl IndexerConfig {
+    /// Merge the domains listed in [`blacklisted_domains_path`] into
+    /// [`blacklisted_domains`]. One domain per line; blank lines and lines
+    /// starting with `#` are ignored, as is a trailing `# comment`.
+    ///
+    /// This is the single source of the domain skip list: after this runs, the
+    /// same set drives ingest-time skipping, the index-start purge, and the
+    /// server's query-time display filter. A missing path is a no-op; an
+    /// unreadable file returns the I/O error for the caller to log.
+    ///
+    /// [`blacklisted_domains_path`]: Self::blacklisted_domains_path
+    /// [`blacklisted_domains`]: Self::blacklisted_domains
+    pub fn load_blacklist_file(&mut self) -> std::io::Result<usize> {
+        let Some(path) = self.blacklisted_domains_path.clone() else {
+            return Ok(0);
+        };
+        let text = std::fs::read_to_string(&path)?;
+        let existing: std::collections::HashSet<String> = self
+            .blacklisted_domains
+            .iter()
+            .map(|d| d.trim().to_ascii_lowercase())
+            .collect();
+        let mut added = 0;
+        let mut seen = existing;
+        for line in text.lines() {
+            let entry = line.split('#').next().unwrap_or("").trim().to_ascii_lowercase();
+            if entry.is_empty() {
+                continue;
+            }
+            if seen.insert(entry.clone()) {
+                self.blacklisted_domains.push(entry);
+                added += 1;
+            }
+        }
+        Ok(added)
+    }
+
     /// Return `true` if `host` (a bare hostname, lower-cased) is covered by
     /// the domain blacklist — i.e. it equals a blacklisted domain or is a
     /// subdomain of one.
@@ -220,13 +263,6 @@ pub struct ServerConfig {
     pub enable_replay: bool,
     #[serde(default)]
     pub static_dir: Option<String>,
-    /// Optional path to a static text file of URL prefixes to hide from search
-    /// results (one per line, `#` comments allowed). Unlike
-    /// [`IndexerConfig::blacklisted_domains`], which drops data at ingest time,
-    /// this only suppresses matching URLs from `/search` and `/ui/search` at
-    /// query time — the records stay in the index and remain replayable.
-    #[serde(default)]
-    pub search_blacklist_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -354,6 +390,7 @@ impl Default for IndexerConfig {
             index_warc_responses: true,
             skip_patterns: vec![],
             blacklisted_domains: vec![],
+            blacklisted_domains_path: None,
             tika: None,
             collections: vec![],
         }
@@ -366,7 +403,6 @@ impl Default for ServerConfig {
             max_results: default_max_results(),
             enable_replay: true,
             static_dir: None,
-            search_blacklist_path: None,
         }
     }
 }
@@ -686,5 +722,44 @@ s3:
     fn load_from_nonexistent_file_returns_error() {
         let result = Config::load("/tmp/this-file-does-not-exist-warc-search.yaml");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn load_blacklist_file_merges_and_dedups() {
+        use std::io::Write;
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("tywb-skip-{}.txt", std::process::id()));
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f, "# noise domains").unwrap();
+        writeln!(f, "instagram.com").unwrap();
+        writeln!(f, "  google.com   # search engine").unwrap();
+        writeln!(f, "").unwrap();
+        writeln!(f, "PINTEREST.COM").unwrap();     // case-normalised
+        writeln!(f, "instagram.com").unwrap();     // duplicate within file
+        f.flush().unwrap();
+
+        let mut cfg = IndexerConfig {
+            blacklisted_domains: vec!["google.com".to_owned()], // pre-existing, should not double
+            blacklisted_domains_path: Some(path.to_string_lossy().into_owned()),
+            ..IndexerConfig::default()
+        };
+        let added = cfg.load_blacklist_file().unwrap();
+        assert_eq!(added, 2, "instagram + pinterest are new; google is already present");
+
+        // The merged set drives both index skip and display filter.
+        assert!(cfg.is_url_blacklisted("https://www.instagram.com/foo"));
+        assert!(cfg.is_url_blacklisted("https://maps.google.com/"));
+        assert!(cfg.is_url_blacklisted("http://pinterest.com/pin/1"));
+        assert!(!cfg.is_url_blacklisted("https://pomologen-verein.de/"));
+        // No duplicate google entry.
+        assert_eq!(cfg.blacklisted_domains.iter().filter(|d| *d == "google.com").count(), 1);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn load_blacklist_file_missing_path_is_noop() {
+        let mut cfg = IndexerConfig::default();
+        assert_eq!(cfg.load_blacklist_file().unwrap(), 0);
     }
 }

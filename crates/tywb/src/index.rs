@@ -255,7 +255,10 @@ pub async fn run(cfg: Config, args: IndexArgs) -> anyhow::Result<()> {
         }
     };
 
-    if objects.is_empty() {
+    // Collections are indexed after the WARC loop (when not in --file mode), so
+    // an empty WARC list is only "nothing to do" if there are no collections.
+    let has_collections = args.file.is_none() && !cfg.indexer.collections.is_empty();
+    if objects.is_empty() && !has_collections {
         info!("nothing to index — all objects are up to date");
         return Ok(());
     }

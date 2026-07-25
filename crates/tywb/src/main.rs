@@ -22,7 +22,6 @@ use tracing::info;
 
 use warc_search_config::Config;
 
-mod blocklist;
 mod gz_warc;
 mod index;
 mod pdf;
@@ -135,6 +134,17 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     info!(config = %cli.config.display(), "tywb starting");
+
+    // Single domain skip list: merge the static file into the in-memory domain
+    // blacklist. It then drives ingest-time skipping, the index-start purge and
+    // the server's query-time display filter alike.
+    let mut cfg = cfg;
+    match cfg.indexer.load_blacklist_file() {
+        Ok(0) => {}
+        Ok(n) => info!(added = n, path = ?cfg.indexer.blacklisted_domains_path, "loaded domain skip list"),
+        Err(e) => tracing::warn!(err = %e, path = ?cfg.indexer.blacklisted_domains_path,
+                                 "could not read domain skip list — continuing without it"),
+    }
 
     match cli.command {
         Command::Index { file, max_files, max_urls, force, collections_only } =>
