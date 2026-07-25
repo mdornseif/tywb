@@ -766,6 +766,22 @@ async fn index_warc_object(
 
 // ── Text extraction ───────────────────────────────────────────────────────────
 
+/// Truncate `s` to at most `max` bytes, backing up to the nearest UTF-8 char
+/// boundary so we never slice through a multi-byte character. Binary or
+/// mis-decoded content (e.g. a non-UTF-8 blob lossily read as text) otherwise
+/// makes a naive `s[..max]` panic and skip the whole WARC object.
+fn truncate_on_char_boundary(mut s: String, max: usize) -> String {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s.truncate(end);
+    s
+}
+
 fn build_index_doc(
     record: &warc::WarcRecord,
     cdx: &CdxRecord,
@@ -797,11 +813,7 @@ fn build_index_doc(
         let extractor = pdf?;
         let body = record.http_body().unwrap_or(record.block.as_ref());
         let doc = extractor.extract(&cdx.original_url, body)?;
-        let body_text = if doc.body.len() > max_bytes {
-            doc.body[..max_bytes].to_owned()
-        } else {
-            doc.body
-        };
+        let body_text = truncate_on_char_boundary(doc.body, max_bytes);
         return Some(IndexDoc {
             url:       cdx.original_url.clone(),
             timestamp: ts,
@@ -829,11 +841,7 @@ fn build_index_doc(
         let rest  = lines.next().unwrap_or("").to_owned();
         (first, rest)
     };
-    let body_text = if body_text.len() > max_bytes {
-        body_text[..max_bytes].to_owned()
-    } else {
-        body_text
-    };
+    let body_text = truncate_on_char_boundary(body_text, max_bytes);
 
     Some(IndexDoc {
         url:       cdx.original_url.clone(),
@@ -1113,5 +1121,32 @@ impl<R: Read> Read for CountingReader<R> {
             self.progress.bytes_read.fetch_add(n as u64, Ordering::Relaxed);
         }
         Ok(n)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::truncate_on_char_boundary;
+
+    #[test]
+    fn truncate_backs_up_off_a_multibyte_char() {
+        // 'ä' is 2 bytes. A cap landing inside it must not panic and must not
+        // emit a partial char.
+        let s = "aä".to_owned(); // bytes: a(1) ä(2) => len 3; boundaries at 0,1,3
+        assert_eq!(truncate_on_char_boundary(s.clone(), 2), "a"); // 2 is inside 'ä' -> back to 1
+        assert_eq!(truncate_on_char_boundary(s.clone(), 3), "aä"); // exact fit
+        assert_eq!(truncate_on_char_boundary(s.clone(), 1), "a");
+        assert_eq!(truncate_on_char_boundary(s, 99), "aä"); // shorter than cap
+    }
+
+    #[test]
+    fn truncate_handles_replacement_char_at_the_cap() {
+        // The real crash: U+FFFD (3 bytes) straddling a 524288-style cap.
+        let mut s = "x".repeat(10);
+        s.push('\u{FFFD}'); // 3 bytes, bytes 10..13
+        // cap 11 and 12 land inside the replacement char -> back up to 10.
+        assert_eq!(truncate_on_char_boundary(s.clone(), 11).len(), 10);
+        assert_eq!(truncate_on_char_boundary(s.clone(), 12).len(), 10);
+        assert_eq!(truncate_on_char_boundary(s, 13).len(), 13); // whole thing fits
     }
 }
