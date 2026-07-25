@@ -38,6 +38,8 @@ pub struct IndexArgs {
     pub max_urls: Option<u64>,
     /// Re-process all objects regardless of saved ETag state.
     pub force: bool,
+    /// Index only the extra collections, skipping the primary WARC bucket.
+    pub collections_only: bool,
 }
 
 // ── Statistics ────────────────────────────────────────────────────────────────
@@ -230,7 +232,10 @@ pub async fn run(cfg: Config, args: IndexArgs) -> anyhow::Result<()> {
         });
 
     // Build list of objects to process
-    let objects: Vec<ObjectMeta> = if let Some(ref key) = args.file {
+    let objects: Vec<ObjectMeta> = if args.collections_only {
+        info!("--collections-only: skipping the primary WARC bucket");
+        Vec::new()
+    } else if let Some(ref key) = args.file {
         // Single-file mode: synthesise a fake ObjectMeta so the loop is uniform.
         info!(key = %key, "single-file mode");
         vec![ObjectMeta { key: key.clone(), size: 0, etag: None, last_modified: None }]

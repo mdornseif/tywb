@@ -66,6 +66,9 @@ enum Command {
         /// Use this to update existing CDX records (e.g. after a bug fix).
         #[arg(long)]
         force: bool,
+        /// Index only the extra collections, skipping the primary WARC bucket.
+        #[arg(long)]
+        collections_only: bool,
     },
     /// Run the HTTP search and replay server.
     Server,
@@ -134,8 +137,8 @@ async fn main() -> anyhow::Result<()> {
     info!(config = %cli.config.display(), "tywb starting");
 
     match cli.command {
-        Command::Index { file, max_files, max_urls, force } =>
-            index::run(cfg, index::IndexArgs { file, max_files, max_urls, force }).await,
+        Command::Index { file, max_files, max_urls, force, collections_only } =>
+            index::run(cfg, index::IndexArgs { file, max_files, max_urls, force, collections_only }).await,
         Command::Server => server::run(cfg).await,
         Command::Stats  => unreachable!(),
         Command::Recompress {
