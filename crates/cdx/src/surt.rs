@@ -33,7 +33,14 @@ pub fn to_surt(raw_url: &str) -> Result<String> {
         reason: e.to_string(),
     })?;
 
-    let host = url.host_str().unwrap_or("").to_ascii_lowercase();
+    // Strip a trailing dot (FQDN form): "scholl.de." indexes the same as
+    // "scholl.de" — otherwise the reversed labels gain a leading empty label
+    // and the two spellings become distinct SURTs.
+    let host = url
+        .host_str()
+        .unwrap_or("")
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
 
     // Reverse host labels: "www.example.com" → "com,example,www"
     let surt_host: String = host
@@ -73,9 +80,10 @@ pub fn canonicalize(raw_url: &str) -> Result<String> {
         reason: e.to_string(),
     })?;
 
-    // Lowercase scheme + host
+    // Lowercase scheme + host, and drop a trailing FQDN dot so "scholl.de."
+    // canonicalises to "scholl.de".
     // (url crate already lowercases these on parse, but be explicit)
-    let host = url.host_str().unwrap_or("").to_ascii_lowercase();
+    let host = url.host_str().unwrap_or("").trim_end_matches('.').to_ascii_lowercase();
     let _ = url.set_host(Some(&host));
 
     // Remove fragment
@@ -122,6 +130,17 @@ mod tests {
         assert_eq!(
             to_surt("https://www.example.com/").unwrap(),
             "com,example,www)/"
+        );
+    }
+
+    #[test]
+    fn surt_trailing_fqdn_dot_stripped() {
+        // "scholl.de." must produce the same SURT as "scholl.de".
+        assert_eq!(to_surt("https://scholl.de./").unwrap(), to_surt("https://scholl.de/").unwrap());
+        assert_eq!(to_surt("https://scholl.de./").unwrap(), "de,scholl)/");
+        assert_eq!(
+            to_surt("http://streuobstmosterei.de./obst").unwrap(),
+            "de,streuobstmosterei)/obst",
         );
     }
 
