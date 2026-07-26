@@ -116,9 +116,12 @@ async fn health_handler() -> impl IntoResponse {
 // ── / — homepage ──────────────────────────────────────────────────────────────
 
 async fn home_handler(State(state): State<Arc<AppState>>) -> Response {
-    let cdx_stats = { state.cdx.lock().unwrap().stats() };
+    let (cdx_stats, collections) = {
+        let store = state.cdx.lock().unwrap();
+        (store.stats(), store.collection_counts().unwrap_or_default())
+    };
     match cdx_stats {
-        Ok(stats) => Html(ui::homepage_html(&stats, state.search.num_docs())).into_response(),
+        Ok(stats) => Html(ui::homepage_html(&stats, state.search.num_docs(), &collections)).into_response(),
         Err(e) => {
             error!(err = %e, "stats query failed");
             (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
@@ -134,6 +137,8 @@ struct UiSearchParams {
     from:  Option<String>,
     to:    Option<String>,
     limit: Option<usize>,
+    /// Restrict results to a single collection (e.g. "obst-pdfs").
+    collection: Option<String>,
 }
 
 async fn ui_search_handler(
@@ -143,7 +148,8 @@ async fn ui_search_handler(
     let q = params.q.as_deref().unwrap_or("").trim().to_owned();
 
     if q.is_empty() {
-        return Html(ui::search_html("", &[], params.from.as_deref(), params.to.as_deref(), false))
+        return Html(ui::search_html("", &[], params.from.as_deref(), params.to.as_deref(),
+                                   params.collection.as_deref(), false))
             .into_response();
     }
 
@@ -172,16 +178,21 @@ async fn ui_search_handler(
     match state.search.search(&q, limit, from_ts, to_ts) {
         Ok(mut hits) => {
             hits.retain(|h| !state.config.indexer.is_url_blacklisted(&h.url));
+            if let Some(coll) = params.collection.as_deref() {
+                hits.retain(|h| h.collection.as_deref() == Some(coll));
+            }
             Html(ui::search_html(
                 &q, &hits,
                 params.from.as_deref(),
                 params.to.as_deref(),
+                params.collection.as_deref(),
                 false,
             )).into_response()
         }
         Err(e) => {
             error!(err = %e, "search failed");
-            Html(ui::search_html(&q, &[], params.from.as_deref(), params.to.as_deref(), true))
+            Html(ui::search_html(&q, &[], params.from.as_deref(), params.to.as_deref(),
+                                 params.collection.as_deref(), true))
                 .into_response()
         }
     }
@@ -400,6 +411,7 @@ struct SearchParams {
     from:  Option<String>,
     to:    Option<String>,
     limit: Option<usize>,
+    collection: Option<String>,
 }
 
 async fn search_handler(
@@ -415,6 +427,9 @@ async fn search_handler(
     match state.search.search(&params.q, limit, from_ts, to_ts) {
         Ok(mut hits) => {
             hits.retain(|h| !state.config.indexer.is_url_blacklisted(&h.url));
+            if let Some(coll) = params.collection.as_deref() {
+                hits.retain(|h| h.collection.as_deref() == Some(coll));
+            }
             Json(hits).into_response()
         }
         Err(e) => {

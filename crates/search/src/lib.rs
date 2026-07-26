@@ -51,6 +51,9 @@ pub struct IndexDoc {
     pub offset: u64,
     /// Byte length of the WARC record block.
     pub length: u64,
+    /// Name of the source collection ("warc" for the primary archive, or a
+    /// named collection such as "obst-pdfs").
+    pub collection: String,
 }
 
 /// A single fulltext search result.
@@ -65,6 +68,9 @@ pub struct SearchHit {
     pub offset: u64,
     pub length: u64,
     pub score: f32,
+    /// Source collection, if the index carries it (older indexes may not).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collection: Option<String>,
 }
 
 // ── Schema internals ──────────────────────────────────────────────────────────
@@ -80,6 +86,8 @@ struct Fields {
     s3_key: Field,
     offset: Field,
     length: Field,
+    /// Present only when the index schema carries a `collection` field.
+    collection: Option<Field>,
 }
 
 fn build_schema() -> (Schema, Fields) {
@@ -95,9 +103,11 @@ fn build_schema() -> (Schema, Fields) {
     let s3_key    = b.add_text_field("s3_key",    STRING | STORED);
     let offset    = b.add_u64_field("offset",     NumericOptions::default().set_stored());
     let length    = b.add_u64_field("length",     NumericOptions::default().set_stored());
+    let collection = b.add_text_field("collection", STRING | STORED);
 
     let schema = b.build();
-    let fields = Fields { url, timestamp, title, body, mime, s3_key, offset, length };
+    let fields = Fields { url, timestamp, title, body, mime, s3_key, offset, length,
+                          collection: Some(collection) };
     (schema, fields)
 }
 
@@ -117,6 +127,8 @@ fn fields_from_index_schema(schema: &Schema) -> Result<Fields> {
         s3_key:    f("s3_key")?,
         offset:    f("offset")?,
         length:    f("length")?,
+        // Optional: indexes built before collections lack this field.
+        collection: schema.get_field("collection").ok(),
     })
 }
 
@@ -173,6 +185,7 @@ fn search_impl(
             offset:    get_u64(&doc, fields.offset).unwrap_or(0),
             length:    get_u64(&doc, fields.length).unwrap_or(0),
             score,
+            collection: fields.collection.and_then(|f| get_str(&doc, f)),
         });
     }
 
@@ -235,6 +248,9 @@ impl SearchIndex {
         d.add_text(self.fields.s3_key, &doc.s3_key);
         d.add_u64( self.fields.offset, doc.offset);
         d.add_u64( self.fields.length, doc.length);
+        if let Some(f) = self.fields.collection {
+            d.add_text(f, &doc.collection);
+        }
         self.writer.add_document(d)?;
         Ok(())
     }

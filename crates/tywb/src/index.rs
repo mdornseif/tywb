@@ -823,6 +823,7 @@ fn build_index_doc(
             s3_key:    cdx.s3_key.clone(),
             offset:    cdx.offset,
             length:    cdx.length,
+            collection: cdx.collection.clone(),
         });
     }
 
@@ -852,6 +853,7 @@ fn build_index_doc(
         s3_key:    cdx.s3_key.clone(),
         offset:    cdx.offset,
         length:    cdx.length,
+        collection: cdx.collection.clone(),
     })
 }
 

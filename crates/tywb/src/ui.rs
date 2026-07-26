@@ -117,6 +117,22 @@ input[type=text]:focus,input[type=search]:focus{
   color:#fff!important;border-radius:6px;font-size:.76rem;font-weight:500;
   text-decoration:none!important;display:inline-block}
 .replay-btn:hover{background:#2d3e7e}
+/* collection badges + filter + homepage cards */
+.coll-badge{background:var(--blue-lt);color:var(--navy);border:1px solid #bcd0f5;
+  padding:.1rem .45rem;border-radius:4px;font-size:.72rem;font-weight:600;
+  white-space:nowrap;text-decoration:none!important}
+a.coll-badge:hover{background:#cfe0fb}
+.coll-clear{font-size:.78rem;color:var(--blue)}
+.coll-section{background:var(--card);border:1px solid var(--border);
+  border-radius:10px;padding:1rem 1.25rem;margin-bottom:1.25rem}
+.coll-section h2{font-size:.95rem;font-weight:600;margin-bottom:.75rem}
+.coll-row{display:flex;flex-wrap:wrap;gap:.6rem}
+.coll-card{display:flex;flex-direction:column;gap:.15rem;min-width:130px;
+  background:var(--bg);border:1px solid var(--border);border-radius:8px;
+  padding:.6rem .9rem;text-decoration:none!important}
+.coll-card:hover{border-color:var(--blue)}
+.coll-name{font-weight:600;color:var(--navy);font-size:.9rem}
+.coll-cnt{font-size:.75rem;color:var(--muted)}
 /* one row per domain — the rest of that domain's hits fold away */
 .result-group{display:flex;flex-direction:column;gap:.25rem}
 .more{margin-left:1.1rem}
@@ -334,7 +350,7 @@ fn short_mime<'a>(mime: Option<&'a str>) -> &'a str {
 
 // ── Homepage ──────────────────────────────────────────────────────────────────
 
-pub fn homepage_html(stats: &CdxStats, num_docs: u64) -> String {
+pub fn homepage_html(stats: &CdxStats, num_docs: u64, collections: &[(String, u64)]) -> String {
     let mut c = String::with_capacity(8192);
 
     // ── Stat cards ────────────────────────────────────────────────────────
@@ -344,6 +360,22 @@ pub fn homepage_html(stats: &CdxStats, num_docs: u64) -> String {
     stat_card(&mut c, &fmt_count(stats.warc_files),    "WARC files");
     stat_card(&mut c, &fmt_count(num_docs),            "Fulltext docs");
     c.push_str("</div>\n");
+
+    // ── Collections ───────────────────────────────────────────────────────
+    // Only worth showing once there is more than the default WARC archive.
+    if collections.iter().any(|(name, _)| name != "warc") {
+        c.push_str("<div class=\"coll-section\">\n<h2>Collections</h2>\n<div class=\"coll-row\">\n");
+        for (name, n) in collections {
+            c.push_str("  <a class=\"coll-card\" href=\"/ui/search?q=&collection=");
+            push_url_encoded(&mut c, name);
+            c.push_str("\">\n    <span class=\"coll-name\">");
+            push_esc(&mut c, name);
+            c.push_str("</span>\n    <span class=\"coll-cnt\">");
+            push_esc(&mut c, &fmt_count(*n));
+            c.push_str("</span>\n  </a>\n");
+        }
+        c.push_str("</div>\n</div>\n");
+    }
 
     // ── Date coverage ─────────────────────────────────────────────────────
     match (&stats.oldest_timestamp, &stats.newest_timestamp) {
@@ -438,6 +470,7 @@ pub fn search_html(
     hits: &[SearchHit],
     from: Option<&str>,
     to: Option<&str>,
+    collection: Option<&str>,
     error: bool,
 ) -> String {
     let mut c = String::with_capacity(4096 + hits.len() * 512);
@@ -445,6 +478,12 @@ pub fn search_html(
     // ── Search form (always visible at top) ───────────────────────────────
     c.push_str("<div class=\"search-top\">\n");
     c.push_str("<form action=\"/ui/search\" method=\"get\">\n");
+    // Keep an active collection filter across searches.
+    if let Some(coll) = collection.filter(|c| !c.is_empty()) {
+        c.push_str("<input type=\"hidden\" name=\"collection\" value=\"");
+        push_esc(&mut c, coll);
+        c.push_str("\">\n");
+    }
     c.push_str("  <div class=\"input-row\">\n");
     c.push_str("    <input name=\"q\" type=\"search\" value=\"");
     push_esc(&mut c, q);
@@ -510,6 +549,14 @@ pub fn search_html(
         c.push_str(" for <strong>");
         push_esc(&mut c, q);
         c.push_str("</strong>");
+    }
+    // Active collection filter: show it with a one-click "clear".
+    if let Some(coll) = collection.filter(|c| !c.is_empty()) {
+        c.push_str(" · in collection <span class=\"coll-badge\">");
+        push_esc(&mut c, coll);
+        c.push_str("</span> <a class=\"coll-clear\" href=\"/ui/search?q=");
+        push_url_encoded(&mut c, q);
+        c.push_str("\">clear</a>");
     }
     c.push_str("</p>\n");
 
@@ -657,6 +704,17 @@ fn render_hit(out: &mut String, hit: &SearchHit) {
         out.push_str("      <span class=\"badge\">");
         push_esc(out, mime);
         out.push_str("</span>\n");
+    }
+    // Collection badge — only for non-default collections; links to a filtered
+    // search of that collection.
+    if let Some(coll) = hit.collection.as_deref() {
+        if coll != warc_search_cdx::DEFAULT_COLLECTION && !coll.is_empty() {
+            out.push_str("      <a class=\"coll-badge\" href=\"/ui/search?collection=");
+            push_url_encoded(out, coll);
+            out.push_str("&q=\" title=\"filter this collection\">");
+            push_esc(out, coll);
+            out.push_str("</a>\n");
+        }
     }
     out.push_str("    </div>\n");
 
@@ -1183,7 +1241,31 @@ mod tests {
             offset: 0,
             length: 0,
             score: 1.0,
+            collection: None,
         }
+    }
+
+    #[test]
+    fn collection_badge_renders_for_non_warc_hits() {
+        let mut h = hit("https://obst-pdfs.23.nu/1152-hochstamm.pdf", "20260227000000", "Hochstamm");
+        h.mime = Some("application/pdf".to_owned());
+        h.collection = Some("obst-pdfs".to_owned());
+        let mut warc = hit("https://example.de/", "20260101000000", "Ex");
+        warc.collection = Some("warc".to_owned());
+        let html = search_html("x", &[h, warc], None, None, None, false);
+        // obst-pdfs gets a badge linking to its filtered search…
+        assert!(html.contains("coll-badge\" href=\"/ui/search?collection=obst-pdfs&q=\""));
+        // …but the default "warc" collection is not badged.
+        assert!(!html.contains(">warc</a>"));
+    }
+
+    #[test]
+    fn active_collection_filter_shows_clear_link() {
+        let html = search_html("apfel", &[], None, None, Some("obst-pdfs"), false);
+        assert!(html.contains("in collection <span class=\"coll-badge\">obst-pdfs"));
+        assert!(html.contains("coll-clear\" href=\"/ui/search?q=apfel\""));
+        // The filter persists as a hidden form field.
+        assert!(html.contains("name=\"collection\" value=\"obst-pdfs\""));
     }
 
     #[test]
@@ -1232,7 +1314,7 @@ mod tests {
             hit("https://obstsorten.a.de/2", "20260101000000", "a new"),
             hit("https://b.de/1", "20200101000000", "b only"),
         ];
-        let html = search_html("Roter Berlepsch", &hits, None, None, false);
+        let html = search_html("Roter Berlepsch", &hits, None, None, None, false);
 
         assert!(html.contains("3 results from 2 domains"), "count line: {html:.0}");
         // The newest capture of a.de is the visible row…
@@ -1246,7 +1328,7 @@ mod tests {
 
     #[test]
     fn empty_result_set_renders_no_groups() {
-        let html = search_html("nothing", &[], None, None, false);
+        let html = search_html("nothing", &[], None, None, None, false);
         assert!(html.contains("No results for"));
         assert!(!html.contains("class=\"more\""));
     }

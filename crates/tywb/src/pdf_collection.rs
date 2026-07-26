@@ -176,6 +176,7 @@ async fn index_one_pdf(
         s3_key:    obj.key.clone(),
         offset:    0,
         length:    bytes.len() as u64,
+        collection: coll.name.clone(),
     };
     search.add_document(&index_doc).context("search add_document")?;
     Ok(true)

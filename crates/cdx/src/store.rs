@@ -431,6 +431,18 @@ impl CdxStore {
     }
 
     /// Aggregate statistics over the whole CDX table.
+    /// Record count per collection, most populous first. Drives the collections
+    /// section on the homepage.
+    pub fn collection_counts(&self) -> Result<Vec<(String, u64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT collection, COUNT(*) AS n FROM cdx GROUP BY collection ORDER BY n DESC")?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64)))?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
+    }
+
     pub fn stats(&self) -> Result<CdxStats> {
         let total: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM cdx", [], |r| r.get(0))?;
