@@ -77,7 +77,11 @@ pub fn from_warc_record(
 
     let record_type = warc.header.record_type()?;
     match record_type {
-        RecordType::Response | RecordType::Resource => {}
+        // Revisit records (dedup captures whose payload equals an earlier one)
+        // carry the HTTP response headers but no body. We include them in the
+        // CDX so the capture history is complete, but they get no fulltext doc
+        // (the content is already indexed via the record they refer to).
+        RecordType::Response | RecordType::Resource | RecordType::Revisit => {}
         _ => return Ok(None),
     }
 
@@ -108,7 +112,14 @@ pub fn from_warc_record(
     // Try to extract HTTP status from the response block
     let status = extract_http_status(&warc.block);
 
-    let digest = warc.header.block_digest().map(|s| s.to_owned());
+    // For a revisit, the block digest is of the headers-only block; the
+    // *payload* digest is the identity of the referenced content and is what a
+    // later replay resolver would match against. Prefer it for revisits.
+    let digest = match record_type {
+        RecordType::Revisit => warc.header.payload_digest().or_else(|| warc.header.block_digest()),
+        _ => warc.header.block_digest(),
+    }
+    .map(|s| s.to_owned());
     let length = warc.header.content_length()? as u64;
 
     Ok(Some(CdxRecord {
@@ -463,4 +474,36 @@ mod tests {
 
     use chrono::Timelike;
     use chrono::Datelike;
+
+    #[test]
+    fn from_warc_revisit_record_is_included_with_payload_digest() {
+        // A revisit record: HTTP headers, no body, WARC-Payload-Digest links to
+        // the original content.
+        let http = b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n";
+        let rec = make_warc_record(
+            &[
+                ("WARC-Type", "revisit"),
+                ("WARC-Date", "2026-07-20T10:00:00Z"),
+                ("WARC-Record-ID", "<urn:uuid:rev-1>"),
+                ("WARC-Target-URI", "https://obst.example/page"),
+                ("WARC-Refers-To", "<urn:uuid:orig-1>"),
+                ("WARC-Payload-Digest", "sha1:PAYLOADHASH"),
+                ("WARC-Block-Digest", "sha1:HEADERSONLY"),
+                ("WARC-Profile", "https://iana.org/assignments/warc/1.1/revisit/identical-payload-digest"),
+                ("Content-Type", "application/http; msgtype=response"),
+            ],
+            http,
+            4242,
+        );
+        let cdx = from_warc_record(&rec, "warc/zeno-00002.warc.gz").unwrap()
+            .expect("revisit records are now included in the CDX");
+        assert_eq!(cdx.original_url, "https://obst.example/page");
+        assert_eq!(cdx.timestamp, "20260720100000");
+        assert_eq!(cdx.status, Some(200));
+        assert_eq!(cdx.mime.as_deref(), Some("text/html"));
+        // Digest is the PAYLOAD digest (content identity), not the headers-only
+        // block digest — so a future resolver can match it to the original.
+        assert_eq!(cdx.digest.as_deref(), Some("sha1:PAYLOADHASH"));
+        assert_eq!(cdx.offset, 4242);
+    }
 }

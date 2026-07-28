@@ -788,6 +788,13 @@ fn build_index_doc(
     max_bytes: usize,
     pdf: Option<&crate::pdf::PdfExtractor>,
 ) -> Option<IndexDoc> {
+    // Revisit records have no payload of their own — the content is already
+    // indexed via the record they refer to, so they get a CDX entry (capture
+    // history) but no duplicate fulltext doc.
+    if matches!(record.header.record_type(), Ok(warc::RecordType::Revisit)) {
+        return None;
+    }
+
     // Skip non-HTTP URIs (urn:, data:, etc.) — internal crawler bookkeeping,
     // not real pages.
     if !cdx.original_url.starts_with("http://") && !cdx.original_url.starts_with("https://") {
