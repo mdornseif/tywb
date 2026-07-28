@@ -72,6 +72,14 @@ impl PdfExtractor {
             debug!(url, bytes = pdf.len(), limit = self.max_pdf_bytes, "PDF too large — skipping");
             return None;
         }
+        // Truncated PDFs (e.g. CommonCrawl/wayback capped at ~1 MiB) have no
+        // `%%EOF` trailer. OCR of them yields only noise that the quality gate
+        // drops anyway — but the OCR attempt itself is what makes indexing
+        // crawl, so skip them before touching Tika.
+        if !pdf_has_eof(pdf) {
+            debug!(url, bytes = pdf.len(), "PDF truncated (no %%EOF) — skipping OCR");
+            return None;
+        }
 
         let resp = self
             .agent
@@ -172,6 +180,15 @@ fn title_from_url(url: &str) -> String {
     name.replace(['_', '+'], " ").replace("%20", " ").trim().chars().take(256).collect()
 }
 
+/// A complete PDF ends with a `%%EOF` trailer within its last stretch of bytes.
+/// A truncated capture (cut at the crawler's size cap) lacks it. Checking a
+/// generous tail tolerates trailing whitespace, incremental-update xref
+/// sections, and a little padding after the marker.
+fn pdf_has_eof(pdf: &[u8]) -> bool {
+    let tail = &pdf[pdf.len().saturating_sub(4096)..];
+    tail.windows(5).any(|w| w == b"%%EOF")
+}
+
 /// Does `s` read like prose rather than OCR noise?
 ///
 /// The guard against wrong-language or wrong-script OCR, which returns long
@@ -262,5 +279,22 @@ mod tests {
         assert!(text.contains("Roter Berlepsch"));
         assert!(text.contains("angehängtes Dokument"));
         assert!(!text.contains("\n\n\n"), "whitespace not collapsed: {text:?}");
+    }
+
+    #[test]
+    fn detects_pdf_eof_trailer() {
+        let mut good = b"%PDF-1.4\n...body...\n".to_vec();
+        good.extend_from_slice(b"xref\n0 1\ntrailer\n<<>>\nstartxref\n9\n%%EOF\n");
+        assert!(pdf_has_eof(&good));
+        // trailing whitespace/padding after the marker still counts
+        good.extend_from_slice(b"   \r\n");
+        assert!(pdf_has_eof(&good));
+    }
+
+    #[test]
+    fn detects_truncated_pdf() {
+        // 1 MiB of body with no %%EOF (a truncated capture)
+        let trunc = vec![b'x'; 1_048_576];
+        assert!(!pdf_has_eof(&trunc));
     }
 }
