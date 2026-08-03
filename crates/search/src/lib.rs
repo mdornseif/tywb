@@ -276,6 +276,21 @@ impl SearchIndex {
         Ok(urls.len())
     }
 
+    /// Queue deletion of every document belonging to a single WARC object,
+    /// matched by its exact `s3_key`.  Used to cleanly *replace* a file's
+    /// contribution when it is re-indexed: `delete_term` only affects
+    /// already-committed documents (lower opstamp), so documents added after
+    /// this call in the same commit survive.  Not visible until [`commit`].
+    ///
+    /// Keyed on `s3_key` rather than `url` on purpose: the archive holds
+    /// multiple captures of the same URL across different WARC files (revisits),
+    /// and deleting by URL would strip the other files' captures too.
+    pub fn delete_s3_key(&mut self, s3_key: &str) -> Result<()> {
+        let term = tantivy::Term::from_field_text(self.fields.s3_key, s3_key);
+        self.writer.delete_term(term);
+        Ok(())
+    }
+
     // ── Reads ─────────────────────────────────────────────────────────────────
 
     /// Fulltext search.
@@ -380,6 +395,23 @@ mod tests {
             s3_key:    "test/archive.warc.gz".to_owned(),
             offset:    1024,
             length:    512,
+            collection: "warc".to_owned(),
+        }
+    }
+
+    /// Like [`doc`] but with an explicit `s3_key` — for exercising per-file
+    /// replace semantics ([`SearchIndex::delete_s3_key`]).
+    fn doc_in(url: &str, s3_key: &str) -> IndexDoc {
+        IndexDoc {
+            url:       url.to_owned(),
+            timestamp: 20240315120000,
+            title:     "t".to_owned(),
+            body:      "some indexable body text".to_owned(),
+            mime:      Some("text/html".to_owned()),
+            s3_key:    s3_key.to_owned(),
+            offset:    0,
+            length:    1,
+            collection: "warc".to_owned(),
         }
     }
 
@@ -581,6 +613,7 @@ mod tests {
             s3_key:    "crawls/full.warc.gz".to_owned(),
             offset:    2048,
             length:    4096,
+            collection: "warc".to_owned(),
         })
         .unwrap();
         idx.commit().unwrap();
@@ -608,5 +641,49 @@ mod tests {
 
         let hits = idx.search("keyword", 1, None, None).unwrap();
         assert_eq!(hits[0].timestamp, "20240101090501");
+    }
+
+    // ── Per-file replace (delete_s3_key) ────────────────────────────────────────
+
+    #[test]
+    fn delete_s3_key_removes_only_that_files_docs() {
+        let dir = tempdir().unwrap();
+        let mut idx = SearchIndex::open_or_create(dir.path()).unwrap();
+        idx.add_document(&doc_in("https://a.com/1", "fileA.warc.gz")).unwrap();
+        idx.add_document(&doc_in("https://a.com/2", "fileA.warc.gz")).unwrap();
+        idx.add_document(&doc_in("https://b.com/1", "fileB.warc.gz")).unwrap();
+        idx.commit().unwrap();
+        assert_eq!(idx.num_docs(), 3);
+
+        // Deleting fileA drops both of its docs, leaves fileB untouched.
+        idx.delete_s3_key("fileA.warc.gz").unwrap();
+        idx.commit().unwrap();
+        assert_eq!(idx.num_docs(), 1);
+        let hits = idx.search("indexable", 10, None, None).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].s3_key, "fileB.warc.gz");
+    }
+
+    #[test]
+    fn reindex_same_file_replaces_not_duplicates() {
+        // The real re-index invariant: delete the file's docs, then re-add in
+        // the SAME commit. delete_term only affects already-committed docs
+        // (lower opstamp), so the re-adds survive and there is no duplication.
+        let dir = tempdir().unwrap();
+        let mut idx = SearchIndex::open_or_create(dir.path()).unwrap();
+        idx.add_document(&doc_in("https://a.com/1", "fileA.warc.gz")).unwrap();
+        idx.add_document(&doc_in("https://a.com/2", "fileA.warc.gz")).unwrap();
+        idx.commit().unwrap();
+        assert_eq!(idx.num_docs(), 2);
+
+        // Re-index the same file: delete-then-add within one commit.
+        idx.delete_s3_key("fileA.warc.gz").unwrap();
+        idx.add_document(&doc_in("https://a.com/1", "fileA.warc.gz")).unwrap();
+        idx.add_document(&doc_in("https://a.com/2", "fileA.warc.gz")).unwrap();
+        idx.add_document(&doc_in("https://a.com/3", "fileA.warc.gz")).unwrap();
+        idx.commit().unwrap();
+
+        // 3 docs, not 5 — the old two were replaced, the new record added.
+        assert_eq!(idx.num_docs(), 3);
     }
 }

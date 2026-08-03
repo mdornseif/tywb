@@ -740,6 +740,14 @@ async fn index_warc_object(
         });
     }
 
+    // Re-index must *replace* a file's contribution, not duplicate it:
+    // add_document below appends unconditionally, so without this a second pass
+    // over the same object (--force, or a --file backfill) would add a second
+    // copy of every already-indexed record. delete_term only affects
+    // already-committed docs (lower opstamp); the adds that follow in this same
+    // commit survive. On a first index this matches nothing and is a no-op.
+    search.delete_s3_key(key).context("search delete_s3_key")?;
+
     let mut indexed = 0usize;
     for (_, doc_opt) in &parsed.records {
         if let Some(doc) = doc_opt {
