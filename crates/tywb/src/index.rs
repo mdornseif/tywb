@@ -929,13 +929,17 @@ pub(crate) fn strip_html(html: &str) -> String {
 /// name; otherwise `None`.
 ///
 /// [raw-text element]: RAW_TEXT_ELEMENTS
+/// Compared on bytes, never on `&str` slices: a mis-decoded page is full of
+/// `U+FFFD`, and `&s[..6]` lands inside one of those three-byte characters and
+/// panics. Byte comparison has no boundary to hit.
 fn raw_text_element(s: &str) -> Option<&'static str> {
-    let after_lt = s.strip_prefix('<')?;
+    let after_lt = s.strip_prefix('<')?.as_bytes();
     RAW_TEXT_ELEMENTS.iter().copied().find(|name| {
+        let name = name.as_bytes();
         after_lt.len() > name.len()
             && after_lt[..name.len()].eq_ignore_ascii_case(name)
             // `<script>`/`<script src=…>` — but not `<scriptural>`.
-            && matches!(after_lt.as_bytes()[name.len()], b'>' | b'/' | b' ' | b'\t' | b'\r' | b'\n')
+            && matches!(after_lt[name.len()], b'>' | b'/' | b' ' | b'\t' | b'\r' | b'\n')
     })
 }
 
@@ -1260,6 +1264,20 @@ mod tests {
     #[test]
     fn strip_html_keeps_elements_that_merely_start_like_script() {
         assert_eq!(strip_html("<scriptural>Text</scriptural>"), "Text");
+    }
+
+    #[test]
+    fn strip_html_survives_mis_decoded_bytes() {
+        // A page that isn't valid UTF-8 arrives here full of U+FFFD. Slicing a
+        // &str at a fixed byte offset lands inside one of those 3-byte chars —
+        // that panicked the whole request in production.
+        let mangled = String::from_utf8_lossy(b"<\xffscript>x</script> Text <\xff\xfe> more");
+        let out = strip_html(&mangled);
+        assert!(out.contains("Text") && out.contains("more"), "{out:?}");
+
+        // Binary noise with stray '<' bytes must not panic either.
+        let noise: Vec<u8> = (0u8..=255).cycle().take(4096).collect();
+        strip_html(&String::from_utf8_lossy(&noise));
     }
 
     #[test]
