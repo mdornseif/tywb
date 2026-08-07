@@ -25,6 +25,15 @@ this project does not yet publish tagged releases, so everything lands under
   - PDFs need `indexer.tika`; without it the endpoint answers `501` for them.
     Everything else works with no external dependency.
 
+- **`tywb scan-wire-format`** — sizes the re-index that the wire-format fix
+  requires. It samples a few indexable records per WARC object and Range-GETs
+  only those, then reports the affected objects, the records a re-index would
+  rebuild, and an extrapolated count of wrong documents; `--out` writes the keys
+  for `index --force --file`. Read-only. A record counts as affected only when
+  peeling actually changes its bytes — a `Content-Encoding` header on a body the
+  crawler had already decoded does not, because the old indexer read that
+  correctly.
+
 - **Fix: the wire format is now peeled everywhere, not just in `/text`.** A WARC
   stores the response exactly as it came off the wire, so the bytes after the
   HTTP headers may still carry `Transfer-Encoding: chunked` framing wrapped

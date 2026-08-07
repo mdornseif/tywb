@@ -19,7 +19,8 @@ warc-search/
     ├── cdx/                # lib: CDX index, SQLite, SURT canonicalization
     ├── s3_store/           # lib: S3 access, streaming, Range GET
     ├── search/             # lib: Tantivy fulltext index wrapper
-    └── tywb/               # bin: tywb — index, server, stats, recompress subcommands
+    └── tywb/               # bin: tywb — index, server, stats, recompress,
+                            #      scan-wire-format subcommands
 ```
 
 ### Dependency rules (enforce strictly)
@@ -252,6 +253,10 @@ cargo run --release -p tywb -- --config config.local.yaml server
 # 4. Repair whole-file-gzip WARCs (see "Record-per-member .warc.gz" below)
 cargo run --release -p tywb -- --config config.local.yaml recompress --scan-only
 cargo run --release -p tywb -- --config config.local.yaml recompress
+
+# 5. Size the re-index the wire-format fix needs (read-only; samples records)
+cargo run --release -p tywb -- --config config.local.yaml \
+    scan-wire-format --sample 5 --out /var/tmp/affected.txt
 ```
 
 ---
@@ -276,4 +281,4 @@ CI should fail on any clippy warning. Run both before opening a PR.
 | `cdx`              | ✅ complete  | SURT, SQLite store, closest-match lookup, CDX builder from WarcRecord, `warc_files` metadata table |
 | `s3_store`         | ✅ complete  | Client builder, paginated listing, ETag state, streaming GET, Range GET |
 | `search`           | 🔲 stub      | Next: Tantivy schema, index, query      |
-| `tywb`             | 🔄 in progress | `index` working (streaming, throughput, SIGINFO, limits); `server` serving UI, `/search`, `/text`, replay, CDX; `stats` complete; `recompress` complete |
+| `tywb`             | 🔄 in progress | `index` working (streaming, throughput, SIGINFO, limits); `server` serving UI, `/search`, `/text`, replay, CDX; `stats` complete; `recompress` complete; `scan-wire-format` complete |

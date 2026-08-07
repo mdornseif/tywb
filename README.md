@@ -470,6 +470,56 @@ CDX sidecar files make the archived content independently usable without tywb's 
 - Provides a backup index that lives with the data in S3
 - Enables other tools to locate and replay individual WARC records without running tywb
 
+## Re-indexing after the wire-format fix
+
+Until the [wire format](#wire-format) was peeled in the indexer, a capture stored
+with chunk framing or a `Content-Encoding` was indexed as `U+FFFD` noise, and
+such PDFs reached Tika unparseable. Deploying the fix does not repair those
+documents — only re-indexing their WARC files does.
+
+`scan-wire-format` sizes that job without reading a WARC in full: it samples a
+few indexable records per object and Range-GETs only those.
+
+```bash
+tywb --config config.yaml scan-wire-format --sample 4 --out /var/tmp/affected.txt
+```
+
+```
+Wire-format scan
+  WARC objects in CDX                  667
+  objects scanned                      667
+  objects affected                     ...   (..% of scanned)
+  records sampled                      ...
+  samples needing peeling              ...   (..%)
+
+Re-index scope
+  indexable records, all objects       ...
+  indexable records to rebuild         ...
+  estimated wrong documents           ~...   (extrapolated from the samples)
+```
+
+| Flag | Meaning |
+|------|---------|
+| `--sample N` | Records sampled per WARC object (default 3). Higher is more accurate and costs one Range GET each. |
+| `--limit N` | Stop after N objects, most records first. |
+| `--jobs N` | Objects sampled concurrently (default 8). |
+| `--out <path>` | Write the affected S3 keys, one per line. |
+| `--verbose` | One line per affected object instead of just the summary. |
+
+The scan is read-only. Re-index what it found:
+
+```bash
+while read -r key; do
+  tywb --config config.yaml index --force --file "$key"
+done < /var/tmp/affected.txt
+```
+
+A record counts as affected only when peeling actually changes its bytes, or
+when the body cannot be decoded at all. A `Content-Encoding` header on a body
+the crawler had already decoded does not count — the old indexer read it
+correctly, so re-indexing it would change nothing. The document count is
+extrapolated from the sample, not counted; the record counts are exact.
+
 ## Index statistics
 
 ```bash
