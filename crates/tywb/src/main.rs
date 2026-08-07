@@ -13,6 +13,7 @@
 //!   server      Run the HTTP search and replay server
 //!   stats       Print statistics about the current index
 //!   recompress  Rewrite whole-file-gzip WARCs as record-per-member .warc.gz
+//!   scan-wire-format  Find WARC files needing a re-index after the wire-format fix
 //! ```
 
 use std::path::PathBuf;
@@ -28,9 +29,11 @@ mod index;
 mod pdf;
 mod pdf_collection;
 mod recompress;
+mod record_fetch;
 mod server;
 mod stats;
 mod ui;
+mod wire_scan;
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
 
@@ -74,6 +77,28 @@ enum Command {
     Server,
     /// Print statistics about the current index.
     Stats,
+    /// Find WARC files whose captures need re-indexing after the wire-format fix.
+    ///
+    /// Samples a few records per WARC object and Range-GETs just those, then
+    /// reports which objects hold bodies that the old indexer read as noise
+    /// (chunked framing or a Content-Encoding it never undid). Read-only.
+    ScanWireFormat {
+        /// Records sampled per WARC object.
+        #[arg(long, default_value_t = 3)]
+        sample: usize,
+        /// Stop after this many objects (most records first).
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Objects sampled concurrently.
+        #[arg(long, default_value_t = 8)]
+        jobs: usize,
+        /// Write the affected S3 keys here, one per line, for `index --force`.
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Print a line per affected object, not just the summary.
+        #[arg(long)]
+        verbose: bool,
+    },
     /// Rewrite whole-file-gzip WARCs as record-per-member `.warc.gz`.
     ///
     /// Some producers gzip an entire WARC as one deflate stream instead of one
@@ -152,6 +177,8 @@ async fn main() -> anyhow::Result<()> {
             index::run(cfg, index::IndexArgs { file, max_files, max_urls, force, collections_only }).await,
         Command::Server => server::run(cfg).await,
         Command::Stats  => unreachable!(),
+        Command::ScanWireFormat { sample, limit, jobs, out, verbose } =>
+            wire_scan::run(cfg, wire_scan::ScanArgs { sample, limit, jobs, out, verbose }).await,
         Command::Recompress {
             files, limit, jobs, workdir, dry_run, scan_only, backup_suffix, salvage_truncated,
         } =>

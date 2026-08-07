@@ -31,15 +31,14 @@ use serde::Deserialize;
 use tower_http::trace::TraceLayer;
 use tracing::{debug, error, info, warn};
 
-use std::io::Read as _;
-
 use warc_search_cdx::{CdxRecord, CdxStore, surt::to_surt};
 use warc_search_config::Config;
-use warc_search_s3::{build_client, get_range};
+use warc_search_s3::build_client;
 use warc_search_search::SearchReader;
 
 use crate::http_payload::{MAX_DECODED_BYTES, parse_http_block};
 use crate::pdf::PdfExtractor;
+use crate::record_fetch::{FetchError, fetch_warc_record, warc_http_block as extract_warc_http_block};
 use crate::ui;
 
 // ── Application state ─────────────────────────────────────────────────────────
@@ -503,57 +502,20 @@ async fn fetch_payload(state: &Arc<AppState>, rec: &CdxRecord) -> Result<Payload
         };
     }
 
-    let is_gz = rec.s3_key.to_ascii_lowercase().ends_with(".gz");
-
-    if is_gz {
-        // ── Compressed ────────────────────────────────────────────────────────
-        // Each WARC record in a .warc.gz lives in its own gzip member.
-        // `c_offset` is the compressed byte offset of that member in the S3
-        // object; we Range-GET from there and decompress exactly one member.
-        let Some(c_offset) = rec.c_offset else {
-            return Err((
+    match fetch_warc_record(&state.s3, &state.config.s3.bucket, rec).await {
+        Ok(bytes) => Ok(Payload::Warc(bytes)),
+        Err(e @ FetchError::NoCompressedOffset) => {
+            warn!(s3_key = %rec.s3_key, err = %e, "record predates compressed-offset indexing");
+            Err((
                 StatusCode::SERVICE_UNAVAILABLE,
                 "This record predates compressed-offset indexing. \
                  Re-index (tywb index --force) then restart the server.",
             )
-                .into_response());
-        };
-
-        // Compressed member size is unknown, but always ≤ uncompressed size.
-        // Fetch `length + 64 KiB` compressed bytes; GzDecoder stops at member end.
-        let fetch_len = rec.length + 65536;
-        let compressed = match get_range(
-            &state.s3, &state.config.s3.bucket,
-            &rec.s3_key, c_offset, fetch_len,
-        ).await {
-            Ok(b)  => b,
-            Err(e) => {
-                error!(err = %e, s3_key = %rec.s3_key, "S3 range GET failed");
-                return Err((StatusCode::BAD_GATEWAY, e.to_string()).into_response());
-            }
-        };
-
-        let mut gz = flate2::read::GzDecoder::new(compressed.as_ref());
-        let mut decompressed = Vec::new();
-        if let Err(e) = gz.read_to_end(&mut decompressed) {
-            error!(err = %e, s3_key = %rec.s3_key, c_offset, "gzip decode failed");
-            return Err((StatusCode::BAD_GATEWAY, format!("gzip decode: {e}")).into_response());
+                .into_response())
         }
-        Ok(Payload::Warc(decompressed))
-    } else {
-        // ── Uncompressed ──────────────────────────────────────────────────────
-        // offset is the byte position of the WARC record in the plain .warc file.
-        // Fetch enough bytes to cover WARC headers (~1 KB) plus the HTTP block.
-        let fetch_len = rec.length + 4096;
-        match get_range(
-            &state.s3, &state.config.s3.bucket,
-            &rec.s3_key, rec.offset, fetch_len,
-        ).await {
-            Ok(b)  => Ok(Payload::Warc(b.to_vec())),
-            Err(e) => {
-                error!(err = %e, s3_key = %rec.s3_key, "S3 range GET failed");
-                Err((StatusCode::BAD_GATEWAY, e.to_string()).into_response())
-            }
+        Err(e) => {
+            error!(err = %e, s3_key = %rec.s3_key, "fetching WARC record failed");
+            Err((StatusCode::BAD_GATEWAY, e.to_string()).into_response())
         }
     }
 }
@@ -617,17 +579,6 @@ async fn replay_handler(
         }
         Err(resp) => resp,
     }
-}
-
-/// Skip WARC headers (everything up to and including the first `\r\n\r\n`) and
-/// return the slice starting at the HTTP response block.
-fn extract_warc_http_block(warc_bytes: &[u8]) -> &[u8] {
-    const SEP: &[u8] = b"\r\n\r\n";
-    warc_bytes
-        .windows(4)
-        .position(|w| w == SEP)
-        .map(|i| &warc_bytes[i + 4..])
-        .unwrap_or(warc_bytes)
 }
 
 /// Parse an HTTP response block and return an Axum `Response`.

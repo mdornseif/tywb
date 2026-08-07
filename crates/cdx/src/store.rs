@@ -443,6 +443,53 @@ impl CdxStore {
         Ok(rows)
     }
 
+    /// MIME prefixes whose records become fulltext documents. Kept here so a
+    /// scan can size the index the same way the indexer fills it.
+    pub const INDEXABLE_MIME_PREFIXES: [&'static str; 6] = [
+        "text/html", "application/xhtml", "text/xml",
+        "application/xml", "text/plain", "application/pdf",
+    ];
+
+    /// Per WARC object, how many of its records are candidates for the fulltext
+    /// index — the population a re-index of that object would rebuild.
+    /// Most-populous first.
+    pub fn indexable_counts_by_s3_key(&self) -> Result<Vec<(String, u64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT s3_key, COUNT(*) AS n FROM cdx
+             WHERE collection = ?1 AND mime IS NOT NULL AND (
+                   mime LIKE 'text/html%'       OR mime LIKE 'application/xhtml%'
+                OR mime LIKE 'text/xml%'        OR mime LIKE 'application/xml%'
+                OR mime LIKE 'text/plain%'      OR mime LIKE 'application/pdf%')
+             GROUP BY s3_key ORDER BY n DESC",
+        )?;
+        let rows = stmt
+            .query_map(params![crate::DEFAULT_COLLECTION], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
+    }
+
+    /// A handful of indexable records from one WARC object, for sampling.
+    ///
+    /// Ordered by timestamp so the sample spans the crawl rather than clustering
+    /// on whichever records happen to sit at the head of the file.
+    pub fn sample_indexable(&self, s3_key: &str, limit: usize) -> Result<Vec<CdxRecord>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT surt_url, timestamp, original, mime, status, digest, s3_key, offset, length, c_offset, collection
+             FROM cdx
+             WHERE s3_key = ?1 AND mime IS NOT NULL AND (
+                   mime LIKE 'text/html%'       OR mime LIKE 'application/xhtml%'
+                OR mime LIKE 'text/xml%'        OR mime LIKE 'application/xml%'
+                OR mime LIKE 'text/plain%'      OR mime LIKE 'application/pdf%')
+             ORDER BY timestamp
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![s3_key, limit as i64], row_to_record)?;
+        rows.map(|r| r.map_err(CdxError::from)).collect()
+    }
+
     pub fn stats(&self) -> Result<CdxStats> {
         let total: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM cdx", [], |r| r.get(0))?;
