@@ -228,8 +228,10 @@ X-Tywb-Low-Quality: 1        (only when the OCR quality gate rejected the text)
 | anything else | `415`, with a pointer to `/web/` for the raw bytes. |
 
 A `Content-Encoding` of `gzip` or `deflate` on the stored response is undone
-first. `br` and other encodings we cannot decode are refused with `415` rather
-than returned as broken text.
+first — but the header is treated as a claim, not a fact: some crawlers store
+the decoded body and keep the original header, so a failed decode falls back to
+the bytes as stored. Encodings with no decoder at all (`br`, `zstd`) are refused
+with `415` rather than returned as binary noise.
 
 Text is decoded as UTF-8, lossily — pages in a legacy single-byte charset lose
 their non-ASCII characters. This matches what the fulltext index holds.

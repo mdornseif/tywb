@@ -995,34 +995,35 @@ fn parse_http_block(block: &[u8]) -> (Option<String>, Option<String>, &[u8]) {
 
 /// Undo the `Content-Encoding` of a stored HTTP body.
 ///
-/// Returns `Err` with a client-facing message for encodings we cannot decode,
-/// rather than handing back compressed bytes that would look like broken text.
+/// The header is a claim, not a fact: plenty of crawlers store the *decoded*
+/// body and keep the original `Content-Encoding` header alongside it. So a
+/// failed decode falls back to the bytes as stored — they are usually already
+/// the text we want. Only an encoding we have no decoder for at all is
+/// refused, because there the bytes really would be unreadable.
 fn decode_content_encoding(body: &[u8], encoding: Option<&str>) -> Result<Vec<u8>, String> {
     let Some(enc) = encoding else { return Ok(body.to_vec()) };
     match enc {
         "" | "identity" | "none" => Ok(body.to_vec()),
-        "gzip" | "x-gzip" => {
-            let mut out = Vec::new();
-            flate2::read::GzDecoder::new(body)
-                .read_to_end(&mut out)
-                .map_err(|e| format!("gzip body decode failed: {e}"))?;
-            Ok(out)
-        }
-        "deflate" => {
-            // "deflate" on the wire is zlib-wrapped in theory and raw deflate
-            // in practice; try both before giving up.
-            let mut out = Vec::new();
-            if flate2::read::ZlibDecoder::new(body).read_to_end(&mut out).is_ok() {
-                return Ok(out);
-            }
-            out.clear();
-            flate2::read::DeflateDecoder::new(body)
-                .read_to_end(&mut out)
-                .map_err(|e| format!("deflate body decode failed: {e}"))?;
-            Ok(out)
-        }
+        "gzip" | "x-gzip" => Ok(inflate(flate2::read::GzDecoder::new(body))
+            .unwrap_or_else(|| stored_as_is(body, enc))),
+        // "deflate" on the wire is zlib-wrapped in theory and raw deflate in
+        // practice; try both.
+        "deflate" => Ok(inflate(flate2::read::ZlibDecoder::new(body))
+            .or_else(|| inflate(flate2::read::DeflateDecoder::new(body)))
+            .unwrap_or_else(|| stored_as_is(body, enc))),
         other => Err(format!("unsupported Content-Encoding: {other}")),
     }
+}
+
+/// Read a decoder to the end, or `None` if the stream is not what it claimed.
+fn inflate(mut decoder: impl std::io::Read) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    decoder.read_to_end(&mut out).ok().map(|_| out)
+}
+
+fn stored_as_is(body: &[u8], enc: &str) -> Vec<u8> {
+    debug!(enc, bytes = body.len(), "body is not really {enc}-encoded — using it as stored");
+    body.to_vec()
 }
 
 // ── Wayback UI injection ──────────────────────────────────────────────────────
@@ -1465,8 +1466,17 @@ mod tests {
     }
 
     #[test]
+    fn decode_content_encoding_trusts_the_bytes_over_the_header() {
+        // Seen in the wild: the crawler stored the decoded body but kept the
+        // original Content-Encoding header. The body is already the text.
+        let plain = b"<html>Apfelsorten</html>";
+        assert_eq!(decode_content_encoding(plain, Some("gzip")).unwrap(), plain);
+        assert_eq!(decode_content_encoding(plain, Some("deflate")).unwrap(), plain);
+    }
+
+    #[test]
     fn decode_content_encoding_rejects_what_it_cannot_decode() {
-        // Better a clear error than compressed bytes masquerading as text.
+        // No decoder at all — better a clear error than binary served as text.
         let err = decode_content_encoding(b"\x1b\x2f", Some("br")).unwrap_err();
         assert!(err.contains("br"), "{err}");
     }
