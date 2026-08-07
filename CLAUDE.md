@@ -175,6 +175,21 @@ quality gate (`pdf::looks_like_text`) drops OCR noise before it reaches the
 index. With `tika` unset, PDFs stay browsable but unsearchable — no external
 dependency. See `crates/tywb/src/pdf.rs` and `playbooks/tika.yml` (ops repo).
 
+### The stored body is not the content
+A WARC holds the HTTP response exactly as it came off the wire: after the
+headers can come `Transfer-Encoding: chunked` framing, and inside that a
+`Content-Encoding` of gzip or deflate. Anything that reads a body must peel
+both, in that order, via `http_payload::parse_http_block` +
+`HttpParts::payload` — never `record.http_body()` straight into a parser.
+Skipping it indexes U+FFFD noise, feeds Tika unparseable PDFs, and serves
+browsers a deflate stream labelled `text/html`.
+
+The headers lie in both directions, so neither gets a vote: chunking is
+detected structurally (`dechunk` succeeds only if the whole body parses as a
+chunk sequence), and a failed decode falls back to the stored bytes unless they
+are genuinely binary. `dechunk` runs over every record of a multi-GB WARC —
+keep its rejection path O(1).
+
 ### One text pipeline, two consumers
 `/text?url=…` returns the readable text of a capture (HTML stripped, PDFs via
 Tika/OCR) so clients need no parser of their own. It runs the *same* extraction

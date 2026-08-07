@@ -14,7 +14,7 @@ use std::time::Instant;
 use anyhow::Context;
 use bytes::Bytes;
 use serde_json;
-use tracing::{info, warn, error};
+use tracing::{debug, info, warn, error};
 
 use warc::{WarcIter, WarcReader};
 use warc_search_cdx::{CdxRecord, CdxStore, WarcFileMeta, WarcInfoRecord, from_warc_record};
@@ -822,12 +822,28 @@ fn build_index_doc(
 
     let ts: u64 = cdx.timestamp.parse().unwrap_or(0);
 
+    // A WARC stores the response as it came off the wire, so the bytes after
+    // the HTTP headers are not the content yet: chunk framing on the outside,
+    // Content-Encoding within. Peel both before anything reads them — an
+    // unpeeled body indexes as U+FFFD noise, and Tika cannot parse a PDF that
+    // still has chunk headers in it.
+    let parts = crate::http_payload::parse_http_block(record.block.as_ref());
+    // HTML and text are truncated anyway, so stop decoding at that point; a PDF
+    // must arrive whole (the xref table a parser needs lives at the end).
+    let decode_limit = if is_pdf { crate::http_payload::MAX_DECODED_BYTES } else { max_bytes * 4 };
+    let payload = match parts.payload(decode_limit) {
+        Ok(p) => p,
+        Err(e) => {
+            debug!(url = %cdx.original_url, err = %e, "undecodable body — not indexed");
+            return None;
+        }
+    };
+
     // ── PDF: hand the whole payload to Tika (never truncate — the xref table a
     // parser needs lives at the end of the file). Requires a configured backend.
     if is_pdf {
         let extractor = pdf?;
-        let body = record.http_body().unwrap_or(record.block.as_ref());
-        let doc = extractor.extract(&cdx.original_url, body)?;
+        let doc = extractor.extract(&cdx.original_url, &payload)?;
         let body_text = truncate_on_char_boundary(doc.body, max_bytes);
         return Some(IndexDoc {
             url:       cdx.original_url.clone(),
@@ -842,8 +858,7 @@ fn build_index_doc(
         });
     }
 
-    let body = record.http_body().unwrap_or(record.block.as_ref());
-    let truncated = if body.len() > max_bytes * 4 { &body[..max_bytes * 4] } else { body };
+    let truncated = if payload.len() > max_bytes * 4 { &payload[..max_bytes * 4] } else { &payload };
     let text = String::from_utf8_lossy(truncated);
 
     let (title, body_text) = if is_html {
@@ -1245,7 +1260,68 @@ impl<R: Read> Read for CountingReader<R> {
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_entities, extract_title, strip_html, truncate_on_char_boundary};
+    use super::{build_index_doc, decode_entities, extract_title, strip_html,
+                truncate_on_char_boundary};
+    use std::io::Write as _;
+
+    /// A `response` record holding `block`, parsed back the way ingest sees it.
+    fn response_record(url: &str, block: &[u8]) -> warc::WarcRecord {
+        let raw = warc::reader::build_warc_record(
+            "WARC/1.0",
+            &[
+                ("WARC-Type", "response"),
+                ("WARC-Target-URI", url),
+                ("WARC-Date", "2026-07-20T20:09:29Z"),
+                ("Content-Type", "application/http; msgtype=response"),
+            ],
+            block,
+        );
+        warc::WarcReader::new(raw.as_slice()).next_record().unwrap().unwrap()
+    }
+
+    /// The wire format that made it into the archive: chunk framing wrapped
+    /// around a gzip stream, with the headers describing only the gzip.
+    #[test]
+    fn index_doc_reads_a_chunked_gzip_capture() {
+        let html = b"<html><head><title>Example Domain</title></head>\
+                     <body><p>Roter Berlepsch &amp; Boskoop</p></body></html>";
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        gz.write_all(html).unwrap();
+        let gz = gz.finish().unwrap();
+
+        let mut block = b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\
+                          Content-Encoding: gzip\r\n\r\n".to_vec();
+        block.extend_from_slice(format!("{:x}\r\n", gz.len()).as_bytes());
+        block.extend_from_slice(&gz);
+        block.extend_from_slice(b"\r\n0\r\n\r\n");
+
+        let record = response_record("https://example.com/", &block);
+        let cdx = warc_search_cdx::from_warc_record(&record, "crawl.warc.gz")
+            .unwrap()
+            .expect("a response record yields a CDX entry");
+
+        let doc = build_index_doc(&record, &cdx, 524288, None)
+            .expect("an HTML capture is indexable");
+
+        // Before the fix this was a string of U+FFFD from the deflate bytes.
+        assert_eq!(doc.title, "Example Domain");
+        // The title is part of the document text too, as it always has been.
+        assert_eq!(doc.body, "Example Domain Roter Berlepsch & Boskoop");
+    }
+
+    /// The same body without either layer must still index — the peeling is
+    /// detected from the bytes, so it must not disturb plain captures.
+    #[test]
+    fn index_doc_still_reads_an_unencoded_capture() {
+        let block = b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n\
+                      <html><head><title>Boskoop</title></head><body>Apfel</body></html>";
+        let record = response_record("https://example.com/plain", block);
+        let cdx = warc_search_cdx::from_warc_record(&record, "crawl.warc.gz").unwrap().unwrap();
+
+        let doc = build_index_doc(&record, &cdx, 524288, None).unwrap();
+        assert_eq!(doc.title, "Boskoop");
+        assert_eq!(doc.body, "Boskoop Apfel");
+    }
 
     #[test]
     fn strip_html_drops_markup_and_keeps_word_boundaries() {

@@ -38,6 +38,7 @@ use warc_search_config::Config;
 use warc_search_s3::{build_client, get_range};
 use warc_search_search::SearchReader;
 
+use crate::http_payload::{MAX_DECODED_BYTES, parse_http_block};
 use crate::pdf::PdfExtractor;
 use crate::ui;
 
@@ -635,58 +636,53 @@ fn extract_warc_http_block(warc_bytes: &[u8]) -> &[u8] {
 /// The function extracts status code, Content-Type, Location (for redirects),
 /// and the response body.  For HTML responses a Wayback toolbar and wombat.js
 /// URL-rewriting shim are injected.
+///
+/// The body is served **decoded**: chunk framing removed and `Content-Encoding`
+/// undone. It has to be — we forward neither `Transfer-Encoding` nor
+/// `Content-Encoding`, so a browser handed the stored bytes would render the
+/// chunk headers and deflate stream as text.
 fn serve_warc_response(block: &[u8], original_url: &str, timestamp: &str) -> Response {
-    let sep = b"\r\n\r\n";
-    let body_start = block.windows(4).position(|w| w == sep).map(|i| i + 4).unwrap_or(block.len());
-    let header_bytes = &block[..body_start.saturating_sub(4)];
-    let body = &block[body_start..];
+    let parts = parse_http_block(block);
 
-    let header_str = String::from_utf8_lossy(header_bytes);
-    let mut lines = header_str.lines();
+    let status = parts
+        .status
+        .and_then(|c| StatusCode::from_u16(c).ok())
+        .unwrap_or(StatusCode::OK);
 
-    let status_code = lines
-        .next()
-        .and_then(|l| l.split_whitespace().nth(1))
-        .and_then(|s| s.parse::<u16>().ok())
-        .unwrap_or(200);
-    let status = StatusCode::from_u16(status_code).unwrap_or(StatusCode::OK);
-
-    let mut content_type_val = String::new();
     let mut headers = HeaderMap::new();
-    for line in lines {
-        if line.is_empty() { break; }
-        if let Some((name, val)) = line.split_once(':') {
-            match name.trim().to_ascii_lowercase().as_str() {
-                "content-type" => {
-                    content_type_val = val.trim().to_owned();
-                    if let Ok(hv) = HeaderValue::from_str(&content_type_val) {
-                        headers.insert(header::CONTENT_TYPE, hv);
-                    }
-                }
-                "location" if status.is_redirection() => {
-                    if let Ok(hv) = HeaderValue::from_str(val.trim()) {
-                        headers.insert(header::LOCATION, hv);
-                    }
-                }
-                _ => {}
-            }
+    if let Some(hv) = parts.content_type.as_deref().and_then(|v| HeaderValue::from_str(v).ok()) {
+        headers.insert(header::CONTENT_TYPE, hv);
+    }
+    if status.is_redirection() {
+        if let Some(hv) = parts.location.as_deref().and_then(|v| HeaderValue::from_str(v).ok()) {
+            headers.insert(header::LOCATION, hv);
         }
     }
-
     if let Ok(hv) = HeaderValue::from_str(original_url) {
         headers.insert("X-Archive-Orig-URL", hv);
     }
 
-    let is_html = content_type_val
-        .split(';')
-        .next()
-        .map(|t| t.trim().eq_ignore_ascii_case("text/html"))
-        .unwrap_or(false);
+    // A body we cannot decode is still worth serving raw — replay is about
+    // handing back what was captured, and the browser may make more of it than
+    // we can. `/text` is the endpoint that refuses.
+    let body = match parts.payload(MAX_DECODED_BYTES) {
+        Ok(b)  => b.into_owned(),
+        Err(e) => {
+            debug!(url = original_url, err = %e, "serving replay body undecoded");
+            parts.body.to_vec()
+        }
+    };
 
-    let final_body: Vec<u8> = if is_html {
-        inject_wayback_ui(body.to_vec(), original_url, timestamp)
+    let is_html = parts
+        .content_type
+        .as_deref()
+        .and_then(|t| t.split(';').next())
+        .is_some_and(|t| t.trim().eq_ignore_ascii_case("text/html"));
+
+    let final_body = if is_html {
+        inject_wayback_ui(body, original_url, timestamp)
     } else {
-        body.to_vec()
+        body
     };
 
     (status, headers, final_body).into_response()
@@ -883,17 +879,15 @@ async fn extract_capture_text(
         ),
         Payload::Warc(warc_bytes) => {
             let parts = parse_http_block(extract_warc_http_block(&warc_bytes));
+            let body = parts
+                .payload(MAX_DECODED_BYTES)
+                .map_err(|e| (StatusCode::UNSUPPORTED_MEDIA_TYPE, e).into_response())?
+                .into_owned();
             let mime = parts
                 .content_type
+                .clone()
                 .or_else(|| rec.mime.clone())
                 .unwrap_or_else(|| "application/octet-stream".to_owned());
-            // A WARC holds the body exactly as it came off the wire: chunk
-            // framing on the outside, Content-Encoding within. Peel in that
-            // order.
-            let unframed = dechunk(parts.body);
-            let raw = unframed.as_deref().unwrap_or(parts.body);
-            let body = decode_content_encoding(raw, parts.content_encoding.as_deref())
-                .map_err(|e| (StatusCode::UNSUPPORTED_MEDIA_TYPE, e).into_response())?;
             (mime, body)
         }
     };
@@ -969,131 +963,6 @@ async fn extract_capture_text(
         format!("no text extractor for {essence} — use /web/ to fetch the raw capture"),
     )
         .into_response())
-}
-
-/// The parts of a stored HTTP response the text path needs.
-struct HttpParts<'a> {
-    content_type:     Option<String>,
-    content_encoding: Option<String>,
-    body:             &'a [u8],
-}
-
-/// Split an HTTP response block into its headers of interest and its body.
-///
-/// `block` must start with the status line; a block without a header/body
-/// separator is treated as all body, which is what a stray `resource` record
-/// without HTTP framing looks like.
-fn parse_http_block(block: &[u8]) -> HttpParts<'_> {
-    let sep = b"\r\n\r\n";
-    let Some(body_start) = block.windows(4).position(|w| w == sep).map(|i| i + 4) else {
-        return HttpParts { content_type: None, content_encoding: None, body: block };
-    };
-    let header_str = String::from_utf8_lossy(&block[..body_start - 4]);
-
-    let mut content_type     = None;
-    let mut content_encoding = None;
-    for line in header_str.lines().skip(1) {
-        let Some((name, value)) = line.split_once(':') else { continue };
-        match name.trim().to_ascii_lowercase().as_str() {
-            "content-type"     => content_type     = Some(value.trim().to_owned()),
-            "content-encoding" => content_encoding = Some(value.trim().to_ascii_lowercase()),
-            _ => {}
-        }
-    }
-    HttpParts { content_type, content_encoding, body: &block[body_start..] }
-}
-
-/// Undo `Transfer-Encoding: chunked` framing.
-///
-/// A WARC holds the body exactly as it came off the wire — chunk-size lines
-/// included, and *before* the `Content-Encoding` is undone. The stored headers
-/// do not reliably say so (some crawlers drop `Transfer-Encoding` while keeping
-/// the framing), so structure decides rather than the header: this returns
-/// `Some` only when the whole body parses as a chunk sequence, which ordinary
-/// content does not do by accident.
-fn dechunk(body: &[u8]) -> Option<Vec<u8>> {
-    let mut out = Vec::with_capacity(body.len());
-    let mut i = 0usize;
-
-    loop {
-        let line_end = find_crlf(body, i)?;
-        // chunk-size [ ";" chunk-ext ]
-        let line = &body[i..line_end];
-        let digits = line.split(|&b| b == b';').next()?;
-        if digits.is_empty() || digits.len() > 16 || !digits.iter().all(u8::is_ascii_hexdigit) {
-            return None;
-        }
-        let size = usize::from_str_radix(std::str::from_utf8(digits).ok()?, 16).ok()?;
-        i = line_end + 2;
-
-        // The terminating 0-size chunk; any trailer after it is not content.
-        if size == 0 {
-            return Some(out);
-        }
-
-        let end = i.checked_add(size)?;
-        if end > body.len() {
-            // A capture cut off mid-chunk: keep what is actually there.
-            out.extend_from_slice(&body[i..]);
-            return Some(out);
-        }
-        out.extend_from_slice(&body[i..end]);
-        match body.get(end..end + 2) {
-            Some(b"\r\n") => i = end + 2,
-            // No CRLF where the framing demands one — this was never chunked.
-            Some(_)       => return None,
-            None          => return Some(out),   // ends exactly at the last chunk
-        }
-    }
-}
-
-fn find_crlf(haystack: &[u8], from: usize) -> Option<usize> {
-    if from >= haystack.len() { return None; }
-    haystack[from..].windows(2).position(|w| w == b"\r\n").map(|p| p + from)
-}
-
-/// Undo the `Content-Encoding` of a stored HTTP body.
-///
-/// The header is a claim, not a fact: plenty of crawlers store the *decoded*
-/// body and keep the original `Content-Encoding` header alongside it. So a
-/// failed decode falls back to the bytes as stored — they are usually already
-/// the text we want. Only an encoding we have no decoder for at all is
-/// refused, because there the bytes really would be unreadable.
-fn decode_content_encoding(body: &[u8], encoding: Option<&str>) -> Result<Vec<u8>, String> {
-    let Some(enc) = encoding else { return Ok(body.to_vec()) };
-    match enc {
-        "" | "identity" | "none" => Ok(body.to_vec()),
-        "gzip" | "x-gzip" => match inflate(flate2::read::GzDecoder::new(body)) {
-            Some(out) => Ok(out),
-            None      => stored_as_is(body, enc),
-        },
-        // "deflate" on the wire is zlib-wrapped in theory and raw deflate in
-        // practice; try both.
-        "deflate" => match inflate(flate2::read::ZlibDecoder::new(body))
-            .or_else(|| inflate(flate2::read::DeflateDecoder::new(body)))
-        {
-            Some(out) => Ok(out),
-            None      => stored_as_is(body, enc),
-        },
-        other => Err(format!("unsupported Content-Encoding: {other}")),
-    }
-}
-
-/// Read a decoder to the end, or `None` if the stream is not what it claimed.
-fn inflate(mut decoder: impl std::io::Read) -> Option<Vec<u8>> {
-    let mut out = Vec::new();
-    decoder.read_to_end(&mut out).ok().map(|_| out)
-}
-
-/// Use the body as stored — unless it really is binary, in which case the
-/// encoding was genuine and merely undecodable (a truncated or corrupt
-/// stream). Returning that as text would be mojibake, so say so instead.
-fn stored_as_is(body: &[u8], enc: &str) -> Result<Vec<u8>, String> {
-    if body.iter().take(1024).any(|&b| b == 0) {
-        return Err(format!("body claims Content-Encoding: {enc} but could not be decoded"));
-    }
-    debug!(enc, bytes = body.len(), "body is not really encoded — using it as stored");
-    Ok(body.to_vec())
 }
 
 // ── Wayback UI injection ──────────────────────────────────────────────────────
@@ -1472,7 +1341,7 @@ async fn cdx_timemap_handler(
 
 #[cfg(test)]
 mod tests {
-    use super::{dechunk, decode_content_encoding, pad_timestamp, parse_http_block};
+    use super::*;
     use std::io::Write as _;
 
     #[test]
@@ -1485,119 +1354,34 @@ mod tests {
         assert_eq!(pad_timestamp("202403151200009"), "20240315120000");
     }
 
+    /// Replay must hand the browser content, not wire format: we forward
+    /// neither Transfer-Encoding nor Content-Encoding, so the body has to be
+    /// decoded before it goes out. This is the shape that broke example.com.
     #[test]
-    fn parse_http_block_reads_type_and_encoding() {
-        let block = b"HTTP/1.1 200 OK\r\n\
-                      Content-Type: text/html; charset=utf-8\r\n\
-                      Content-Encoding: GZIP\r\n\r\nbody bytes";
-        let parts = parse_http_block(block);
-        assert_eq!(parts.content_type.as_deref(), Some("text/html; charset=utf-8"));
-        assert_eq!(parts.content_encoding.as_deref(), Some("gzip"));  // lowercased
-        assert_eq!(parts.body, b"body bytes");
-    }
+    fn replay_serves_a_chunked_gzip_capture_decoded() {
+        let html = b"<html><head><title>Example Domain</title></head><body>Hi</body></html>";
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        gz.write_all(html).unwrap();
+        let gz = gz.finish().unwrap();
 
-    #[test]
-    fn parse_http_block_without_headers_is_all_body() {
-        let parts = parse_http_block(b"just bytes");
-        assert!(parts.content_type.is_none() && parts.content_encoding.is_none());
-        assert_eq!(parts.body, b"just bytes");
-    }
+        let mut block = b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\
+                          Content-Encoding: gzip\r\n\r\n".to_vec();
+        block.extend_from_slice(format!("{:x}\r\n", gz.len()).as_bytes());
+        block.extend_from_slice(&gz);
+        block.extend_from_slice(b"\r\n0\r\n\r\n");
 
-    #[test]
-    fn dechunk_reassembles_a_chunked_body() {
-        let body = b"5\r\nRoter\r\na\r\n Berlepsch\r\n0\r\n\r\n";
-        assert_eq!(dechunk(body).unwrap(), b"Roter Berlepsch");
-        // Chunk extensions are part of the size line, not the content.
-        assert_eq!(dechunk(b"5;a=b\r\nRoter\r\n0\r\n\r\n").unwrap(), b"Roter");
-    }
+        let resp = serve_warc_response(&block, "https://example.com/", "20260720200929");
+        assert_eq!(resp.status(), StatusCode::OK);
 
-    #[test]
-    fn dechunk_keeps_what_a_cut_off_capture_has() {
-        // Crawl stopped mid-chunk: better a partial page than nothing.
-        assert_eq!(dechunk(b"20\r\nRoter Berlepsch").unwrap(), b"Roter Berlepsch");
-    }
-
-    #[test]
-    fn dechunk_declines_bodies_that_are_not_chunked() {
-        // Structure decides, so an ordinary body must not be mistaken for one.
-        assert!(dechunk(b"<html><body>Apfelsorten</body></html>").is_none());
-        assert!(dechunk(b"173 is a number\r\nand this is prose\r\n").is_none());
-        // Hex-looking first line but the framing does not hold up.
-        assert!(dechunk(b"5\r\nRoter is longer than five\r\n").is_none());
-        assert!(dechunk(b"").is_none());
-    }
-
-    #[test]
-    fn dechunk_then_gunzip_recovers_a_real_capture() {
-        // The shape that broke the first deploy: chunk framing wrapped around a
-        // gzip stream, stored exactly as it came off the wire.
-        let plain = b"<html>Apfelsorten in Deutschland</html>";
-        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
-        enc.write_all(plain).unwrap();
-        let gz = enc.finish().unwrap();
-
-        let mut wire = format!("{:x}\r\n", gz.len()).into_bytes();
-        wire.extend_from_slice(&gz);
-        wire.extend_from_slice(b"\r\n0\r\n\r\n");
-
-        let unframed = dechunk(&wire).expect("chunked framing should parse");
-        assert_eq!(decode_content_encoding(&unframed, Some("gzip")).unwrap(), plain);
-    }
-
-    #[test]
-    fn decode_content_encoding_handles_gzip_and_identity() {
-        let plain = b"Roter Berlepsch";
-        assert_eq!(decode_content_encoding(plain, None).unwrap(), plain);
-        assert_eq!(decode_content_encoding(plain, Some("identity")).unwrap(), plain);
-
-        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
-        enc.write_all(plain).unwrap();
-        let gz = enc.finish().unwrap();
-        assert_eq!(decode_content_encoding(&gz, Some("gzip")).unwrap(), plain);
-    }
-
-    #[test]
-    fn decode_content_encoding_handles_both_flavours_of_deflate() {
-        let plain = b"Boskoop";
-
-        let mut zlib = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
-        zlib.write_all(plain).unwrap();
-        assert_eq!(
-            decode_content_encoding(&zlib.finish().unwrap(), Some("deflate")).unwrap(),
-            plain,
-        );
-
-        // Servers that send raw deflate despite the spec.
-        let mut raw = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::fast());
-        raw.write_all(plain).unwrap();
-        assert_eq!(
-            decode_content_encoding(&raw.finish().unwrap(), Some("deflate")).unwrap(),
-            plain,
-        );
-    }
-
-    #[test]
-    fn decode_content_encoding_trusts_the_bytes_over_the_header() {
-        // Seen in the wild: the crawler stored the decoded body but kept the
-        // original Content-Encoding header. The body is already the text.
-        let plain = b"<html>Apfelsorten</html>";
-        assert_eq!(decode_content_encoding(plain, Some("gzip")).unwrap(), plain);
-        assert_eq!(decode_content_encoding(plain, Some("deflate")).unwrap(), plain);
-    }
-
-    #[test]
-    fn decode_content_encoding_refuses_undecodable_binary() {
-        // A genuinely compressed body we failed to inflate (truncated, corrupt)
-        // must not come back as mojibake.
-        let binary = b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x03 truncated here";
-        let err = decode_content_encoding(binary, Some("gzip")).unwrap_err();
-        assert!(err.contains("gzip"), "{err}");
-    }
-
-    #[test]
-    fn decode_content_encoding_rejects_what_it_cannot_decode() {
-        // No decoder at all — better a clear error than binary served as text.
-        let err = decode_content_encoding(b"\x1b\x2f", Some("br")).unwrap_err();
-        assert!(err.contains("br"), "{err}");
+        let body = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(axum::body::to_bytes(resp.into_body(), usize::MAX))
+            .unwrap();
+        let body = String::from_utf8_lossy(&body);
+        assert!(body.contains("Example Domain"), "not decoded: {:?}", &body[..80.min(body.len())]);
+        assert!(!body.contains("\u{FFFD}"), "raw deflate bytes leaked into the page");
+        // ...and the toolbar still goes in, because it is recognised as HTML.
+        assert!(body.contains("__tywb_bar"), "toolbar missing");
     }
 }

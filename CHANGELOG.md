@@ -25,6 +25,28 @@ this project does not yet publish tagged releases, so everything lands under
   - PDFs need `indexer.tika`; without it the endpoint answers `501` for them.
     Everything else works with no external dependency.
 
+- **Fix: the wire format is now peeled everywhere, not just in `/text`.** A WARC
+  stores the response exactly as it came off the wire, so the bytes after the
+  HTTP headers may still carry `Transfer-Encoding: chunked` framing wrapped
+  around a `Content-Encoding` of gzip or deflate. Only `/text` undid that; the
+  indexer and replay read the raw bytes.
+
+  - **Indexer** — such captures were indexed as `U+FFFD` noise (title and body
+    both), and PDFs still carrying chunk headers were handed to Tika, which
+    cannot parse them. `build_index_doc` now decodes first. **Existing
+    documents are not repaired by this; a re-index of the affected WARCs is
+    needed to fix them.**
+  - **Replay** — `/web/` forwards neither `Transfer-Encoding` nor
+    `Content-Encoding`, so browsers received chunk headers and a deflate stream
+    labelled `text/html`. The body is now decoded before it is served (and
+    before the toolbar is injected). A body that cannot be decoded is still
+    served as stored — replay hands back what was captured.
+
+  The peeling lives in one place, `crates/tywb/src/http_payload.rs`, together
+  with the HTTP-block parser both the replay and text paths had been
+  duplicating. Decoding is capped at 128 MiB and keeps the decodable prefix of
+  a stream that was cut off mid-capture.
+
 - **Fix: `strip_html` could panic on a mis-decoded page.** A page that is not
   valid UTF-8 arrives full of `U+FFFD`, and the raw-text-element check sliced
   the string at a fixed byte offset — six bytes into a three-byte character.

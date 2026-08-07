@@ -23,6 +23,7 @@ use tracing::info;
 use warc_search_config::Config;
 
 mod gz_warc;
+mod http_payload;
 mod index;
 mod pdf;
 mod pdf_collection;

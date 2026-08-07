@@ -227,8 +227,11 @@ X-Tywb-Low-Quality: 1        (only when the OCR quality gate rejected the text)
 | `application/pdf` | Text via Tika — PDFBox for born-digital files, Tesseract OCR for scans. |
 | anything else | `415`, with a pointer to `/web/` for the raw bytes. |
 
-**Wire format** — a WARC stores the body exactly as it came off the wire, so
-`/text` peels it in the same order the wire put it on:
+<a name="wire-format"></a>
+**Wire format** — a WARC stores the response exactly as it came off the wire, so
+the bytes after the HTTP headers are not the content yet. They are peeled in the
+order the wire put them on, by every reader — the indexer, `/text` and replay
+alike (`crates/tywb/src/http_payload.rs`):
 
 1. `Transfer-Encoding: chunked` framing is removed. Stored headers are not
    trustworthy about this (crawlers drop the header and keep the framing), so
@@ -238,7 +241,11 @@ X-Tywb-Low-Quality: 1        (only when the OCR quality gate rejected the text)
    claim too: some crawlers store the decoded body and keep the header, so a
    failed decode falls back to the bytes as stored — unless they really are
    binary, which is reported rather than served as mojibake. Encodings with no
-   decoder at all (`br`, `zstd`) are refused with `415`.
+   decoder at all (`br`, `zstd`) are refused by `/text` with `415`.
+
+A capture whose body is cut off mid-stream still yields the prefix that did
+decode, and decoding stops at 128 MiB so a decompression bomb cannot exhaust
+memory.
 
 Text is decoded as UTF-8, lossily — pages in a legacy single-byte charset lose
 their non-ASCII characters. This matches what the fulltext index holds.
@@ -267,6 +274,8 @@ GET /web/<timestamp>/<url>
 ```
 
 Replays an archived page. The server looks up the closest CDX record, fetches only that WARC record's bytes from S3 via a Range GET, and serves the original HTTP response body with its original status and `Content-Type`.
+
+The body is served **decoded** — chunk framing removed, `Content-Encoding` undone (see [Wire format](#wire-format)). It has to be: replay forwards neither `Transfer-Encoding` nor `Content-Encoding`, so a browser handed the stored bytes would render the chunk headers and the deflate stream as text. A body that cannot be decoded is served as stored rather than refused; replay hands back what was captured.
 
 ```bash
 curl 'http://localhost:8080/web/20240315120000/https://example.com/'
