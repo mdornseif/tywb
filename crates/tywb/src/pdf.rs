@@ -21,7 +21,15 @@
 //! letter-salad, which would pollute the fulltext index far more harmfully than
 //! a missing document. [`looks_like_text`] rejects output that does not read
 //! like prose, so a garbage OCR result is dropped rather than indexed.
+//!
+//! # Two entry points
+//!
+//! [`PdfExtractor::extract`] is what the indexer calls: text or nothing, with
+//! the reason logged. [`PdfExtractor::try_extract`] backs the `/text` endpoint,
+//! which reports the failure to its caller and hands back gate-rejected text
+//! flagged rather than dropped.
 
+use std::fmt;
 use std::time::Duration;
 
 use serde_json::Value;
@@ -33,6 +41,37 @@ use warc_search_config::TikaConfig;
 pub struct PdfDoc {
     pub title: String,
     pub body:  String,
+    /// Whether [`looks_like_text`] accepted the body.
+    ///
+    /// The indexer drops a document that fails the gate; the `/text` endpoint
+    /// hands it to the caller anyway, flagged, because a human asking for one
+    /// specific document can judge OCR noise for themselves.
+    pub quality_ok: bool,
+}
+
+/// Why a PDF yielded no text.
+#[derive(Debug)]
+pub enum ExtractError {
+    /// Larger than `tika.max_pdf_bytes`.
+    TooLarge { bytes: usize, limit: usize },
+    /// No `%%EOF` trailer — the capture was cut short mid-file.
+    Truncated,
+    /// Tika refused the request, timed out, or returned an unusable body.
+    Tika(String),
+    /// Tika parsed the file but returned no text at all.
+    Empty,
+}
+
+impl fmt::Display for ExtractError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TooLarge { bytes, limit } =>
+                write!(f, "PDF is {bytes} bytes, over the {limit}-byte limit"),
+            Self::Truncated => write!(f, "PDF is truncated (no %%EOF trailer)"),
+            Self::Tika(e)   => write!(f, "Tika extraction failed: {e}"),
+            Self::Empty     => write!(f, "Tika returned no text"),
+        }
+    }
 }
 
 /// A configured client for a Tika server.
@@ -65,20 +104,54 @@ impl PdfExtractor {
         }
     }
 
-    /// Extract text from PDF bytes. Returns `None` when the PDF is too large,
-    /// Tika fails, or the result does not look like usable text.
+    /// Extract text from PDF bytes for the fulltext index.
+    ///
+    /// Returns `None` when the PDF is too large, truncated, Tika fails, or the
+    /// result does not look like usable text. Use [`try_extract`] when the
+    /// caller needs to know *why*.
+    ///
+    /// [`try_extract`]: PdfExtractor::try_extract
     pub fn extract(&self, url: &str, pdf: &[u8]) -> Option<PdfDoc> {
+        match self.try_extract(url, pdf, false) {
+            Ok(doc) if doc.quality_ok => Some(doc),
+            Ok(doc) => {
+                warn!(url, chars = doc.body.len(),
+                      "PDF text rejected by quality gate (likely OCR noise)");
+                None
+            }
+            Err(e @ (ExtractError::TooLarge { .. } | ExtractError::Truncated)) => {
+                debug!(url, bytes = pdf.len(), reason = %e, "PDF skipped");
+                None
+            }
+            Err(e) => {
+                warn!(url, err = %e, "PDF extraction failed");
+                None
+            }
+        }
+    }
+
+    /// Extract text from PDF bytes, reporting the reason for any failure.
+    ///
+    /// The returned [`PdfDoc`] carries `quality_ok = false` when the text does
+    /// not read like prose — the caller decides whether to use it anyway.
+    ///
+    /// `allow_truncated` sends a PDF with no `%%EOF` trailer to Tika regardless.
+    /// The indexer never does that: OCR of a cut-off capture produces noise the
+    /// quality gate drops anyway, and the attempt is what makes indexing crawl.
+    /// A single on-demand request can afford it.
+    pub fn try_extract(
+        &self,
+        url: &str,
+        pdf: &[u8],
+        allow_truncated: bool,
+    ) -> Result<PdfDoc, ExtractError> {
         if pdf.len() > self.max_pdf_bytes {
-            debug!(url, bytes = pdf.len(), limit = self.max_pdf_bytes, "PDF too large — skipping");
-            return None;
+            return Err(ExtractError::TooLarge { bytes: pdf.len(), limit: self.max_pdf_bytes });
         }
         // Truncated PDFs (e.g. CommonCrawl/wayback capped at ~1 MiB) have no
-        // `%%EOF` trailer. OCR of them yields only noise that the quality gate
-        // drops anyway — but the OCR attempt itself is what makes indexing
-        // crawl, so skip them before touching Tika.
-        if !pdf_has_eof(pdf) {
-            debug!(url, bytes = pdf.len(), "PDF truncated (no %%EOF) — skipping OCR");
-            return None;
+        // `%%EOF` trailer.
+        if !allow_truncated && !pdf_has_eof(pdf) {
+            return Err(ExtractError::Truncated);
         }
 
         let resp = self
@@ -93,26 +166,26 @@ impl PdfExtractor {
             .send_bytes(pdf);
 
         let body = match resp {
-            Ok(r) => match r.into_string() {
-                Ok(s) => s,
-                Err(e) => { warn!(url, err = %e, "reading Tika response failed"); return None; }
-            },
-            Err(e) => { warn!(url, err = %e, "Tika request failed"); return None; }
+            Ok(r) => r.into_string()
+                .map_err(|e| ExtractError::Tika(format!("reading response: {e}")))?,
+            Err(e) => return Err(ExtractError::Tika(e.to_string())),
         };
 
-        let (title, text) = parse_rmeta(&body)?;
+        let (title, text) = parse_rmeta(&body)
+            .ok_or_else(|| ExtractError::Tika("unparseable /rmeta/text response".to_owned()))?;
 
-        if !looks_like_text(&text) {
-            warn!(url, chars = text.len(), "PDF text rejected by quality gate (likely OCR noise)");
-            return None;
+        if text.trim().is_empty() {
+            return Err(ExtractError::Empty);
         }
+
+        let quality_ok = looks_like_text(&text);
 
         let title = if title.trim().is_empty() {
             title_from_url(url)
         } else {
             title.trim().chars().take(256).collect()
         };
-        Some(PdfDoc { title, body: text })
+        Ok(PdfDoc { title, body: text, quality_ok })
     }
 }
 

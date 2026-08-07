@@ -175,6 +175,18 @@ quality gate (`pdf::looks_like_text`) drops OCR noise before it reaches the
 index. With `tika` unset, PDFs stay browsable but unsearchable — no external
 dependency. See `crates/tywb/src/pdf.rs` and `playbooks/tika.yml` (ops repo).
 
+### One text pipeline, two consumers
+`/text?url=…` returns the readable text of a capture (HTML stripped, PDFs via
+Tika/OCR) so clients need no parser of their own. It runs the *same* extraction
+the indexer runs — `index::strip_html`, `index::extract_title`,
+`pdf::PdfExtractor` — on demand against the stored bytes, rather than reading
+text back out of the fulltext index: index bodies are truncated to
+`indexer.max_text_bytes` and are not meant to be reproduced verbatim.
+Keep the two in step. Anything that improves extraction belongs in those shared
+functions, not in the handler. The endpoint differs from the indexer in exactly
+two documented ways: it returns quality-gate-rejected OCR text (flagged) and it
+attempts truncated PDFs. See `server::extract_capture_text`.
+
 ### Collections
 The primary WARC bucket is the implicit collection `warc`. `indexer.collections`
 adds further sources; type `pdf_bucket` indexes a bucket of standalone PDFs
@@ -219,6 +231,7 @@ cargo run --release -p tywb -- --config config.local.yaml server
 # The server binds to server.bind (default 0.0.0.0:8080).
 # Fulltext search:  GET /search?q=<query>&from=20240101&to=20241231
 # Wayback replay:   GET /web/20240315120000/https://example.com/
+# Plain text:       GET /text?url=https://example.com/&timestamp=2024&output=json
 # CDX API:          GET /cdx?url=example.com/*&output=json
 
 # 4. Repair whole-file-gzip WARCs (see "Record-per-member .warc.gz" below)
@@ -248,4 +261,4 @@ CI should fail on any clippy warning. Run both before opening a PR.
 | `cdx`              | ✅ complete  | SURT, SQLite store, closest-match lookup, CDX builder from WarcRecord, `warc_files` metadata table |
 | `s3_store`         | ✅ complete  | Client builder, paginated listing, ETag state, streaming GET, Range GET |
 | `search`           | 🔲 stub      | Next: Tantivy schema, index, query      |
-| `tywb`             | 🔄 in progress | `index` working (streaming, throughput, SIGINFO, limits); `server` stub; `stats` complete; `recompress` complete |
+| `tywb`             | 🔄 in progress | `index` working (streaming, throughput, SIGINFO, limits); `server` serving UI, `/search`, `/text`, replay, CDX; `stats` complete; `recompress` complete |

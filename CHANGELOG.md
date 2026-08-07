@@ -8,6 +8,29 @@ this project does not yet publish tagged releases, so everything lands under
 
 ## [Unreleased]
 
+- **Text endpoint.** `GET /text?url=…[&timestamp=…][&output=json]` (and the
+  replay-shaped `GET /text/<timestamp>/<url>`) returns the readable text of an
+  archived capture: HTML stripped, `Content-Encoding` undone, PDFs extracted
+  through Tika/OCR. Clients that only want the content no longer have to
+  re-implement any of that on top of `/web/`. It is the indexer's own
+  extraction run on demand against the stored bytes — not a read-back of the
+  fulltext index, whose bodies are truncated to `indexer.max_text_bytes`.
+
+  - Plain text by default; `output=json` adds title, timestamp, collection,
+    HTTP status, MIME and a character count.
+  - Two deliberate differences from indexing: text that fails the OCR quality
+    gate is returned with a `low_quality` flag (a caller asking for one named
+    document can judge the noise itself), and truncated PDFs are attempted —
+    one on-demand OCR is affordable where a bulk pass is not.
+  - PDFs need `indexer.tika`; without it the endpoint answers `501` for them.
+    Everything else works with no external dependency.
+
+- **Better HTML-to-text extraction**, in the indexer as well as `/text`: the
+  content of `<script>`, `<style>` and `<noscript>` is dropped instead of being
+  indexed as prose, HTML comments are skipped, and character references
+  (`&amp;`, `&nbsp;`, `&#8211;`, `&#xe4;`) are decoded. Re-index to get the
+  cleaner text into existing documents; nothing breaks if you don't.
+
 - **Unified domain skip list.** One list of domains now controls skipping
   everywhere: entries are not indexed, purged from CDX + fulltext on the next
   `tywb index`, and hidden from search results immediately at query time. This

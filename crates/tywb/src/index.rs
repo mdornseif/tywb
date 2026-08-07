@@ -872,38 +872,130 @@ fn build_index_doc(
     })
 }
 
-fn extract_title(html: &str) -> String {
+/// The document title from `<title>…</title>`, entity-decoded and collapsed.
+pub(crate) fn extract_title(html: &str) -> String {
     let lower = html.as_bytes();
     let Some(open_tag_start) = memmem(lower, b"<title") else { return String::new(); };
     let Some(rel_gt) = lower[open_tag_start..].iter().position(|&b| b == b'>') else { return String::new(); };
     let content_start = open_tag_start + rel_gt + 1;
     let Some(close_start) = memmem(&lower[content_start..], b"</title") else { return String::new(); };
-    html[content_start..content_start + close_start].trim().chars().take(512).collect()
+    let raw = &html[content_start..content_start + close_start];
+    collapse_ws(&decode_entities(raw)).chars().take(512).collect()
 }
 
-fn strip_html(html: &str) -> String {
+/// Elements whose content is code, not prose — dropped wholesale.
+const RAW_TEXT_ELEMENTS: [&str; 3] = ["script", "style", "noscript"];
+
+/// Convert an HTML document to plain text.
+///
+/// Markup is removed, the content of [`RAW_TEXT_ELEMENTS`] is dropped, comments
+/// are skipped, character references are decoded, and whitespace is collapsed
+/// to single spaces. Every tag boundary becomes a space, so `a<br>b` reads as
+/// two words rather than one.
+///
+/// This is deliberately a scanner, not a DOM parser: it runs over every record
+/// in a multi-GB WARC and must never allocate a tree per document.
+pub(crate) fn strip_html(html: &str) -> String {
+    let b = html.as_bytes();
     let mut out = String::with_capacity(html.len());
-    let mut in_tag = false;
-    for ch in html.chars() {
-        match ch {
-            '<' => { in_tag = true; if !out.ends_with(' ') && !out.is_empty() { out.push(' '); } }
-            '>' => { in_tag = false; }
-            _ if in_tag => {}
-            _ => out.push(ch),
+    let mut text_start = 0usize;
+    let mut i = 0usize;
+
+    // `<` and `>` are ASCII, so every index computed here is a char boundary.
+    while let Some(lt) = find_at(b, i, b"<") {
+        out.push_str(&html[text_start..lt]);
+
+        i = if b[lt..].starts_with(b"<!--") {
+            find_at(b, lt + 4, b"-->").map(|p| p + 3).unwrap_or(b.len())
+        } else if let Some(elem) = raw_text_element(&html[lt..]) {
+            // Skip past the whole element, content and closing tag included.
+            match find_at(b, lt + 1, format!("</{elem}").as_bytes()) {
+                Some(close) => find_at(b, close, b">").map(|p| p + 1).unwrap_or(b.len()),
+                None        => b.len(),
+            }
+        } else {
+            find_at(b, lt + 1, b">").map(|p| p + 1).unwrap_or(b.len())
+        };
+
+        out.push(' ');
+        text_start = i;
+    }
+    out.push_str(&html[text_start..]);
+
+    collapse_ws(&decode_entities(&out))
+}
+
+/// If the tag at the start of `s` opens a [raw-text element], its lowercase
+/// name; otherwise `None`.
+///
+/// [raw-text element]: RAW_TEXT_ELEMENTS
+fn raw_text_element(s: &str) -> Option<&'static str> {
+    let after_lt = s.strip_prefix('<')?;
+    RAW_TEXT_ELEMENTS.iter().copied().find(|name| {
+        after_lt.len() > name.len()
+            && after_lt[..name.len()].eq_ignore_ascii_case(name)
+            // `<script>`/`<script src=…>` — but not `<scriptural>`.
+            && matches!(after_lt.as_bytes()[name.len()], b'>' | b'/' | b' ' | b'\t' | b'\r' | b'\n')
+    })
+}
+
+/// Decode the character references that matter for readable text: the five
+/// predefined XML entities, `&nbsp;`, and numeric references. Anything else is
+/// passed through verbatim — a bare `&` in the text stays a bare `&`.
+fn decode_entities(s: &str) -> String {
+    if !s.contains('&') {
+        return s.to_owned();
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(amp) = rest.find('&') {
+        out.push_str(&rest[..amp]);
+        let tail = &rest[amp..];
+        // A reference is short; scanning further means it was never one.
+        let end = tail[1..].find(';').map(|p| p + 2).filter(|&e| e <= 12);
+        match end.and_then(|e| decode_one_entity(&tail[1..e - 1]).map(|c| (c, e))) {
+            Some((c, e)) => { out.push(c); rest = &tail[e..]; }
+            None         => { out.push('&'); rest = &tail[1..]; }
         }
     }
-    let mut collapsed = String::with_capacity(out.len());
+    out.push_str(rest);
+    out
+}
+
+/// Decode the body of one character reference (`amp`, `#233`, `#xE9`).
+fn decode_one_entity(body: &str) -> Option<char> {
+    match body {
+        "amp"                  => return Some('&'),
+        "lt"                   => return Some('<'),
+        "gt"                   => return Some('>'),
+        "quot"                 => return Some('"'),
+        "apos" | "#39"         => return Some('\''),
+        "nbsp"                 => return Some('\u{a0}'),
+        _ => {}
+    }
+    let num = body.strip_prefix('#')?;
+    let code = match num.strip_prefix(['x', 'X']) {
+        Some(hex) => u32::from_str_radix(hex, 16).ok()?,
+        None      => num.parse::<u32>().ok()?,
+    };
+    char::from_u32(code)
+}
+
+/// Collapse every run of whitespace to a single space and trim the ends.
+fn collapse_ws(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
     let mut prev_space = true;
-    for ch in out.chars() {
+    for ch in s.chars() {
         if ch.is_whitespace() {
-            if !prev_space { collapsed.push(' '); }
+            if !prev_space { out.push(' '); }
             prev_space = true;
         } else {
-            collapsed.push(ch);
+            out.push(ch);
             prev_space = false;
         }
     }
-    collapsed.trim().to_owned()
+    out.truncate(out.trim_end().len());
+    out
 }
 
 fn memmem(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -911,6 +1003,12 @@ fn memmem(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| {
         w.iter().zip(needle).all(|(&h, &n)| h.to_ascii_lowercase() == n)
     })
+}
+
+/// `memmem` from byte offset `start`, returning an absolute position.
+fn find_at(haystack: &[u8], start: usize, needle: &[u8]) -> Option<usize> {
+    if start >= haystack.len() { return None; }
+    memmem(&haystack[start..], needle).map(|p| p + start)
 }
 
 // ── SIGINFO / SIGUSR1 handler ─────────────────────────────────────────────────
@@ -1143,7 +1241,56 @@ impl<R: Read> Read for CountingReader<R> {
 
 #[cfg(test)]
 mod tests {
-    use super::truncate_on_char_boundary;
+    use super::{decode_entities, extract_title, strip_html, truncate_on_char_boundary};
+
+    #[test]
+    fn strip_html_drops_markup_and_keeps_word_boundaries() {
+        let html = "<p>Roter<br>Berlepsch</p><p>Boskoop</p>";
+        assert_eq!(strip_html(html), "Roter Berlepsch Boskoop");
+    }
+
+    #[test]
+    fn strip_html_drops_script_and_style_bodies() {
+        let html = "<html><head><style>body{color:red}</style>\
+                    <script src=\"x.js\">var apfel = 1;</script></head>\
+                    <body>Apfelsorten<noscript>bitte JavaScript</noscript></body></html>";
+        assert_eq!(strip_html(html), "Apfelsorten");
+    }
+
+    #[test]
+    fn strip_html_keeps_elements_that_merely_start_like_script() {
+        assert_eq!(strip_html("<scriptural>Text</scriptural>"), "Text");
+    }
+
+    #[test]
+    fn strip_html_skips_comments_and_unclosed_tags() {
+        assert_eq!(strip_html("a<!-- hidden -->b"), "a b");
+        // A `<` with no `>` swallows the rest — the same as a browser's parser.
+        assert_eq!(strip_html("visible <div class=\"x"), "visible");
+    }
+
+    #[test]
+    fn strip_html_decodes_entities() {
+        assert_eq!(
+            strip_html("<p>Gr&uuml;n &amp; Gelb&nbsp;&#8211; &#xe4;pfel</p>"),
+            // &uuml; is not in the table and stays verbatim; nbsp collapses.
+            "Gr&uuml;n & Gelb – äpfel",
+        );
+    }
+
+    #[test]
+    fn decode_entities_leaves_bare_ampersands_alone() {
+        assert_eq!(decode_entities("Tom & Jerry"), "Tom & Jerry");
+        assert_eq!(decode_entities("a&nolongerareference;b"), "a&nolongerareference;b");
+        assert_eq!(decode_entities("&lt;b&gt;"), "<b>");
+    }
+
+    #[test]
+    fn extract_title_decodes_and_collapses() {
+        let html = "<html><head><title>Obst\n  &amp;  Garten</title></head><body>x</body></html>";
+        assert_eq!(extract_title(html), "Obst & Garten");
+        assert_eq!(extract_title("<html><body>no title</body></html>"), "");
+    }
 
     #[test]
     fn truncate_backs_up_off_a_multibyte_char() {

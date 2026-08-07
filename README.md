@@ -16,6 +16,7 @@ Commands:
 - **Fulltext search** — Tantivy-powered, ~30 MB idle RAM regardless of index size
 - **Wayback replay** — `GET /web/{timestamp}/{url}` fetches only the relevant bytes via S3 Range GET; a 10 GB WARC costs one small range request per replay
 - **Wayback toolbar** — sticky archive bar injected into replayed HTML pages showing the capture date, original URL, and a link to other captures; uses [wombat.js](https://github.com/webrecorder/wombat) for client-side URL rewriting
+- **Text API** — `GET /text?url=…` returns the plain text of a capture, HTML stripped and PDFs OCR'd, so clients need no parsing of their own
 - **CDX API** — Wayback-compatible `/cdx` endpoint with exact and prefix URL lookup
 - **CDX timemap** — `GET /web/timemap/cdx` compatible with Zeno and gowarc deduplication
 - **Domain browser** — hierarchical TLD → domain → captures navigation at `/ui/browse`
@@ -156,6 +157,99 @@ GET /search?q=<query>[&from=<timestamp>][&to=<timestamp>][&limit=<n>]
 ```bash
 curl 'http://localhost:8080/search?q=rust+programming&from=20240101000000&limit=10'
 ```
+
+### Plain text of a capture
+
+```
+GET /text?url=<url>[&timestamp=<ts>][&output=json]
+GET /text/<timestamp>/<url>
+```
+
+Returns the readable text of one archived capture — HTML stripped, PDFs run
+through Tika/OCR — so a client does not have to re-implement any of that.
+It is the same extraction pipeline the indexer uses, run on demand.
+
+| Parameter   | Description |
+|-------------|-------------|
+| `url`       | The archived URL (required). A missing scheme is read as `https://`. |
+| `timestamp` | 14-digit capture timestamp, or any prefix of one: `2024` means `20240101000000`. The closest capture wins. Omitted → the most recent capture. |
+| `output`    | `text` (default) or `json`. |
+
+The path form `/text/<timestamp>/<url>` mirrors `/web/<timestamp>/<url>`, so any
+replay link becomes text by swapping the prefix. Because the query string
+belongs to the target URL there, that form always answers `text/plain`; use
+`/text?url=…&output=json` for JSON.
+
+```bash
+# newest capture, as plain text
+curl 'http://localhost:8080/text?url=example.com/page'
+
+# a specific capture, with metadata
+curl 'http://localhost:8080/text?url=https://example.com/page&timestamp=20240315&output=json'
+
+# any replay URL, as text
+curl 'http://localhost:8080/text/20240315120000/https://example.com/page'
+```
+
+**Plain-text response** — the body is only the text; everything else is a header:
+
+```
+Content-Type: text/plain; charset=utf-8
+X-Archive-Orig-URL: https://example.com/page
+X-Tywb-Timestamp:   20240315120000
+X-Tywb-Collection:  warc
+X-Tywb-Mime:        text/html
+X-Tywb-Low-Quality: 1        (only when the OCR quality gate rejected the text)
+```
+
+**JSON response:**
+
+```json
+{
+  "url":         "https://example.com/page",
+  "timestamp":   "20240315120000",
+  "collection":  "warc",
+  "status":      200,
+  "mime":        "text/html",
+  "title":       "Example Page",
+  "chars":       2395,
+  "low_quality": false,
+  "text":        "Example Page …"
+}
+```
+
+**What gets extracted**
+
+| Content type | Result |
+|--------------|--------|
+| `text/html`, `application/xhtml+xml`, `text/xml`, `application/xml` | Markup removed, `<script>`/`<style>`/`<noscript>` bodies dropped, character references decoded, whitespace collapsed. `title` comes from `<title>`. |
+| `text/*` | Returned verbatim, line breaks intact. `title` is the first line. |
+| `application/pdf` | Text via Tika — PDFBox for born-digital files, Tesseract OCR for scans. |
+| anything else | `415`, with a pointer to `/web/` for the raw bytes. |
+
+A `Content-Encoding` of `gzip` or `deflate` on the stored response is undone
+first. `br` and other encodings we cannot decode are refused with `415` rather
+than returned as broken text.
+
+Text is decoded as UTF-8, lossily — pages in a legacy single-byte charset lose
+their non-ASCII characters. This matches what the fulltext index holds.
+
+Unlike the indexer, `/text` returns text that fails the OCR quality gate (with
+`low_quality`/`X-Tywb-Low-Quality` set) and attempts extraction on truncated
+PDFs: one on-demand request can afford an OCR attempt the bulk indexer skips,
+and a caller asking for one named document can judge the noise itself.
+
+**Errors**
+
+| Status | Cause |
+|--------|-------|
+| `400`  | No `url`, unparseable URL, or a non-numeric `timestamp` |
+| `404`  | No capture of that URL in the CDX index |
+| `413`  | PDF larger than `indexer.tika.max_pdf_bytes` |
+| `415`  | No text extractor for that content type, or an undecodable `Content-Encoding` |
+| `422`  | Tika parsed the PDF but found no text |
+| `501`  | A PDF was requested but `indexer.tika` is not configured |
+| `502`  | S3 or Tika failed |
 
 ### Wayback replay
 

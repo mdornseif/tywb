@@ -10,6 +10,8 @@
 //! | GET    | `/ui/files`        | Web UI — WARC file list  |
 //! | GET    | `/api/stats`       | JSON stats               |
 //! | GET    | `/search`          | JSON fulltext search     |
+//! | GET    | `/text`            | Plain text of a capture  |
+//! | GET    | `/text/<ts>/<url>` | Plain text of a capture  |
 //! | GET    | `/web/<ts>/<url>`  | Wayback replay           |
 //! | GET    | `/cdx`             | CDX API (JSON)           |
 //! | GET    | `/web/timemap/cdx` | CDX timemap (Zeno/pywb)  |
@@ -31,11 +33,12 @@ use tracing::{debug, error, info, warn};
 
 use std::io::Read as _;
 
-use warc_search_cdx::{CdxStore, surt::to_surt};
+use warc_search_cdx::{CdxRecord, CdxStore, surt::to_surt};
 use warc_search_config::Config;
 use warc_search_s3::{build_client, get_range};
 use warc_search_search::SearchReader;
 
+use crate::pdf::PdfExtractor;
 use crate::ui;
 
 // ── Application state ─────────────────────────────────────────────────────────
@@ -45,6 +48,9 @@ pub struct AppState {
     search: Arc<SearchReader>,
     s3:     Arc<aws_sdk_s3::Client>,
     config: Config,
+    /// Tika client for `/text` on PDFs. `None` when `indexer.tika` is unset —
+    /// PDFs are then served for replay but their text cannot be extracted.
+    pdf:    Option<PdfExtractor>,
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -69,11 +75,17 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
 
     let s3 = build_client(&cfg.s3).await;
 
+    let pdf = cfg.indexer.tika.as_ref().map(PdfExtractor::new);
+    if pdf.is_none() {
+        info!("indexer.tika unset — /text will not extract PDFs");
+    }
+
     let state = Arc::new(AppState {
         cdx:    Arc::new(Mutex::new(cdx_store)),
         search: Arc::new(search_reader),
         s3:     Arc::new(s3),
         config: cfg.clone(),
+        pdf,
     });
 
     let app = Router::new()
@@ -87,6 +99,9 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         .route("/api/stats", get(api_stats_handler))
         .route("/search",    get(search_handler))
         .route("/cdx",               get(cdx_handler))
+        // ── Plain text of a capture ───────────────────────────────────────
+        .route("/text",              get(text_handler))
+        .route("/text/*rest",        get(text_path_handler))
         // ── CDX timemap (Zeno / gowarc deduplication) ─────────────────────
         // Must be registered before /web/*rest so the static path wins.
         .route("/web/timemap/cdx",   get(cdx_timemap_handler))
@@ -439,28 +454,105 @@ async fn search_handler(
     }
 }
 
-/// Serve a standalone collection object (e.g. a PDF) directly from its bucket.
-async fn serve_collection_object(
-    state: &Arc<AppState>,
-    bucket: &str,
-    rec: &warc_search_cdx::CdxRecord,
-) -> Response {
-    match warc_search_s3::get_bytes(&state.s3, bucket, &rec.s3_key).await {
-        Ok(bytes) => {
-            let ctype = rec.mime.as_deref().unwrap_or("application/octet-stream");
-            (
-                [(header::CONTENT_TYPE, HeaderValue::from_str(ctype)
-                    .unwrap_or(HeaderValue::from_static("application/octet-stream")))],
-                bytes.to_vec(),
+// ── Fetching the bytes behind a CDX record ────────────────────────────────────
+
+/// The stored bytes a CDX record points at.
+enum Payload {
+    /// One WARC record, starting at `WARC/1.0`, out of the archive bucket.
+    Warc(Vec<u8>),
+    /// A standalone object from a non-WARC collection (e.g. a PDF bucket).
+    Object(Vec<u8>),
+}
+
+/// Fetch the bytes for `rec` — a Range GET of a single WARC record, or the
+/// whole object for a non-WARC collection.
+///
+/// Shared by replay and `/text`: both need exactly these bytes and differ only
+/// in what they do with them. The error case is a ready-made `Response` so the
+/// two handlers report S3 and index problems identically.
+async fn fetch_payload(state: &Arc<AppState>, rec: &CdxRecord) -> Result<Payload, Response> {
+    // Records from a non-WARC collection are standalone objects with no WARC
+    // container — read them straight from their own bucket.
+    if rec.collection != warc_search_cdx::DEFAULT_COLLECTION {
+        let Some(coll) = state
+            .config
+            .indexer
+            .collections
+            .iter()
+            .find(|c| c.name == rec.collection)
+        else {
+            error!(collection = %rec.collection, "request for unknown collection");
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("unknown collection: {}", rec.collection),
             )
-                .into_response()
+                .into_response());
+        };
+
+        return match warc_search_s3::get_bytes(&state.s3, &coll.bucket, &rec.s3_key).await {
+            Ok(bytes) => Ok(Payload::Object(bytes.to_vec())),
+            Err(warc_search_s3::S3Error::NotFound { .. }) => {
+                Err((StatusCode::NOT_FOUND, "object not found in collection bucket").into_response())
+            }
+            Err(e) => {
+                error!(err = %e, bucket = %coll.bucket, key = %rec.s3_key,
+                       "collection object GET failed");
+                Err((StatusCode::BAD_GATEWAY, e.to_string()).into_response())
+            }
+        };
+    }
+
+    let is_gz = rec.s3_key.to_ascii_lowercase().ends_with(".gz");
+
+    if is_gz {
+        // ── Compressed ────────────────────────────────────────────────────────
+        // Each WARC record in a .warc.gz lives in its own gzip member.
+        // `c_offset` is the compressed byte offset of that member in the S3
+        // object; we Range-GET from there and decompress exactly one member.
+        let Some(c_offset) = rec.c_offset else {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "This record predates compressed-offset indexing. \
+                 Re-index (tywb index --force) then restart the server.",
+            )
+                .into_response());
+        };
+
+        // Compressed member size is unknown, but always ≤ uncompressed size.
+        // Fetch `length + 64 KiB` compressed bytes; GzDecoder stops at member end.
+        let fetch_len = rec.length + 65536;
+        let compressed = match get_range(
+            &state.s3, &state.config.s3.bucket,
+            &rec.s3_key, c_offset, fetch_len,
+        ).await {
+            Ok(b)  => b,
+            Err(e) => {
+                error!(err = %e, s3_key = %rec.s3_key, "S3 range GET failed");
+                return Err((StatusCode::BAD_GATEWAY, e.to_string()).into_response());
+            }
+        };
+
+        let mut gz = flate2::read::GzDecoder::new(compressed.as_ref());
+        let mut decompressed = Vec::new();
+        if let Err(e) = gz.read_to_end(&mut decompressed) {
+            error!(err = %e, s3_key = %rec.s3_key, c_offset, "gzip decode failed");
+            return Err((StatusCode::BAD_GATEWAY, format!("gzip decode: {e}")).into_response());
         }
-        Err(warc_search_s3::S3Error::NotFound { .. }) => {
-            (StatusCode::NOT_FOUND, "object not found in collection bucket").into_response()
-        }
-        Err(e) => {
-            error!(err = %e, bucket, key = %rec.s3_key, "collection object GET failed");
-            (StatusCode::BAD_GATEWAY, e.to_string()).into_response()
+        Ok(Payload::Warc(decompressed))
+    } else {
+        // ── Uncompressed ──────────────────────────────────────────────────────
+        // offset is the byte position of the WARC record in the plain .warc file.
+        // Fetch enough bytes to cover WARC headers (~1 KB) plus the HTTP block.
+        let fetch_len = rec.length + 4096;
+        match get_range(
+            &state.s3, &state.config.s3.bucket,
+            &rec.s3_key, rec.offset, fetch_len,
+        ).await {
+            Ok(b)  => Ok(Payload::Warc(b.to_vec())),
+            Err(e) => {
+                error!(err = %e, s3_key = %rec.s3_key, "S3 range GET failed");
+                Err((StatusCode::BAD_GATEWAY, e.to_string()).into_response())
+            }
         }
     }
 }
@@ -505,87 +597,25 @@ async fn replay_handler(
         }
     };
 
-    // Records from a non-WARC collection (e.g. a PDF bucket) are standalone
-    // objects with no WARC container — serve the object straight from its
-    // bucket rather than extracting a record from a WARC.
-    if cdx_rec.collection != warc_search_cdx::DEFAULT_COLLECTION {
-        return match state
-            .config
-            .indexer
-            .collections
-            .iter()
-            .find(|c| c.name == cdx_rec.collection)
-        {
-            Some(coll) => serve_collection_object(&state, &coll.bucket, &cdx_rec).await,
-            None => {
-                error!(collection = %cdx_rec.collection, "replay for unknown collection");
-                (StatusCode::INTERNAL_SERVER_ERROR,
-                 format!("unknown collection: {}", cdx_rec.collection)).into_response()
-            }
-        };
+    match fetch_payload(&state, &cdx_rec).await {
+        // `warc_bytes` begins at the WARC record (WARC/1.0\r\n...).
+        // Skip the WARC header block to get the HTTP response block.
+        Ok(Payload::Warc(warc_bytes)) => serve_warc_response(
+            extract_warc_http_block(&warc_bytes),
+            &cdx_rec.original_url,
+            &cdx_rec.timestamp,
+        ),
+        Ok(Payload::Object(bytes)) => {
+            let ctype = cdx_rec.mime.as_deref().unwrap_or("application/octet-stream");
+            (
+                [(header::CONTENT_TYPE, HeaderValue::from_str(ctype)
+                    .unwrap_or(HeaderValue::from_static("application/octet-stream")))],
+                bytes,
+            )
+                .into_response()
+        }
+        Err(resp) => resp,
     }
-
-    let is_gz = cdx_rec.s3_key.to_ascii_lowercase().ends_with(".gz");
-
-    let warc_bytes: Vec<u8> = if is_gz {
-        // ── Compressed replay ─────────────────────────────────────────────────
-        // Each WARC record in a .warc.gz lives in its own gzip member.
-        // `c_offset` is the compressed byte offset of that member in the S3
-        // object; we Range-GET from there and decompress exactly one member.
-        let c_offset = match cdx_rec.c_offset {
-            Some(o) => o,
-            None => {
-                return (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "This record predates compressed-offset indexing. \
-                     Re-index (tywb index --force) then restart the server.",
-                )
-                    .into_response();
-            }
-        };
-
-        // Compressed member size is unknown, but always ≤ uncompressed size.
-        // Fetch `length + 64 KiB` compressed bytes; GzDecoder stops at member end.
-        let fetch_len = cdx_rec.length + 65536;
-        let compressed = match get_range(
-            &state.s3, &state.config.s3.bucket,
-            &cdx_rec.s3_key, c_offset, fetch_len,
-        ).await {
-            Ok(b)  => b,
-            Err(e) => {
-                error!(err = %e, s3_key = %cdx_rec.s3_key, "S3 range GET failed");
-                return (StatusCode::BAD_GATEWAY, e.to_string()).into_response();
-            }
-        };
-
-        let mut gz = flate2::read::GzDecoder::new(compressed.as_ref());
-        let mut decompressed = Vec::new();
-        if let Err(e) = gz.read_to_end(&mut decompressed) {
-            error!(err = %e, s3_key = %cdx_rec.s3_key, c_offset, "gzip decode failed");
-            return (StatusCode::BAD_GATEWAY, format!("gzip decode: {e}")).into_response();
-        }
-        decompressed
-    } else {
-        // ── Uncompressed replay ───────────────────────────────────────────────
-        // offset is the byte position of the WARC record in the plain .warc file.
-        // Fetch enough bytes to cover WARC headers (~1 KB) plus the HTTP block.
-        let fetch_len = cdx_rec.length + 4096;
-        match get_range(
-            &state.s3, &state.config.s3.bucket,
-            &cdx_rec.s3_key, cdx_rec.offset, fetch_len,
-        ).await {
-            Ok(b)  => b.to_vec(),
-            Err(e) => {
-                error!(err = %e, s3_key = %cdx_rec.s3_key, "S3 range GET failed");
-                return (StatusCode::BAD_GATEWAY, e.to_string()).into_response();
-            }
-        }
-    };
-
-    // `warc_bytes` begins at the WARC record (WARC/1.0\r\n...).
-    // Skip the WARC header block to get the HTTP response block.
-    let http_block = extract_warc_http_block(&warc_bytes);
-    serve_warc_response(http_block, &cdx_rec.original_url, &cdx_rec.timestamp)
 }
 
 /// Skip WARC headers (everything up to and including the first `\r\n\r\n`) and
@@ -660,6 +690,339 @@ fn serve_warc_response(block: &[u8], original_url: &str, timestamp: &str) -> Res
     };
 
     (status, headers, final_body).into_response()
+}
+
+// ── /text — plain text of one capture ────────────────────────────────────────
+//
+// The archive already knows how to turn a capture into readable text: the
+// indexer strips HTML and pushes PDFs through Tika/OCR. This endpoint exposes
+// exactly that pipeline, so a client does not have to re-implement HTML
+// stripping, gzip decoding, or PDF extraction to work with archived content.
+//
+// The text is extracted on demand from the stored bytes, not read back out of
+// the fulltext index — index bodies are truncated to `indexer.max_text_bytes`
+// and hold no titles for text/plain records.
+
+#[derive(Deserialize)]
+struct TextParams {
+    url:       Option<String>,
+    /// 14-digit capture timestamp, or any prefix of one. Omitted → newest.
+    timestamp: Option<String>,
+    /// `text` (default) or `json`.
+    output:    Option<String>,
+}
+
+/// `GET /text?url=<url>[&timestamp=<ts>][&output=json]`
+async fn text_handler(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<TextParams>,
+) -> Response {
+    let Some(url) = params.url.as_deref().map(str::trim).filter(|u| !u.is_empty()) else {
+        return (StatusCode::BAD_REQUEST, "url parameter required").into_response();
+    };
+    let as_json = params.output.as_deref().is_some_and(|o| o.eq_ignore_ascii_case("json"));
+    text_response(&state, url, params.timestamp.as_deref(), as_json).await
+}
+
+/// `GET /text/<timestamp>/<url>` — the same lookup addressed like a replay URL,
+/// so any `/web/…` link becomes text by swapping the prefix.
+///
+/// The query string belongs to the target URL in this form (as it does for
+/// `/web/`), leaving no room for an `output` parameter: this form always
+/// answers `text/plain`. Use `/text?url=…&output=json` for JSON.
+async fn text_path_handler(
+    State(state): State<Arc<AppState>>,
+    uri: Uri,
+    Path(rest): Path<String>,
+) -> Response {
+    let Some(slash) = rest.find('/') else {
+        return (StatusCode::BAD_REQUEST, "expected /text/<timestamp>/<url>").into_response();
+    };
+    let timestamp = rest[..slash].to_owned();
+    let url = match uri.query() {
+        Some(q) => format!("{}?{q}", &rest[slash + 1..]),
+        None    => rest[slash + 1..].to_owned(),
+    };
+    text_response(&state, &url, Some(&timestamp), false).await
+}
+
+async fn text_response(
+    state: &Arc<AppState>,
+    url: &str,
+    timestamp: Option<&str>,
+    as_json: bool,
+) -> Response {
+    let normalised = if url.contains("://") { url.to_owned() } else { format!("https://{url}") };
+    let surt = match to_surt(&normalised) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(url, err = %e, "invalid URL in /text request");
+            return (StatusCode::BAD_REQUEST, format!("invalid URL: {e}")).into_response();
+        }
+    };
+
+    debug!(url, ?timestamp, "text");
+
+    let rec = match lookup_capture(state, &surt, timestamp) {
+        Ok(r)              => r,
+        Err((status, msg)) => return (status, msg).into_response(),
+    };
+
+    let payload = match fetch_payload(state, &rec).await {
+        Ok(p)     => p,
+        Err(resp) => return resp,
+    };
+
+    let extracted = match extract_capture_text(state, &rec, payload).await {
+        Ok(t)     => t,
+        Err(resp) => return resp,
+    };
+
+    if as_json {
+        return Json(serde_json::json!({
+            "url":         rec.original_url,
+            "timestamp":   rec.timestamp,
+            "collection":  rec.collection,
+            "status":      rec.status,
+            "mime":        extracted.mime,
+            "title":       extracted.title,
+            "chars":       extracted.text.chars().count(),
+            "low_quality": !extracted.quality_ok,
+            "text":        extracted.text,
+        }))
+        .into_response();
+    }
+
+    // Plain text: the body is only the text, everything else is a header.
+    let mut headers = HeaderMap::new();
+    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("text/plain; charset=utf-8"));
+    for (name, value) in [
+        ("X-Archive-Orig-URL", rec.original_url.as_str()),
+        ("X-Tywb-Timestamp",   rec.timestamp.as_str()),
+        ("X-Tywb-Collection",  rec.collection.as_str()),
+        ("X-Tywb-Mime",        extracted.mime.as_str()),
+    ] {
+        if let Ok(hv) = HeaderValue::from_str(value) {
+            headers.insert(name, hv);
+        }
+    }
+    if !extracted.quality_ok {
+        headers.insert("X-Tywb-Low-Quality", HeaderValue::from_static("1"));
+    }
+
+    (StatusCode::OK, headers, extracted.text).into_response()
+}
+
+/// The capture to extract: the one closest to `timestamp`, or — with no
+/// timestamp — the most recent one.
+fn lookup_capture(
+    state: &Arc<AppState>,
+    surt: &str,
+    timestamp: Option<&str>,
+) -> Result<CdxRecord, (StatusCode, String)> {
+    let found = {
+        let store = state.cdx.lock().unwrap();
+        match timestamp.map(str::trim).filter(|t| !t.is_empty()) {
+            Some(ts) => {
+                if !ts.chars().all(|c| c.is_ascii_digit()) {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        "timestamp must be digits (YYYYMMDDHHMMSS or a prefix of it)".to_owned(),
+                    ));
+                }
+                store.closest(surt, &pad_timestamp(ts))
+            }
+            // get_by_surt is timestamp-ascending, so the last row is the newest.
+            None => store.get_by_surt(surt).map(|recs| recs.into_iter().next_back()),
+        }
+    };
+
+    match found {
+        Ok(Some(r)) => Ok(r),
+        Ok(None)    => Err((StatusCode::NOT_FOUND, "not found in CDX index".to_owned())),
+        Err(e) => {
+            error!(err = %e, "CDX lookup failed");
+            Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
+        }
+    }
+}
+
+/// Pad a partial timestamp to the 14 digits the CDX store expects.
+/// Missing month and day default to `01`, missing time fields to `00`, so
+/// `2024` means 2024-01-01 00:00:00.
+fn pad_timestamp(ts: &str) -> String {
+    const TEMPLATE: &str = "00010101000000";
+    if ts.len() >= TEMPLATE.len() {
+        return ts[..TEMPLATE.len()].to_owned();
+    }
+    format!("{ts}{}", &TEMPLATE[ts.len()..])
+}
+
+/// The plain text of one capture and what it was derived from.
+struct CaptureText {
+    title: String,
+    text:  String,
+    /// The content type the text was extracted from.
+    mime:  String,
+    /// PDFs only: `false` when the text failed the OCR quality gate. Such text
+    /// is still returned — a caller asking for one named document can judge
+    /// OCR noise itself, whereas the index cannot.
+    quality_ok: bool,
+}
+
+async fn extract_capture_text(
+    state: &Arc<AppState>,
+    rec: &CdxRecord,
+    payload: Payload,
+) -> Result<CaptureText, Response> {
+    let (mime, body): (String, Vec<u8>) = match payload {
+        // A collection object is the file itself — no HTTP envelope around it.
+        Payload::Object(bytes) => (
+            rec.mime.clone().unwrap_or_else(|| "application/octet-stream".to_owned()),
+            bytes,
+        ),
+        Payload::Warc(warc_bytes) => {
+            let (ctype, encoding, http_body) =
+                parse_http_block(extract_warc_http_block(&warc_bytes));
+            let mime = ctype
+                .or_else(|| rec.mime.clone())
+                .unwrap_or_else(|| "application/octet-stream".to_owned());
+            // WARC response records hold the body exactly as it came off the
+            // wire, which for most servers means gzip.
+            let body = decode_content_encoding(http_body, encoding.as_deref())
+                .map_err(|e| (StatusCode::UNSUPPORTED_MEDIA_TYPE, e).into_response())?;
+            (mime, body)
+        }
+    };
+
+    let essence = mime.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+
+    let is_html = essence.starts_with("text/html")
+        || essence.starts_with("application/xhtml")
+        || essence.starts_with("text/xml")
+        || essence.starts_with("application/xml");
+
+    if is_html {
+        // Decoded lossily as UTF-8, exactly as the indexer does. Pages in a
+        // legacy single-byte charset lose their non-ASCII characters.
+        let raw = String::from_utf8_lossy(&body);
+        return Ok(CaptureText {
+            title: crate::index::extract_title(&raw),
+            text:  crate::index::strip_html(&raw),
+            mime,
+            quality_ok: true,
+        });
+    }
+
+    if essence.starts_with("text/") {
+        let raw = String::from_utf8_lossy(&body).into_owned();
+        let title = raw.lines().next().unwrap_or("").trim().chars().take(256).collect();
+        return Ok(CaptureText { title, text: raw, mime, quality_ok: true });
+    }
+
+    if essence == "application/pdf" {
+        let Some(extractor) = state.pdf.clone() else {
+            return Err((
+                StatusCode::NOT_IMPLEMENTED,
+                "PDF text extraction is not configured — set indexer.tika",
+            )
+                .into_response());
+        };
+        let url = rec.original_url.clone();
+        // Tika's client is blocking, and extraction of a big scan is slow.
+        let result = tokio::task::spawn_blocking(move || {
+            // allow_truncated: a single on-demand request can afford the OCR
+            // attempt on a cut-off PDF that the bulk indexer skips.
+            extractor.try_extract(&url, &body, true)
+        })
+        .await;
+
+        return match result {
+            Ok(Ok(doc)) => Ok(CaptureText {
+                title: doc.title,
+                text:  doc.body,
+                mime,
+                quality_ok: doc.quality_ok,
+            }),
+            Ok(Err(e)) => {
+                use crate::pdf::ExtractError;
+                let status = match e {
+                    ExtractError::TooLarge { .. }               => StatusCode::PAYLOAD_TOO_LARGE,
+                    ExtractError::Tika(_)                       => StatusCode::BAD_GATEWAY,
+                    ExtractError::Empty | ExtractError::Truncated => StatusCode::UNPROCESSABLE_ENTITY,
+                };
+                warn!(url = %rec.original_url, err = %e, "PDF text extraction failed");
+                Err((status, e.to_string()).into_response())
+            }
+            Err(e) => {
+                error!(err = %e, "PDF extraction task panicked");
+                Err((StatusCode::INTERNAL_SERVER_ERROR, "extraction task failed").into_response())
+            }
+        };
+    }
+
+    Err((
+        StatusCode::UNSUPPORTED_MEDIA_TYPE,
+        format!("no text extractor for {essence} — use /web/ to fetch the raw capture"),
+    )
+        .into_response())
+}
+
+/// Split an HTTP response block into `(content-type, content-encoding, body)`.
+///
+/// `block` must start with the status line; a block without a header/body
+/// separator is treated as all body, which is what a stray `resource` record
+/// without HTTP framing looks like.
+fn parse_http_block(block: &[u8]) -> (Option<String>, Option<String>, &[u8]) {
+    let sep = b"\r\n\r\n";
+    let Some(body_start) = block.windows(4).position(|w| w == sep).map(|i| i + 4) else {
+        return (None, None, block);
+    };
+    let header_str = String::from_utf8_lossy(&block[..body_start - 4]);
+
+    let mut content_type = None;
+    let mut encoding     = None;
+    for line in header_str.lines().skip(1) {
+        let Some((name, value)) = line.split_once(':') else { continue };
+        match name.trim().to_ascii_lowercase().as_str() {
+            "content-type"     => content_type = Some(value.trim().to_owned()),
+            "content-encoding" => encoding     = Some(value.trim().to_ascii_lowercase()),
+            _ => {}
+        }
+    }
+    (content_type, encoding, &block[body_start..])
+}
+
+/// Undo the `Content-Encoding` of a stored HTTP body.
+///
+/// Returns `Err` with a client-facing message for encodings we cannot decode,
+/// rather than handing back compressed bytes that would look like broken text.
+fn decode_content_encoding(body: &[u8], encoding: Option<&str>) -> Result<Vec<u8>, String> {
+    let Some(enc) = encoding else { return Ok(body.to_vec()) };
+    match enc {
+        "" | "identity" | "none" => Ok(body.to_vec()),
+        "gzip" | "x-gzip" => {
+            let mut out = Vec::new();
+            flate2::read::GzDecoder::new(body)
+                .read_to_end(&mut out)
+                .map_err(|e| format!("gzip body decode failed: {e}"))?;
+            Ok(out)
+        }
+        "deflate" => {
+            // "deflate" on the wire is zlib-wrapped in theory and raw deflate
+            // in practice; try both before giving up.
+            let mut out = Vec::new();
+            if flate2::read::ZlibDecoder::new(body).read_to_end(&mut out).is_ok() {
+                return Ok(out);
+            }
+            out.clear();
+            flate2::read::DeflateDecoder::new(body)
+                .read_to_end(&mut out)
+                .map_err(|e| format!("deflate body decode failed: {e}"))?;
+            Ok(out)
+        }
+        other => Err(format!("unsupported Content-Encoding: {other}")),
+    }
 }
 
 // ── Wayback UI injection ──────────────────────────────────────────────────────
@@ -1032,4 +1395,79 @@ async fn cdx_timemap_handler(
         body,
     )
         .into_response()
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::{decode_content_encoding, pad_timestamp, parse_http_block};
+    use std::io::Write as _;
+
+    #[test]
+    fn pad_timestamp_fills_from_the_start_of_the_period() {
+        assert_eq!(pad_timestamp("2024"),           "20240101000000");
+        assert_eq!(pad_timestamp("202403"),         "20240301000000");
+        assert_eq!(pad_timestamp("20240315"),       "20240315000000");
+        assert_eq!(pad_timestamp("20240315120000"), "20240315120000");
+        // Over-long input is cut, not rejected — the CDX store validates it.
+        assert_eq!(pad_timestamp("202403151200009"), "20240315120000");
+    }
+
+    #[test]
+    fn parse_http_block_reads_type_and_encoding() {
+        let block = b"HTTP/1.1 200 OK\r\n\
+                      Content-Type: text/html; charset=utf-8\r\n\
+                      Content-Encoding: GZIP\r\n\r\nbody bytes";
+        let (ctype, enc, body) = parse_http_block(block);
+        assert_eq!(ctype.as_deref(), Some("text/html; charset=utf-8"));
+        assert_eq!(enc.as_deref(), Some("gzip"));   // lowercased for matching
+        assert_eq!(body, b"body bytes");
+    }
+
+    #[test]
+    fn parse_http_block_without_headers_is_all_body() {
+        let (ctype, enc, body) = parse_http_block(b"just bytes");
+        assert!(ctype.is_none() && enc.is_none());
+        assert_eq!(body, b"just bytes");
+    }
+
+    #[test]
+    fn decode_content_encoding_handles_gzip_and_identity() {
+        let plain = b"Roter Berlepsch";
+        assert_eq!(decode_content_encoding(plain, None).unwrap(), plain);
+        assert_eq!(decode_content_encoding(plain, Some("identity")).unwrap(), plain);
+
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        enc.write_all(plain).unwrap();
+        let gz = enc.finish().unwrap();
+        assert_eq!(decode_content_encoding(&gz, Some("gzip")).unwrap(), plain);
+    }
+
+    #[test]
+    fn decode_content_encoding_handles_both_flavours_of_deflate() {
+        let plain = b"Boskoop";
+
+        let mut zlib = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+        zlib.write_all(plain).unwrap();
+        assert_eq!(
+            decode_content_encoding(&zlib.finish().unwrap(), Some("deflate")).unwrap(),
+            plain,
+        );
+
+        // Servers that send raw deflate despite the spec.
+        let mut raw = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::fast());
+        raw.write_all(plain).unwrap();
+        assert_eq!(
+            decode_content_encoding(&raw.finish().unwrap(), Some("deflate")).unwrap(),
+            plain,
+        );
+    }
+
+    #[test]
+    fn decode_content_encoding_rejects_what_it_cannot_decode() {
+        // Better a clear error than compressed bytes masquerading as text.
+        let err = decode_content_encoding(b"\x1b\x2f", Some("br")).unwrap_err();
+        assert!(err.contains("br"), "{err}");
+    }
 }
