@@ -10,9 +10,9 @@ this project does not yet publish tagged releases, so everything lands under
 
 - **Text endpoint.** `GET /text?url=…[&timestamp=…][&output=json]` (and the
   replay-shaped `GET /text/<timestamp>/<url>`) returns the readable text of an
-  archived capture: HTML stripped, `Content-Encoding` undone, PDFs extracted
-  through Tika/OCR. Clients that only want the content no longer have to
-  re-implement any of that on top of `/web/`. It is the indexer's own
+  archived capture: HTML stripped, chunk framing and `Content-Encoding` undone,
+  PDFs extracted through Tika/OCR. Clients that only want the content no longer
+  have to re-implement any of that on top of `/web/`. It is the indexer's own
   extraction run on demand against the stored bytes — not a read-back of the
   fulltext index, whose bodies are truncated to `indexer.max_text_bytes`.
 
@@ -24,6 +24,12 @@ this project does not yet publish tagged releases, so everything lands under
     one on-demand OCR is affordable where a bulk pass is not.
   - PDFs need `indexer.tika`; without it the endpoint answers `501` for them.
     Everything else works with no external dependency.
+
+- **Fix: `strip_html` could panic on a mis-decoded page.** A page that is not
+  valid UTF-8 arrives full of `U+FFFD`, and the raw-text-element check sliced
+  the string at a fixed byte offset — six bytes into a three-byte character.
+  In the server that dropped the connection; in the indexer it could abort a
+  WARC file mid-pass. The comparison is on bytes now.
 
 - **Better HTML-to-text extraction**, in the indexer as well as `/text`: the
   content of `<script>`, `<style>` and `<noscript>` is dropped instead of being

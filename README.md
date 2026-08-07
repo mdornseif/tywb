@@ -227,11 +227,18 @@ X-Tywb-Low-Quality: 1        (only when the OCR quality gate rejected the text)
 | `application/pdf` | Text via Tika — PDFBox for born-digital files, Tesseract OCR for scans. |
 | anything else | `415`, with a pointer to `/web/` for the raw bytes. |
 
-A `Content-Encoding` of `gzip` or `deflate` on the stored response is undone
-first — but the header is treated as a claim, not a fact: some crawlers store
-the decoded body and keep the original header, so a failed decode falls back to
-the bytes as stored. Encodings with no decoder at all (`br`, `zstd`) are refused
-with `415` rather than returned as binary noise.
+**Wire format** — a WARC stores the body exactly as it came off the wire, so
+`/text` peels it in the same order the wire put it on:
+
+1. `Transfer-Encoding: chunked` framing is removed. Stored headers are not
+   trustworthy about this (crawlers drop the header and keep the framing), so
+   the body is de-chunked when — and only when — it actually parses as a chunk
+   sequence. A capture cut off mid-chunk keeps what it has.
+2. A `Content-Encoding` of `gzip` or `deflate` is undone. That header is a
+   claim too: some crawlers store the decoded body and keep the header, so a
+   failed decode falls back to the bytes as stored — unless they really are
+   binary, which is reported rather than served as mojibake. Encodings with no
+   decoder at all (`br`, `zstd`) are refused with `415`.
 
 Text is decoded as UTF-8, lossily — pages in a legacy single-byte charset lose
 their non-ASCII characters. This matches what the fulltext index holds.
