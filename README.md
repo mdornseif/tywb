@@ -484,18 +484,36 @@ few indexable records per object and Range-GETs only those.
 tywb --config config.yaml scan-wire-format --sample 4 --out /var/tmp/affected.txt
 ```
 
+It separates two kinds of damage, because conflating them overstates the job by
+a wide margin:
+
+| Stored as | What the old indexer wrote | Re-index |
+|-----------|----------------------------|----------|
+| **Compressed** (`Content-Encoding: gzip`/`deflate`, or undecodable) | deflate bytes read as text — `U+FFFD` noise, unsearchable | **needed** — the content is lost until then |
+| **Chunked only** | readable text, plus stray hex tokens like `173` where the chunk-size lines fell | optional — only tidies those tokens |
+| **Neither** | correct | none |
+
+A PDF is the exception: chunk framing alone already makes it unparseable for
+Tika, so any peeling counts as damage for `application/pdf`. A
+`Content-Encoding` header on a body the crawler had already decoded counts as
+neither — the old indexer read it correctly.
+
 ```
 Wire-format scan
-  WARC objects in CDX                  667
-  objects scanned                      667
-  objects affected                     ...   (..% of scanned)
-  records sampled                      ...
-  samples needing peeling              ...   (..%)
+  WARC objects in CDX                  392
+  objects scanned                      392
+  records sampled                     1375
+    compressed (indexed noise)         ...   (..%)
+    chunked only (text usable)         ...   (..%)
 
-Re-index scope
-  indexable records, all objects       ...
+Re-index needed — documents are noise today
+  objects                              ...
   indexable records to rebuild         ...
-  estimated wrong documents           ~...   (extrapolated from the samples)
+  estimated unsearchable documents    ~...   (extrapolated from the samples)
+
+Optional — chunked but already searchable
+  objects                              ...
+  indexable records                    ...
 ```
 
 | Flag | Meaning |
@@ -503,8 +521,8 @@ Re-index scope
 | `--sample N` | Records sampled per WARC object (default 3). Higher is more accurate and costs one Range GET each. |
 | `--limit N` | Stop after N objects, most records first. |
 | `--jobs N` | Objects sampled concurrently (default 8). |
-| `--out <path>` | Write the affected S3 keys, one per line. |
-| `--verbose` | One line per affected object instead of just the summary. |
+| `--out <path>` | Write the S3 keys that need a re-index, one per line. |
+| `--verbose` | One line per damaged object instead of just the summary. |
 
 The scan is read-only. Re-index what it found:
 
@@ -514,11 +532,8 @@ while read -r key; do
 done < /var/tmp/affected.txt
 ```
 
-A record counts as affected only when peeling actually changes its bytes, or
-when the body cannot be decoded at all. A `Content-Encoding` header on a body
-the crawler had already decoded does not count — the old indexer read it
-correctly, so re-indexing it would change nothing. The document count is
-extrapolated from the sample, not counted; the record counts are exact.
+The document count is extrapolated from the sample, not counted; the record
+counts are exact.
 
 ## Index statistics
 

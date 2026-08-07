@@ -27,12 +27,17 @@ this project does not yet publish tagged releases, so everything lands under
 
 - **`tywb scan-wire-format`** — sizes the re-index that the wire-format fix
   requires. It samples a few indexable records per WARC object and Range-GETs
-  only those, then reports the affected objects, the records a re-index would
-  rebuild, and an extrapolated count of wrong documents; `--out` writes the keys
-  for `index --force --file`. Read-only. A record counts as affected only when
-  peeling actually changes its bytes — a `Content-Encoding` header on a body the
-  crawler had already decoded does not, because the old indexer read that
-  correctly.
+  only those, then reports what a re-index would recover; `--out` writes the
+  keys for `index --force --file`. Read-only.
+
+  It counts two kinds of damage separately, because conflating them overstates
+  the job badly: a **compressed** body (gzip/deflate, or undecodable) was read
+  as text and indexed as `U+FFFD` noise, so those documents are unsearchable
+  until re-indexed; a body that was only **chunked** still stripped to readable
+  text, carrying nothing worse than stray hex tokens like `173` where the
+  chunk-size lines fell. PDFs are the exception — chunk framing alone already
+  makes them unparseable for Tika. A `Content-Encoding` header on a body the
+  crawler had already decoded counts as neither.
 
 - **Fix: the wire format is now peeled everywhere, not just in `/text`.** A WARC
   stores the response exactly as it came off the wire, so the bytes after the
