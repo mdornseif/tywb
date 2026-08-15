@@ -594,19 +594,27 @@ pub fn search_html(
     let groups = group_by_domain(hits);
 
     c.push_str("<p class=\"result-count\">");
+    // "for <terms>" only when there are terms: browsing a collection has none,
+    // and a dangling "for" with nothing after it reads like a truncated page.
     if hits.is_empty() {
-        c.push_str("No results for <strong>");
-        push_esc(&mut c, q);
-        c.push_str("</strong>.");
+        c.push_str("No results");
+        if !q.is_empty() {
+            c.push_str(" for <strong>");
+            push_esc(&mut c, q);
+            c.push_str("</strong>");
+        }
+        c.push('.');
     } else {
         push_esc(&mut c, &fmt_count(hits.len() as u64));
         c.push_str(if hits.len() == 1 { " result" } else { " results" });
         c.push_str(" from ");
         push_esc(&mut c, &fmt_count(groups.len() as u64));
         c.push_str(if groups.len() == 1 { " domain" } else { " domains" });
-        c.push_str(" for <strong>");
-        push_esc(&mut c, q);
-        c.push_str("</strong>");
+        if !q.is_empty() {
+            c.push_str(" for <strong>");
+            push_esc(&mut c, q);
+            c.push_str("</strong>");
+        }
     }
     // Active collection filter: show it with a one-click "clear".
     if let Some(coll) = collection.filter(|c| !c.is_empty()) {
@@ -1450,6 +1458,17 @@ mod tests {
         let html = search_html("", &[h], None, None, Some("monatshefte"), false);
         assert!(html.contains("Band 01"), "the hit must be rendered");
         assert!(html.contains("in collection"));
+    }
+
+    #[test]
+    fn browsing_a_collection_does_not_say_for_nothing() {
+        let mut h = hit("https://obst-pdfs.23.nu/monatshefte-ocr/Band_01.pdf", "20260814173550", "Band 01");
+        h.collection = Some("monatshefte".to_owned());
+        let html = search_html("", &[h], None, None, Some("monatshefte"), false);
+        assert!(html.contains("1 result from 1 domain ·"), "no dangling \"for\": {html:?}");
+        // With terms it still names them.
+        let html = search_html("Obstbau", &[hit("https://a.de/", "20240101120000", "A")], None, None, None, false);
+        assert!(html.contains("for <strong>Obstbau</strong>"));
     }
 
     #[test]
