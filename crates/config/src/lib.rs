@@ -192,6 +192,55 @@ pub struct CollectionConfig {
     /// `https://obst-pdfs.23.nu/` + `1152-hochstamm.pdf`.
     #[serde(default)]
     pub public_base_url: Option<String>,
+    /// Per-collection text-extraction settings, layered over the global
+    /// [`IndexerConfig::tika`]. A collection is a body of documents with
+    /// properties of its own — one that arrives pre-OCR'd wants `no_ocr` and a
+    /// generous size limit, while the web archive around it wants neither.
+    /// Without this the two had to share one setting, and the compromise was
+    /// wrong for both. See [`TikaOverride`].
+    #[serde(default)]
+    pub tika: Option<TikaOverride>,
+}
+
+/// Text-extraction settings for one collection.
+///
+/// Every field is optional and unset means "as configured globally": this
+/// adjusts *how* documents are parsed, never *where* — the Tika server is one
+/// service, and its URL stays in [`IndexerConfig::tika`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TikaOverride {
+    /// `no_ocr`, `auto` or `ocr_only` for this collection's documents.
+    #[serde(default)]
+    pub ocr_strategy: Option<String>,
+    /// Tesseract languages, e.g. `deu+frk` for a German Fraktur corpus.
+    #[serde(default)]
+    pub ocr_languages: Option<String>,
+    /// Size ceiling for this collection. Library digitisations run to hundreds
+    /// of megabytes where ordinary web PDFs do not.
+    #[serde(default)]
+    pub max_pdf_bytes: Option<usize>,
+    /// Per-document timeout. Must stay below Tika's own `taskTimeoutMillis`, or
+    /// the server kills its parser first and the client sees a broken
+    /// connection instead of a deadline.
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
+}
+
+impl TikaConfig {
+    /// This configuration with a collection's overrides applied.
+    ///
+    /// Unset fields keep the global value, so a collection states only what is
+    /// special about it.
+    pub fn with_override(&self, o: &TikaOverride) -> TikaConfig {
+        TikaConfig {
+            url:           self.url.clone(),
+            ocr_strategy:  o.ocr_strategy.clone().unwrap_or_else(|| self.ocr_strategy.clone()),
+            ocr_languages: o.ocr_languages.clone().unwrap_or_else(|| self.ocr_languages.clone()),
+            max_pdf_bytes: o.max_pdf_bytes.unwrap_or(self.max_pdf_bytes),
+            timeout_secs:  o.timeout_secs.unwrap_or(self.timeout_secs),
+        }
+    }
 }
 
 /// Configuration for the optional Apache Tika text-extraction backend.
@@ -760,6 +809,87 @@ log:
         // s3 section missing entirely — bucket has no default
         let result = Config::from_yaml("server:\n  bind: '0.0.0.0:8080'\n");
         assert!(result.is_err());
+    }
+
+    // ── Per-collection Tika settings ──────────────────────────────────────────
+
+    const COLLECTION_YAML: &str = r#"
+s3:
+  bucket: warc
+indexer:
+  tika:
+    url: "http://127.0.0.1:9998"
+    ocr_strategy: "auto"
+    ocr_languages: "deu+frk+eng"
+    max_pdf_bytes: 104857600
+    timeout_secs: 600
+  collections:
+    - name: pomologie
+      type: pdf_bucket
+      bucket: obst-pdfs
+      public_base_url: "https://obst-pdfs.23.nu/"
+      tika:
+        ocr_strategy: "no_ocr"
+        max_pdf_bytes: 629145600
+    - name: plain
+      type: pdf_bucket
+      bucket: other
+      public_base_url: "https://other.example/"
+"#;
+
+    #[test]
+    fn a_collection_overrides_only_what_it_names() {
+        let cfg = Config::from_yaml(COLLECTION_YAML).unwrap();
+        let tika = cfg.indexer.tika.as_ref().unwrap();
+        let over = cfg.indexer.collections[0].tika.as_ref().unwrap();
+        let merged = tika.with_override(over);
+
+        assert_eq!(merged.ocr_strategy, "no_ocr", "stated by the collection");
+        assert_eq!(merged.max_pdf_bytes, 629145600, "stated by the collection");
+        // Everything unstated stays global — a collection says what is special
+        // about it, not everything about it.
+        assert_eq!(merged.url, tika.url);
+        assert_eq!(merged.ocr_languages, "deu+frk+eng");
+        assert_eq!(merged.timeout_secs, 600);
+    }
+
+    #[test]
+    fn the_global_settings_are_untouched_by_a_merge() {
+        let cfg = Config::from_yaml(COLLECTION_YAML).unwrap();
+        let tika = cfg.indexer.tika.as_ref().unwrap();
+        let _ = tika.with_override(cfg.indexer.collections[0].tika.as_ref().unwrap());
+        assert_eq!(tika.ocr_strategy, "auto", "the WARC archive keeps its own setting");
+        assert_eq!(tika.max_pdf_bytes, 104857600);
+    }
+
+    #[test]
+    fn a_collection_without_overrides_has_none() {
+        let cfg = Config::from_yaml(COLLECTION_YAML).unwrap();
+        assert!(cfg.indexer.collections[1].tika.is_none());
+    }
+
+    #[test]
+    fn an_empty_override_changes_nothing() {
+        let cfg = Config::from_yaml(COLLECTION_YAML).unwrap();
+        let tika = cfg.indexer.tika.as_ref().unwrap();
+        let merged = tika.with_override(&TikaOverride::default());
+        assert_eq!(merged.ocr_strategy,  tika.ocr_strategy);
+        assert_eq!(merged.ocr_languages, tika.ocr_languages);
+        assert_eq!(merged.max_pdf_bytes, tika.max_pdf_bytes);
+        assert_eq!(merged.timeout_secs,  tika.timeout_secs);
+    }
+
+    #[test]
+    fn an_unknown_key_in_a_collection_override_is_an_error() {
+        // The whole point of deny_unknown_fields: `ocr: "no_ocr"` instead of
+        // `ocr_strategy:` would otherwise be dropped and OCR would run anyway.
+        let err = Config::from_yaml(
+            "s3:\n  bucket: warc\nindexer:\n  collections:\n    - name: c\n      \
+             type: pdf_bucket\n      bucket: b\n      tika:\n        ocr: \"no_ocr\"\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("ocr"), "error should name the stray key: {err}");
     }
 
     // ── Unknown keys ──────────────────────────────────────────────────────────

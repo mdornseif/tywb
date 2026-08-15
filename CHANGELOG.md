@@ -35,6 +35,18 @@ this project does not yet publish tagged releases, so everything lands under
   the lock failed on the spot — and on the indexer that loses a record, because
   a failed object is marked as seen regardless.
 
+- **Text extraction is configured per collection.** `indexer.tika` was one
+  block for every source, and a digitised library corpus and a web crawl want
+  opposite settings from it. The compromise cost both: `auto` sent pre-OCR'd
+  scans through Tesseract for hours, and a `max_pdf_bytes` sized for web PDFs
+  dropped the highest-resolution volumes — the ones most worth having.
+
+  A collection may now carry a `tika:` block of its own, layered over the global
+  one: state what is special, inherit the rest. The Tika URL stays global on
+  purpose — this decides how a document is parsed, not which service parses it.
+  `/text` applies the same override the indexer used, so the text served on
+  demand is the text that was indexed.
+
 - **The collection filter is a query, not a sieve over the results.** `/search`
   and `/ui/search` retrieved the top N and then dropped everything not in the
   requested collection. With 4.1 million web captures next to a few thousand

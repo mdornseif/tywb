@@ -399,6 +399,43 @@ To use tywb as a deduplication server with Zeno, pass:
 | `/ui/url?url=<url>` | All archived captures for a specific URL, sorted by date |
 | `/ui/files` | List of indexed WARC files with per-file statistics |
 
+#### Per-collection text extraction
+
+A collection is a body of documents with properties of its own. A digitised
+library corpus arrives already OCR'd, in volumes of several hundred megabytes;
+the web crawl beside it holds small PDFs of unknown provenance where OCR is the
+only way to get any text at all. One `indexer.tika` block had to serve both, and
+the compromise was wrong for each: `auto` spent hours in Tesseract re-reading
+text that was already there, while a size limit sized for web PDFs silently
+dropped exactly the volumes worth having.
+
+Each collection may now carry its own `tika` block, layered over the global one:
+
+```yaml
+indexer:
+  tika:
+    url: "http://127.0.0.1:9998"
+    ocr_strategy: "auto"          # right for the web archive
+    max_pdf_bytes: 104857600
+  collections:
+    - name: pomologie
+      type: pdf_bucket
+      bucket: obst-pdfs.23.nu
+      prefix: "pomologie-ocr/"
+      public_base_url: "https://obst-pdfs.23.nu/"
+      tika:
+        ocr_strategy: "no_ocr"    # already OCR'd — just read the text layer
+        max_pdf_bytes: 629145600  # 600 MiB
+```
+
+State only what differs; every unset field keeps the global value. The Tika
+**URL** is deliberately not overridable — this decides how a document is parsed,
+not which service parses it.
+
+`/text` applies the same override as the indexer did, so asking for a
+document's text returns what was indexed rather than a second, differently
+extracted reading of the same bytes.
+
 #### Why statistics have their own page
 
 The homepage asks SQLite only for scalar counts. Every breakdown — content

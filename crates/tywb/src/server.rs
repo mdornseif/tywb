@@ -20,6 +20,7 @@
 //! | GET    | `/web/timemap/cdx` | CDX timemap (Zeno/pywb)  |
 //! | GET    | `/healthz`         | Health check             |
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use axum::{
@@ -54,6 +55,18 @@ pub struct AppState {
     /// Tika client for `/text` on PDFs. `None` when `indexer.tika` is unset —
     /// PDFs are then served for replay but their text cannot be extracted.
     pdf:    Option<PdfExtractor>,
+    /// Extractors for collections that override the global Tika settings.
+    /// `/text` must read a document the way the indexer read it, or the two
+    /// disagree about the same bytes — see `extract_capture_text`.
+    pdf_by_collection: HashMap<String, PdfExtractor>,
+}
+
+impl AppState {
+    /// The extractor that applies to a capture, honouring its collection's
+    /// overrides.
+    fn extractor_for(&self, collection: &str) -> Option<&PdfExtractor> {
+        self.pdf_by_collection.get(collection).or(self.pdf.as_ref())
+    }
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -83,12 +96,30 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         info!("indexer.tika unset — /text will not extract PDFs");
     }
 
+    let pdf_by_collection: HashMap<String, PdfExtractor> = cfg
+        .indexer
+        .tika
+        .as_ref()
+        .map(|tika| {
+            cfg.indexer
+                .collections
+                .iter()
+                .filter_map(|c| {
+                    let over = c.tika.as_ref()?;
+                    info!(collection = %c.name, "collection overrides the Tika settings");
+                    Some((c.name.clone(), PdfExtractor::new(&tika.with_override(over))))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
     let state = Arc::new(AppState {
         cdx:    Arc::new(Mutex::new(cdx_store)),
         search: Arc::new(search_reader),
         s3:     Arc::new(s3),
         config: cfg.clone(),
         pdf,
+        pdf_by_collection,
     });
 
     let app = Router::new()
@@ -1066,7 +1097,7 @@ async fn extract_capture_text(
     }
 
     if essence == "application/pdf" {
-        let Some(extractor) = state.pdf.clone() else {
+        let Some(extractor) = state.extractor_for(&rec.collection).cloned() else {
             return Err((
                 StatusCode::NOT_IMPLEMENTED,
                 "PDF text extraction is not configured — set indexer.tika",

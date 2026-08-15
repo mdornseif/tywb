@@ -147,7 +147,8 @@ indexer:
   # Additional sources indexed alongside the primary WARC bucket (which is the
   # implicit collection "warc"). Each is searched and browsed together with the
   # archive; the `collection` is recorded per CDX entry and drives which bucket
-  # replay reads from. The Tika/PDF path above applies to every collection.
+  # replay reads from. The Tika/PDF path above applies to every collection, and
+  # each collection may adjust it for itself — see the `tika:` block below.
   #
   # Currently supported type: pdf_bucket — a bucket of standalone PDF objects,
   # each indexed and replayed directly (no WARC container). The object's public
@@ -169,6 +170,19 @@ indexer:
   #     bucket: obst-pdfs.23.nu
   #     prefix: "pomologie-ocr/"
   #     public_base_url: "https://obst-pdfs.23.nu/"
+  #     # Text extraction for this collection only, layered over the `tika`
+  #     # block above — state what is special, inherit the rest (the URL always
+  #     # comes from there; one Tika server serves everything).
+  #     #
+  #     # A digitised corpus and a web crawl want opposite settings, and before
+  #     # this they had to share one: `auto` sends pre-OCR'd scans through
+  #     # Tesseract for nothing, and a limit sized for web PDFs drops the
+  #     # library volumes that are worth the most.
+  #     tika:
+  #       ocr_strategy: "no_ocr"        # already OCR'd before upload
+  #       max_pdf_bytes: 629145600      # 600 MiB — library scans are big
+  #       # ocr_languages: "deu+frk"
+  #       # timeout_secs: 1500          # keep below Tika's taskTimeoutMillis
   #
   # `tywb index --collections-only` indexes just these and leaves the WARC
   # bucket alone — the way to add a collection without re-walking the archive.

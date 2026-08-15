@@ -49,10 +49,21 @@ pub async fn index_pdf_collection(
         return Ok(CollStats::default());
     }
 
-    // OCR applies to every collection: the Tika extractor is built from the
-    // shared indexer config, so these PDFs get the same PDFBox + Tesseract path.
+    // Text extraction is configured per collection, layered over the global
+    // Tika settings: a corpus that arrives pre-OCR'd wants `no_ocr` and a size
+    // limit measured in hundreds of megabytes, and the web archive next to it
+    // wants neither. One shared setting made every choice wrong somewhere.
     let extractor = if cfg.index_pdfs {
-        cfg.tika.as_ref().map(PdfExtractor::new)
+        cfg.tika.as_ref().map(|tika| match &coll.tika {
+            Some(over) => {
+                let merged = tika.with_override(over);
+                info!(name = %coll.name, ocr = %merged.ocr_strategy,
+                      max_pdf_bytes = merged.max_pdf_bytes, timeout_secs = merged.timeout_secs,
+                      "collection overrides the Tika settings");
+                PdfExtractor::new(&merged)
+            }
+            None => PdfExtractor::new(tika),
+        })
     } else {
         None
     };

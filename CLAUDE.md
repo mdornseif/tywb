@@ -254,6 +254,19 @@ names it separately instead.
 `skip-urls.txt` is the shipped list. It is content that decides what gets
 deleted, so `index.rs` tests it like code.
 
+### Tika settings belong to the collection, not to the deployment
+A digitised corpus and a web crawl want opposite extraction settings, and one
+`indexer.tika` block forced a compromise that was wrong for both: `auto` re-OCRs
+scans that already carry text (hours of Tesseract for nothing), and a size limit
+sized for web PDFs drops the library volumes worth the most. A collection may
+carry a `tika:` block of its own — `TikaOverride`, merged over the global one by
+`TikaConfig::with_override`; unset fields inherit. The URL is not overridable:
+this decides *how* a document is parsed, not *where*.
+
+The server applies the same override on `/text` (`AppState::extractor_for`), so
+the on-demand text of a capture is the text that was indexed — the same rule as
+"one text pipeline, two consumers" below.
+
 ### Collections
 The primary WARC bucket is the implicit collection `warc`. `indexer.collections`
 adds further sources; type `pdf_bucket` indexes a bucket of standalone PDFs
