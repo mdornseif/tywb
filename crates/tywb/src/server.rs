@@ -283,10 +283,15 @@ async fn ui_search_handler(
     Query(params): Query<UiSearchParams>,
 ) -> Response {
     let q = params.q.as_deref().unwrap_or("").trim().to_owned();
+    let collection = params.collection.as_deref().filter(|c| !c.is_empty());
 
-    if q.is_empty() {
+    // No terms *and* no collection is someone who has just opened the search
+    // page: show the empty form rather than ranking the whole archive. With a
+    // collection it is a different request — "browse this one" — and that is
+    // exactly what the collection cards on the homepage link to.
+    if q.is_empty() && collection.is_none() {
         return Html(ui::search_html("", &[], params.from.as_deref(), params.to.as_deref(),
-                                   params.collection.as_deref(), false))
+                                   None, false))
             .into_response();
     }
 
@@ -315,7 +320,7 @@ async fn ui_search_handler(
     // The collection goes into the query, not over the results: see SearchQuery.
     match state.search.search(SearchQuery {
         terms: &q,
-        collection: params.collection.as_deref().filter(|c| !c.is_empty()),
+        collection,
         limit,
         from_ts,
         to_ts,
