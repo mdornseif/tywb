@@ -31,6 +31,7 @@ mod pdf_collection;
 mod recompress;
 mod record_fetch;
 mod server;
+mod skiplist;
 mod stats;
 mod ui;
 mod wire_scan;
@@ -161,15 +162,33 @@ async fn main() -> anyhow::Result<()> {
 
     info!(config = %cli.config.display(), "tywb starting");
 
-    // Single domain skip list: merge the static file into the in-memory domain
-    // blacklist. It then drives ingest-time skipping, the index-start purge and
-    // the server's query-time display filter alike.
+    // Single skip list, two halves: domains and URL patterns. Merge both static
+    // files into the in-memory config. Whatever ends up here drives ingest-time
+    // skipping, the index-start purge and the server's query-time display
+    // filter alike.
     let mut cfg = cfg;
     match cfg.indexer.load_blacklist_file() {
         Ok(0) => {}
         Ok(n) => info!(added = n, path = ?cfg.indexer.blacklisted_domains_path, "loaded domain skip list"),
         Err(e) => tracing::warn!(err = %e, path = ?cfg.indexer.blacklisted_domains_path,
                                  "could not read domain skip list — continuing without it"),
+    }
+    match cfg.indexer.load_url_patterns_file() {
+        Ok(0) => {}
+        Ok(n) => info!(added = n, path = ?cfg.indexer.blacklisted_url_patterns_path,
+                       "loaded URL skip patterns"),
+        Err(e) => tracing::warn!(err = %e, path = ?cfg.indexer.blacklisted_url_patterns_path,
+                                 "could not read URL skip patterns — continuing without them"),
+    }
+    // Nothing filters until the patterns are compiled. A rejected pattern is
+    // logged rather than fatal, but logged loudly: silently dropping one means
+    // cruft keeps flowing into the index and nobody notices.
+    let patterns = cfg.indexer.compile_url_patterns();
+    for (pattern, reason) in &patterns.rejected {
+        tracing::warn!(%pattern, %reason, "ignoring invalid URL skip pattern");
+    }
+    if patterns.compiled > 0 {
+        info!(patterns = patterns.compiled, "URL skip patterns active");
     }
 
     match cli.command {

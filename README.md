@@ -25,7 +25,7 @@ Commands:
 - **Incremental indexing** — ETag-based state file skips unchanged objects on re-runs
 - **SQLite CDX index** — WAL-mode, concurrent reads, no daemon overhead
 - **Compressed WARC replay** — per-gzip-member offsets stored in CDX so `.warc.gz` replay is a targeted range GET, not a full decompression
-- **Domain blacklist** — exclude domains (and their subdomains) from indexing; existing entries are purged automatically on next run
+- **Skip list** — exclude whole domains (with their subdomains) or single kinds of page by URL pattern, e.g. wiki talk pages and version histories; matches are skipped at ingest, purged from an existing index on the next run, and hidden from search results at once
 - **warcinfo storage** — the `warcinfo` record from each WARC file is stored in SQLite for audit and provenance tracking
 
 ## Architecture
@@ -92,12 +92,15 @@ After each WARC file is indexed, a CDX sidecar file is written to the same S3 bu
 | `--max-files <N>` | Stop after processing N WARC files |
 | `--max-urls <N>` | Stop after writing N new CDX entries |
 | `--force` | Re-process all WARC files even if their ETag matches the saved state (use to repair existing index data) |
+| `--collections-only` | Skip the primary WARC bucket and index only `indexer.collections` — the way to add or refresh a PDF collection without re-walking the archive |
 
 **Live status:** press **Ctrl+T** (macOS/BSD) or send **SIGUSR1** (Linux) to print current file, URL, throughput (rec/s, MB/s) to stderr without interrupting indexing.
 
-### Domain blacklist
+### Skip list
 
-Domains (and all their subdomains) can be excluded from indexing by listing them under `indexer.blacklisted_domains` in `config.yaml`:
+One list decides what never enters the index. It has two halves, and both act in the same three places.
+
+**Domains** drop a whole site:
 
 ```yaml
 indexer:
@@ -106,13 +109,50 @@ indexer:
     - ads.example.net
 ```
 
-Two things happen automatically each time `tywb index` runs:
+Subdomain matching is automatic: `example.com` covers `www.example.com`, `cdn.example.com`, `deep.sub.example.com`, etc.
 
-1. **Skip during ingest** — any WARC record whose `WARC-Target-URI` belongs to a blacklisted domain (or one of its subdomains) is silently skipped; nothing is written to the CDX or fulltext index for that record.
+**URL patterns** drop a kind of page on sites that are otherwise worth keeping — the talk pages, version histories and `action=edit` links every wiki hangs off each article:
 
-2. **Purge existing data** — before processing new files, tywb removes all CDX records and fulltext index entries for every blacklisted domain from the current index.  This means adding a domain to the blacklist and re-running `tywb index` is sufficient to clean up previously-indexed data — no manual database surgery required.
+```yaml
+indexer:
+  blacklisted_url_patterns:
+    - "(?i)[?&]action=(edit|history)"
+    - "(?i)(/|[?&]title=)(Diskussion|Talk):"
+```
 
-Subdomain matching is automatic: `example.com` in the blacklist covers `www.example.com`, `cdn.example.com`, `deep.sub.example.com`, etc.
+Each pattern is a regular expression matched against the whole URL, unanchored, in RE2 syntax (no backreferences, no lookaround). Prefix `(?i)` for case-insensitivity. A pattern that matches the empty string is refused at startup, with a warning: it would match every URL and purge the entire index. A pattern that fails to compile is dropped and logged, never fatal.
+
+Both halves are better kept in static files, editable without re-rendering `config.yaml` — a server restart applies the display filter, a re-index purges what is already stored:
+
+```yaml
+indexer:
+  blacklisted_domains_path:      "/etc/tywb/skip-domains.txt"
+  blacklisted_url_patterns_path: "/etc/tywb/skip-urls.txt"
+```
+
+The repository ships a ready-made [`skip-urls.txt`](skip-urls.txt) covering MediaWiki and DokuWiki cruft: talk namespaces in German and English, `Spezial:`/`Special:`, `action=`/`do=` verbs, `oldid=`/`diff=` permalinks, `api.php` and friends. Category, file and portal pages are deliberately left in — they carry captions, provenance and the wiki's own navigation — with a commented-out rule for anyone who disagrees.
+
+What happens to a match:
+
+1. **Skipped during ingest** — a WARC record whose `WARC-Target-URI` matches is never written to CDX or the fulltext index.
+
+2. **Purged from existing data** — before processing new files, `tywb index` removes the CDX records and fulltext entries of everything that matches. Adding an entry and re-running `tywb index` is enough to clean up data indexed earlier; no manual database surgery. The domain half is a SURT-prefix query; the pattern half is one sequential scan of the CDX table, so it only runs when patterns are configured. Nothing is deleted from the WARC files themselves — remove the rule, re-index, and the captures come back.
+
+3. **Hidden from search results** — the server applies the same test at query time, so an edit to either file takes effect on restart without waiting for a re-index.
+
+### Viewing the list, and feeding it to a crawler
+
+`GET /ui/skiplist` shows what is in force: the domains, the URL patterns with the comments they were written with, and — separately — anything configured that did *not* compile. A rule that silently does nothing is worse than no rule, so the page names it.
+
+`GET /skiplist.zeno` serves the same list as an exclusion file for the [Zeno](https://github.com/internetarchive/Zeno) crawler. Crawling pages tywb would only throw away costs bandwidth on both ends, and both sides use RE2, so the URL patterns transfer unchanged; only the domains are translated, to `^https?://([^/]*\.)?host([:/?#]|$)`.
+
+```bash
+# in a crawl script, before the run
+curl -o exclusions.txt http://tywb.example.org/skiplist.zeno
+Zeno get list seeds.txt --exclusion-file exclusions.txt …
+```
+
+The list is edited in one place — tywb's skip list — and the crawler fetches it. There is no second copy to drift, and no local generator step. Add `?inline=1` to read it in the browser instead of downloading it. Patterns that failed to compile are absent from the export as well: inert in tywb, inert in the crawler.
 
 ### 3. Serve
 
@@ -352,11 +392,31 @@ To use tywb as a deduplication server with Zeno, pass:
 
 | Path | Description |
 |------|-------------|
-| `/` | Homepage with index statistics (record count, date range, MIME breakdown) |
+| `/` | Homepage — record count, unique URLs, WARC files, date range, search forms |
+| `/ui/stats` | Collections, content types and HTTP status codes |
 | `/ui/search` | HTML fulltext search form |
 | `/ui/browse` | Domain browser — TLD → domain → captures hierarchy |
 | `/ui/url?url=<url>` | All archived captures for a specific URL, sorted by date |
 | `/ui/files` | List of indexed WARC files with per-file statistics |
+
+#### Why statistics have their own page
+
+The homepage asks SQLite only for scalar counts. Every breakdown — content
+types, HTTP status codes, records per collection — is a `GROUP BY` over the
+whole CDX table with no index to lean on, and on a 4-million-record archive the
+three of them together take about seven seconds.
+
+That was never just the homepage's problem. The server keeps **one** SQLite
+connection behind a mutex, so for those seconds every other request waited too:
+replay, search, CDX lookups. A health check with a ten-second budget duly
+reported the server as unreachable while it was serving perfectly well.
+
+`/ui/stats` runs each of those queries on its own short-lived **read-only**
+connection, concurrently — in WAL mode readers do not block each other — so the
+page costs roughly its slowest query instead of the sum, and costs the rest of
+the server nothing. It prints the measured time at the bottom, which is the
+number that decides whether anything may ever put those queries back on a hot
+path.
 
 #### Domain browser
 
@@ -588,6 +648,47 @@ All values can be overridden by environment variables. Environment variables win
 | `RUST_LOG`                | `log.level`               | `info` |
 
 Full annotated config: see [`config.yaml`](config.yaml).
+
+### Unknown keys are an error
+
+Every block rejects keys it does not know. This is deliberate: a key in the
+wrong place is otherwise invisible. Writing `tika:` or `collections:` at the top
+level instead of under `indexer:` used to be dropped without a word — the run
+then reported `nothing to index — all objects are up to date` and exited
+successfully, having done nothing at all. Now it says:
+
+```
+unknown field `tika`, expected one of `s3`, `storage`, `indexer`, `server`, `log`
+```
+
+### The index schema and older indexes
+
+The Tantivy index stores its schema on disk, and fields have only ever been
+*appended* to it (`collection`, when collections arrived). An index written
+before a field existed still opens, still answers searches and can still be
+written to — the indexer reads the field handles back from the index rather
+than assuming them, and logs on startup which fields the index predates:
+
+```
+WARN index predates these fields — it stays searchable and writable, but new
+     documents will not carry them (a collection filter will not find them).
+     Rebuild the index to get them back.
+```
+
+That is the whole cost: documents added to such an index carry no collection,
+so `/ui/search?collection=…` does not find them. Replay is unaffected — the
+collection that selects the bucket lives in the CDX database, which has no such
+restriction. To get the field back, move the index directory aside and re-run
+`tywb index`; the CDX database is kept.
+
+The schema is not rewritten in place to add the field, tempting as it looks:
+segments written without a field carry no field norms for it, and the first
+background merge of an old segment with a new one fails with `Field norm not
+found for field`. An index that works for hours and then dies in a merge is
+worse than one that says up front what it cannot do.
+
+A schema that differs in any *other* way — a renamed field, changed indexing
+options — is refused at startup, naming the field and telling you to rebuild.
 
 ## Building
 

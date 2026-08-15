@@ -13,6 +13,7 @@ use tantivy::{
     collector::TopDocs,
 };
 use thiserror::Error;
+use tracing::warn;
 
 // ── Error ─────────────────────────────────────────────────────────────────────
 
@@ -26,6 +27,10 @@ pub enum SearchError {
     Io(#[from] std::io::Error),
     #[error("schema field not found: {0}")]
     FieldNotFound(String),
+    #[error("the index at {path} was written with an incompatible schema: {reason}.\n\
+             It cannot be written to by this build — move the directory aside and \
+             re-run `tywb index` to rebuild it from S3.")]
+    SchemaMismatch { path: String, reason: String },
 }
 
 pub type Result<T> = std::result::Result<T, SearchError>;
@@ -132,6 +137,84 @@ fn fields_from_index_schema(schema: &Schema) -> Result<Fields> {
     })
 }
 
+// ── Schema compatibility ──────────────────────────────────────────────────────
+//
+// Tantivy stores the schema in `meta.json` and refuses to open an index whose
+// schema differs from the one handed to `open_or_create` — the error is a bare
+// "An index exists but the schema does not match", which says nothing about
+// which field or what to do.  Every field this project has added since the
+// first release was *appended*: `collection` is the current example, and an
+// index written before collections existed is otherwise perfectly usable.
+//
+// Such an index is opened as it is, with the field handles read back from it
+// rather than assumed — the same thing the read path has always done.  The
+// appended field is then simply not written: `add_document` skips it and
+// `search_impl` reports `None` for it, which both already handle.
+//
+// The schema is deliberately *not* rewritten in place to add the field.  That
+// looks like it should work — old segments would just read back empty — but a
+// segment written without the field carries no field norms for it, and the
+// first background merge of an old segment with a new one dies with
+// "Field norm not found for field". An index that opens and indexes fine and
+// then loses everything on a merge hours later is worse than one that says up
+// front what it cannot do. Bringing an old index up to a new field means
+// rebuilding it; nothing else is honest.
+
+/// How the schema stored in an index relates to the one this build writes.
+#[derive(Debug, PartialEq)]
+enum SchemaCompat {
+    /// Field for field the same — full functionality.
+    Identical,
+    /// The stored schema is this build's with a suffix of fields missing.
+    /// Readable and writable; the named fields stay empty.  Carries their names.
+    Behind(Vec<String>),
+    /// Anything else: a renamed field, changed options, a removed field, or a
+    /// field this build does not know.  Carries a human-readable reason.
+    Incompatible(String),
+}
+
+/// Field entries of a schema, as the JSON Tantivy itself stores in `meta.json`.
+fn schema_fields(schema: &Schema) -> Result<Vec<serde_json::Value>> {
+    match serde_json::to_value(schema).map_err(std::io::Error::other)? {
+        serde_json::Value::Array(v) => Ok(v),
+        other => Err(SearchError::SchemaMismatch {
+            path: "meta.json".to_owned(),
+            reason: format!("schema did not serialise to a field list but to {other}"),
+        }),
+    }
+}
+
+fn field_name(entry: &serde_json::Value) -> String {
+    entry.get("name").and_then(|n| n.as_str()).unwrap_or("?").to_owned()
+}
+
+fn schema_compat(stored: &Schema, target: &Schema) -> Result<SchemaCompat> {
+    let old = schema_fields(stored)?;
+    let new = schema_fields(target)?;
+
+    if old == new {
+        return Ok(SchemaCompat::Identical);
+    }
+    if old.len() > new.len() {
+        return Ok(SchemaCompat::Incompatible(format!(
+            "the index has {} fields, this build writes {} — fields were removed",
+            old.len(),
+            new.len()
+        )));
+    }
+    for (i, stored_field) in old.iter().enumerate() {
+        if stored_field != &new[i] {
+            return Ok(SchemaCompat::Incompatible(format!(
+                "field {i} differs: the index has `{}`, this build writes `{}` \
+                 (a renamed field, or changed indexing options)",
+                field_name(stored_field),
+                field_name(&new[i])
+            )));
+        }
+    }
+    Ok(SchemaCompat::Behind(new[old.len()..].iter().map(field_name).collect()))
+}
+
 // ── Shared search implementation ──────────────────────────────────────────────
 
 fn search_impl(
@@ -215,15 +298,45 @@ impl SearchIndex {
     }
 
     /// Open/create with a custom writer heap size in bytes.
+    ///
+    /// An existing index is opened as it stands and its field handles read back
+    /// from it, the way the read path has always done — an index written before
+    /// a field was appended stays writable, minus that field (see
+    /// [`SchemaCompat`]).  Only a genuinely incompatible schema is an error, and
+    /// it says which field and why.
     pub fn with_heap(path: impl AsRef<Path>, heap_bytes: usize) -> Result<Self> {
         let path = path.as_ref();
         std::fs::create_dir_all(path)?;
 
-        let (schema, fields) = build_schema();
+        let (schema, _) = build_schema();
         let dir = MmapDirectory::open(path)
             .map_err(|e| std::io::Error::other(e.to_string()))?;
-        let index = Index::open_or_create(dir, schema)?;
 
+        let exists = Index::exists(&dir).map_err(|e| std::io::Error::other(e.to_string()))?;
+        let index = if exists {
+            let existing = Index::open(dir)?;
+            match schema_compat(&existing.schema(), &schema)? {
+                SchemaCompat::Identical => {}
+                SchemaCompat::Behind(missing) => warn!(
+                    index = %path.display(),
+                    fields = %missing.join(", "),
+                    "index predates these fields — it stays searchable and writable, \
+                     but new documents will not carry them (a collection filter \
+                     will not find them). Rebuild the index to get them back.",
+                ),
+                SchemaCompat::Incompatible(reason) => {
+                    return Err(SearchError::SchemaMismatch {
+                        path: path.display().to_string(),
+                        reason,
+                    });
+                }
+            }
+            existing
+        } else {
+            Index::create(dir, schema, tantivy::IndexSettings::default())?
+        };
+
+        let fields = fields_from_index_schema(&index.schema())?;
         let writer = index.writer(heap_bytes)?;
         let reader = index
             .reader_builder()
@@ -641,6 +754,148 @@ mod tests {
 
         let hits = idx.search("keyword", 1, None, None).unwrap();
         assert_eq!(hits[0].timestamp, "20240101090501");
+    }
+
+    // ── Schema compatibility ──────────────────────────────────────────────────
+
+    /// The schema as it was before `collection` was appended.  Field options are
+    /// copied from `build_schema` verbatim — an older index must be recognised
+    /// as one field behind, not as one with changed options.
+    fn legacy_schema() -> Schema {
+        let mut b = Schema::builder();
+        b.add_text_field("url",       STRING | STORED);
+        b.add_u64_field( "timestamp", NumericOptions::default().set_stored());
+        b.add_text_field("title",     TEXT | STORED);
+        b.add_text_field("body",      TEXT);
+        b.add_text_field("mime",      STRING | STORED);
+        b.add_text_field("s3_key",    STRING | STORED);
+        b.add_u64_field( "offset",    NumericOptions::default().set_stored());
+        b.add_u64_field( "length",    NumericOptions::default().set_stored());
+        b.build()
+    }
+
+    /// Write an index in the pre-`collection` schema, the way a build from
+    /// before collections would have left it on disk.
+    fn write_legacy_index(path: &Path, urls: &[&str]) {
+        let schema = legacy_schema();
+        let dir = MmapDirectory::open(path).unwrap();
+        let index = Index::create(dir, schema.clone(), tantivy::IndexSettings::default()).unwrap();
+        let mut w: IndexWriter = index.writer(DEFAULT_HEAP_BYTES).unwrap();
+        let f = |n: &str| schema.get_field(n).unwrap();
+        for url in urls {
+            let mut d = TantivyDocument::default();
+            d.add_text(f("url"), url);
+            d.add_u64( f("timestamp"), 20240101120000);
+            d.add_text(f("title"), "Legacy");
+            d.add_text(f("body"), "legacy body text");
+            d.add_text(f("mime"), "text/html");
+            d.add_text(f("s3_key"), "old.warc.gz");
+            d.add_u64( f("offset"), 0);
+            d.add_u64( f("length"), 1);
+            w.add_document(d).unwrap();
+        }
+        w.commit().unwrap();
+    }
+
+    #[test]
+    fn schema_compat_identical_for_same_schema() {
+        let (schema, _) = build_schema();
+        assert_eq!(schema_compat(&schema, &schema).unwrap(), SchemaCompat::Identical);
+    }
+
+    #[test]
+    fn schema_compat_reports_missing_appended_field() {
+        let (current, _) = build_schema();
+        assert_eq!(
+            schema_compat(&legacy_schema(), &current).unwrap(),
+            SchemaCompat::Behind(vec!["collection".to_owned()]),
+        );
+    }
+
+    #[test]
+    fn schema_compat_refuses_removed_field() {
+        let (current, _) = build_schema();
+        // An index with a field this build no longer writes: not just behind.
+        let diff = schema_compat(&current, &legacy_schema()).unwrap();
+        assert!(matches!(diff, SchemaCompat::Incompatible(r) if r.contains("removed")));
+    }
+
+    #[test]
+    fn schema_compat_refuses_changed_options() {
+        let (current, _) = build_schema();
+        let mut b = Schema::builder();
+        // `url` indexed differently — same names, different meaning.
+        b.add_text_field("url", TEXT | STORED);
+        b.add_u64_field( "timestamp", NumericOptions::default().set_stored());
+        b.add_text_field("title",  TEXT | STORED);
+        b.add_text_field("body",   TEXT);
+        b.add_text_field("mime",   STRING | STORED);
+        b.add_text_field("s3_key", STRING | STORED);
+        b.add_u64_field( "offset", NumericOptions::default().set_stored());
+        b.add_u64_field( "length", NumericOptions::default().set_stored());
+        let diff = schema_compat(&b.build(), &current).unwrap();
+        assert!(matches!(diff, SchemaCompat::Incompatible(r) if r.contains("field 0 differs")));
+    }
+
+    #[test]
+    fn opening_a_pre_collection_index_works_instead_of_failing() {
+        let dir = tempdir().unwrap();
+        write_legacy_index(dir.path(), &["https://old.com/1", "https://old.com/2"]);
+
+        // This is the call that used to abort with
+        // "An index exists but the schema does not match".
+        let idx = SearchIndex::open_or_create(dir.path()).unwrap();
+        assert_eq!(idx.num_docs(), 2, "existing documents are left alone");
+
+        let hits = idx.search("legacy", 10, None, None).unwrap();
+        assert_eq!(hits.len(), 2);
+        assert!(hits.iter().all(|h| h.collection.is_none()));
+    }
+
+    #[test]
+    fn writing_to_a_pre_collection_index_drops_only_the_collection() {
+        let dir = tempdir().unwrap();
+        write_legacy_index(dir.path(), &["https://old.com/1"]);
+
+        let mut idx = SearchIndex::open_or_create(dir.path()).unwrap();
+        let mut pdf = doc("https://obst.example/1.pdf", "Pomologie", "Bigarreau Kernobst", 20260101000000);
+        pdf.collection = "obst-pdfs".to_owned();
+        idx.add_document(&pdf).unwrap();
+        idx.commit().unwrap();
+        assert_eq!(idx.num_docs(), 2);
+
+        // The document is indexed and findable — only its collection is lost,
+        // which is what the warning on open says.
+        let hits = idx.search("Bigarreau", 10, None, None).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].url, "https://obst.example/1.pdf");
+        assert!(hits[0].collection.is_none());
+
+        drop(idx);
+        assert_eq!(SearchReader::open(dir.path()).unwrap().num_docs(), 2);
+    }
+
+    #[test]
+    fn merging_segments_of_a_pre_collection_index_keeps_every_document() {
+        // Writing into an old index must not leave a merge landmine: the schema
+        // on disk and the segments agree, so a merge of old and new segments is
+        // an ordinary merge.
+        let dir = tempdir().unwrap();
+        write_legacy_index(dir.path(), &["https://old.com/1", "https://old.com/2"]);
+
+        let mut idx = SearchIndex::open_or_create(dir.path()).unwrap();
+        idx.add_document(&doc("https://obst.example/1.pdf", "Pomologie", "legacy body text", 20260101000000))
+            .unwrap();
+        idx.commit().unwrap();
+
+        let segments = idx.index.searchable_segment_ids().unwrap();
+        assert!(segments.len() >= 2, "want an old and a new segment");
+        idx.writer.merge(&segments).wait().unwrap();
+        idx.commit().unwrap();
+
+        assert_eq!(idx.index.searchable_segment_ids().unwrap().len(), 1);
+        assert_eq!(idx.num_docs(), 3);
+        assert_eq!(idx.search("legacy", 10, None, None).unwrap().len(), 3);
     }
 
     // ── Per-file replace (delete_s3_key) ────────────────────────────────────────

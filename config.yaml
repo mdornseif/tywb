@@ -20,7 +20,14 @@ s3:
   # Optional: custom endpoint for MinIO, Cloudflare R2, Backblaze B2, etc.
   # Leave unset to use standard AWS S3.
   # Override with: AWS_ENDPOINT_URL
-  endpoint_url: "https://s3.dornseif.cloud"
+  #
+  # Point this at the object store directly. A reverse proxy in front of it
+  # must pass requests through unchanged: SigV4 signs a list of headers, so a
+  # proxy that adds or rewrites one (`accept-encoding` is the usual culprit)
+  # turns every request into
+  #   400 InvalidRequest: signed header `accept-encoding` is not present
+  # which reads like a credentials problem and is not one.
+  endpoint_url: "https://s3.foxel.org"
 
   # Optional: force path-style addressing (required for MinIO / some S3-compat).
   force_path_style: true
@@ -74,30 +81,39 @@ indexer:
   # Set to false to build a CDX-only index without fulltext search.
   index_warc_responses: true
 
-  # URL glob patterns to skip during ingest (matched against WARC-Target-URI).
-  # Useful for excluding static assets that add noise to the fulltext index.
-  # skip_patterns:
-  #   - "*.css"
-  #   - "*.js"
-  #   - "*.png"
-  #   - "*.jpg"
-
-  # ── Domain skip list ───────────────────────────────────────────────────────
-  # A single list of domains that are skipped everywhere: not indexed, purged
-  # from the index on the next `tywb index` run, AND hidden from search results
-  # immediately (query-time filter). Subdomain matching is automatic —
-  # "google.com" also covers "www.google.com", "maps.google.com", etc.
+  # ── Skip list ──────────────────────────────────────────────────────────────
+  # One list, applied everywhere: matching records are not indexed, are purged
+  # from the index on the next `tywb index` run, AND are hidden from search
+  # results immediately (query-time filter). It has two halves.
   #
-  # The recommended way is a static file, editable without re-rendering this
-  # config (a server restart applies the display filter; a re-index purges
+  # 1. Domains — drop a whole site. Subdomain matching is automatic:
+  #    "google.com" also covers "www.google.com", "maps.google.com", etc.
+  #
+  # 2. URL patterns — drop a kind of page on sites that are otherwise wanted:
+  #    wiki talk pages, version histories, `action=edit` links. Regular
+  #    expressions matched against the whole URL, unanchored, `(?i)` for
+  #    case-insensitivity. The shipped skip-urls.txt covers MediaWiki and
+  #    DokuWiki cruft. A pattern that matches the empty string is refused at
+  #    startup — it would match every URL and purge the whole index.
+  #
+  # The recommended way is a static file per half, editable without re-rendering
+  # this config (a server restart applies the display filter; a re-index purges
   # already-stored entries):
-  #   blacklisted_domains_path: "/etc/tywb/skip-domains.txt"   # one domain per line, # comments
+  #   blacklisted_domains_path:      "/etc/tywb/skip-domains.txt"  # one domain per line
+  #   blacklisted_url_patterns_path: "/etc/tywb/skip-urls.txt"     # one regex per line
   #
-  # An inline list works too and is merged with the file:
+  # Inline lists work too and are merged with the files:
   #   blacklisted_domains:
   #     - instagram.com
   #     - google.com
   #     - pinterest.com
+  #   blacklisted_url_patterns:
+  #     - "(?i)[?&]action=(edit|history)"
+  #     - "(?i)(/|[?&]title=)(Diskussion|Talk):"
+  #
+  # The server shows the list at /ui/skiplist and serves it as an exclusion
+  # file for the Zeno crawler at /skiplist.zeno, so the same rules keep cruft
+  # out of the crawl too.
 
   # ── PDF text extraction (optional) ─────────────────────────────────────────
   # An Apache Tika server that turns PDFs into searchable text. Leave the whole
@@ -114,10 +130,15 @@ indexer:
   #   url: "http://127.0.0.1:9998"
   #   # no_ocr = text layer only; auto = OCR only when there is no text layer;
   #   # ocr_only = always OCR. "auto" suits a mix of digital and scanned PDFs.
+  #   # Use "no_ocr" for a collection that was OCR'd before upload: it rules out
+  #   # an index run quietly spending hours in Tesseract on text that is
+  #   # already there.
   #   ocr_strategy: "auto"
   #   # Tesseract languages. frk = Fraktur, for older German prints.
   #   ocr_languages: "deu+frk+eng"
-  #   # PDFs larger than this are skipped rather than sent to Tika.
+  #   # PDFs larger than this are skipped rather than sent to Tika. Each skip is
+  #   # logged at WARN with the key and size — high-resolution library scans run
+  #   # to several hundred MB and are exactly the documents worth having.
   #   max_pdf_bytes: 104857600  # 100 MiB
   #   # Per-document timeout; OCR of a big scan can be slow.
   #   timeout_secs: 300
@@ -132,12 +153,25 @@ indexer:
   # each indexed and replayed directly (no WARC container). The object's public
   # URL is public_base_url + key.
   #
+  # One bucket can carry several collections, split by key prefix — useful when
+  # only part of it should be indexed, or when the parts deserve separate names
+  # in the UI. Prefixes are matched literally, so "archive-org/" does not reach
+  # into "archive-org-ocr/".
+  #
   # collections:
   #   - name: obst-pdfs
   #     type: pdf_bucket
   #     bucket: obst-pdfs.23.nu
   #     public_base_url: "https://obst-pdfs.23.nu/"
   #     # prefix: ""   # optional key prefix
+  #   - name: pomologie
+  #     type: pdf_bucket
+  #     bucket: obst-pdfs.23.nu
+  #     prefix: "pomologie-ocr/"
+  #     public_base_url: "https://obst-pdfs.23.nu/"
+  #
+  # `tywb index --collections-only` indexes just these and leaves the WARC
+  # bucket alone — the way to add a collection without re-walking the archive.
 
 # ── Server ────────────────────────────────────────────────────────────────────
 server:

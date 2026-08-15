@@ -7,7 +7,7 @@
 //! The store is opened in WAL mode so reads never block writes and multiple
 //! concurrent readers are supported without any locking overhead.
 
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use crate::error::{CdxError, Result};
 use crate::record::{CdxRecord, parse_timestamp};
 
@@ -140,8 +140,22 @@ pub struct WarcFileRow {
 
 // ── Stats ─────────────────────────────────────────────────────────────────────
 
+/// The cheap half of [`CdxStats`]: scalar aggregates only, no `GROUP BY`.
+///
+/// Every one of these is a single index or table scan that SQLite finishes in
+/// well under a second even on a multi-million-record archive. The breakdowns
+/// in [`CdxStats`] are not — see [`CdxStore::basic_stats`].
+#[derive(Debug, Clone, Default)]
+pub struct BasicStats {
+    pub total_records:    u64,
+    pub unique_urls:      u64,
+    pub warc_files:       u64,
+    pub oldest_timestamp: Option<String>,
+    pub newest_timestamp: Option<String>,
+}
+
 /// Aggregate statistics over the CDX table, returned by [`CdxStore::stats`].
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct CdxStats {
     pub total_records:    u64,
     pub unique_urls:      u64,
@@ -168,6 +182,26 @@ impl CdxStore {
         let store = Self { conn };
         store.init()?;
         Ok(store)
+    }
+
+    /// Open an existing CDX database read-only, without touching its schema.
+    ///
+    /// The server keeps one read-write connection behind a Mutex, which means
+    /// every query it runs is serialised against every other. That is the right
+    /// trade for the short lookups replay and search make, and the wrong one for
+    /// the statistics page, whose `GROUP BY`s take seconds each. Those get a
+    /// connection apiece and run concurrently — SQLite in WAL mode serves any
+    /// number of readers at once.
+    ///
+    /// Read-only on purpose: no `init()`, so these connections never take the
+    /// write lock for the schema's `CREATE TABLE IF NOT EXISTS` / `ALTER TABLE`
+    /// and can never contend with a running indexer.
+    pub fn open_readonly(path: &str) -> Result<Self> {
+        let conn = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        Ok(Self { conn })
     }
 
     /// Open an in-memory database (useful for tests).
@@ -317,6 +351,53 @@ impl CdxStore {
             params![apex_pat, sub_pat],
         )?;
         Ok(n)
+    }
+
+    /// Return the `(surt_url, original)` pairs whose original URL is accepted by
+    /// `keep`, deduplicated by SURT key.
+    ///
+    /// There is no index on `original`, and a URL pattern cannot be pushed into
+    /// SQL, so this is a full sequential scan — the price of purging by pattern
+    /// rather than by domain. Rows stream past the predicate one at a time and
+    /// only the matches are held, so memory is bounded by the *hit* count, not
+    /// by the table size.
+    pub fn urls_matching<F>(&self, mut keep: F) -> Result<Vec<(String, String)>>
+    where
+        F: FnMut(&str) -> bool,
+    {
+        let mut stmt = self.conn.prepare("SELECT surt_url, original FROM cdx")?;
+        let mut rows = stmt.query([])?;
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            let original: String = row.get(1)?;
+            if !keep(&original) {
+                continue;
+            }
+            let surt: String = row.get(0)?;
+            if seen.insert(surt.clone()) {
+                out.push((surt, original));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Delete every record for each of the given exact SURT URLs (all captures,
+    /// all timestamps). Returns the number of rows deleted.
+    ///
+    /// Deletes by SURT because that is the leading column of the primary key;
+    /// deleting by `original` would scan the table once per URL.
+    pub fn delete_by_surt_urls(&mut self, surt_urls: &[String]) -> Result<usize> {
+        let tx = self.conn.transaction()?;
+        let mut deleted = 0usize;
+        {
+            let mut stmt = tx.prepare_cached("DELETE FROM cdx WHERE surt_url = ?1")?;
+            for surt in surt_urls {
+                deleted += stmt.execute(params![surt])?;
+            }
+        }
+        tx.commit()?;
+        Ok(deleted)
     }
 
     // ── Reads ─────────────────────────────────────────────────────────────────
@@ -490,8 +571,18 @@ impl CdxStore {
         rows.map(|r| r.map_err(CdxError::from)).collect()
     }
 
-    pub fn stats(&self) -> Result<CdxStats> {
-        let total: i64 = self.conn.query_row(
+    /// The scalar aggregates only — no `GROUP BY`, and that is the point.
+    ///
+    /// This is what the homepage asks for. On the production archive (4.1M
+    /// records) these four queries together take well under two seconds, while
+    /// the three breakdowns in [`stats`] take seven on their own. Since every
+    /// request shares one connection behind a Mutex, a homepage that asked for
+    /// the breakdowns stalled replay and search for as long as it ran, and a
+    /// health probe with a 10-second budget reported the server as down.
+    ///
+    /// [`stats`]: Self::stats
+    pub fn basic_stats(&self) -> Result<BasicStats> {
+        let total_records: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM cdx", [], |r| r.get(0))?;
 
         let unique_urls: i64 = self.conn.query_row(
@@ -500,22 +591,45 @@ impl CdxStore {
         let warc_files: i64 = self.conn.query_row(
             "SELECT COUNT(DISTINCT s3_key) FROM cdx", [], |r| r.get(0))?;
 
-        let (oldest, newest): (Option<String>, Option<String>) = self.conn.query_row(
-            "SELECT MIN(timestamp), MAX(timestamp) FROM cdx", [],
-            |r| Ok((r.get(0)?, r.get(1)?)))?;
+        let (oldest_timestamp, newest_timestamp): (Option<String>, Option<String>) =
+            self.conn.query_row(
+                "SELECT MIN(timestamp), MAX(timestamp) FROM cdx", [],
+                |r| Ok((r.get(0)?, r.get(1)?)))?;
 
-        let mut mime_stmt = self.conn.prepare_cached(
+        Ok(BasicStats {
+            total_records: total_records as u64,
+            unique_urls:   unique_urls as u64,
+            warc_files:    warc_files as u64,
+            oldest_timestamp,
+            newest_timestamp,
+        })
+    }
+
+    /// Record count per MIME type, most common first (top 20).
+    ///
+    /// A full `GROUP BY` over the table — seconds on a large archive, with no
+    /// index to lean on. Ask for it on its own connection, in parallel with the
+    /// other breakdowns, not on the request path of a page that has to be fast.
+    pub fn mime_counts(&self) -> Result<Vec<(String, u64)>> {
+        let mut stmt = self.conn.prepare_cached(
             "SELECT COALESCE(mime, '(none)'), COUNT(*) AS n \
              FROM cdx GROUP BY mime ORDER BY n DESC LIMIT 20")?;
-        let mime_counts: Vec<(String, u64)> = mime_stmt
+        let rows = stmt
             .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64)))?
             .filter_map(|r| r.ok())
             .collect();
+        Ok(rows)
+    }
 
-        let mut status_stmt = self.conn.prepare_cached(
+    /// Record count per HTTP status code, most common first. See
+    /// [`mime_counts`] on cost.
+    ///
+    /// [`mime_counts`]: Self::mime_counts
+    pub fn status_counts(&self) -> Result<Vec<(Option<u16>, u64)>> {
+        let mut stmt = self.conn.prepare_cached(
             "SELECT status, COUNT(*) AS n \
              FROM cdx GROUP BY status ORDER BY n DESC")?;
-        let status_counts: Vec<(Option<u16>, u64)> = status_stmt
+        let rows = stmt
             .query_map([], |r| {
                 let s: Option<i64> = r.get(0)?;
                 let n: i64 = r.get(1)?;
@@ -523,15 +637,23 @@ impl CdxStore {
             })?
             .filter_map(|r| r.ok())
             .collect();
+        Ok(rows)
+    }
 
+    /// Everything at once, run sequentially on this connection. Used by
+    /// `tywb stats` on the command line, where waiting is what the caller asked
+    /// for. Server handlers compose the parts above instead, on connections of
+    /// their own.
+    pub fn stats(&self) -> Result<CdxStats> {
+        let basic = self.basic_stats()?;
         Ok(CdxStats {
-            total_records: total as u64,
-            unique_urls:   unique_urls as u64,
-            warc_files:    warc_files as u64,
-            oldest_timestamp: oldest,
-            newest_timestamp: newest,
-            mime_counts,
-            status_counts,
+            total_records:    basic.total_records,
+            unique_urls:      basic.unique_urls,
+            warc_files:       basic.warc_files,
+            oldest_timestamp: basic.oldest_timestamp,
+            newest_timestamp: basic.newest_timestamp,
+            mime_counts:      self.mime_counts()?,
+            status_counts:    self.status_counts()?,
         })
     }
 
@@ -795,6 +917,65 @@ mod tests {
         }
     }
 
+    // ── Split statistics ──────────────────────────────────────────────────
+
+    #[test]
+    fn basic_stats_matches_the_scalar_half_of_stats() {
+        // The homepage runs basic_stats and the CLI runs stats; they must not
+        // disagree about how many records there are.
+        let store = store_with_samples();
+        let basic = store.basic_stats().unwrap();
+        let full  = store.stats().unwrap();
+        assert_eq!(basic.total_records,    full.total_records);
+        assert_eq!(basic.unique_urls,      full.unique_urls);
+        assert_eq!(basic.warc_files,       full.warc_files);
+        assert_eq!(basic.oldest_timestamp, full.oldest_timestamp);
+        assert_eq!(basic.newest_timestamp, full.newest_timestamp);
+    }
+
+    #[test]
+    fn breakdowns_match_the_composed_stats() {
+        let store = store_with_samples();
+        let full = store.stats().unwrap();
+        assert_eq!(store.mime_counts().unwrap(),   full.mime_counts);
+        assert_eq!(store.status_counts().unwrap(), full.status_counts);
+    }
+
+    #[test]
+    fn open_readonly_reads_but_cannot_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cdx.db");
+        let p = path.to_str().unwrap();
+        {
+            let store = CdxStore::open(p).unwrap();
+            store.upsert(&sample("com,example)/", "20240101120000", "https://example.com/")).unwrap();
+        }
+
+        let ro = CdxStore::open_readonly(p).unwrap();
+        assert_eq!(ro.basic_stats().unwrap().total_records, 1);
+        // The schema is not touched on open, and writes are refused — which is
+        // what keeps these connections from ever contending with the indexer.
+        assert!(ro.upsert(&sample("org,other)/", "20240101120000", "https://other.org/")).is_err());
+    }
+
+    #[test]
+    fn several_readonly_connections_can_read_at_once() {
+        // The statistics page opens one per query and runs them concurrently.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cdx.db");
+        let p = path.to_str().unwrap();
+        {
+            let store = CdxStore::open(p).unwrap();
+            store.upsert(&sample("com,example)/", "20240101120000", "https://example.com/")).unwrap();
+        }
+        let a = CdxStore::open_readonly(p).unwrap();
+        let b = CdxStore::open_readonly(p).unwrap();
+        let c = CdxStore::open_readonly(p).unwrap();
+        assert_eq!(a.basic_stats().unwrap().total_records, 1);
+        assert_eq!(b.mime_counts().unwrap().len(), 1);
+        assert_eq!(c.status_counts().unwrap().len(), 1);
+    }
+
     fn store_with_samples() -> CdxStore {
         let mut store = CdxStore::open_in_memory().unwrap();
         let records = vec![
@@ -1012,6 +1193,36 @@ mod tests {
         let deleted = store.delete_by_s3_key("nonexistent.warc.gz").unwrap();
         assert_eq!(deleted, 0);
         assert_eq!(store.count().unwrap(), 6);
+    }
+
+    #[test]
+    fn urls_matching_returns_each_surt_once() {
+        let store = store_with_samples();
+        // "/page" has two captures; the pair must come back once.
+        let hits = store.urls_matching(|u| u.contains("/page")).unwrap();
+        assert_eq!(
+            hits,
+            vec![("com,example)/page".to_owned(), "https://example.com/page".to_owned())],
+        );
+    }
+
+    #[test]
+    fn urls_matching_that_selects_nothing_is_empty() {
+        let store = store_with_samples();
+        assert!(store.urls_matching(|u| u.contains("action=edit")).unwrap().is_empty());
+    }
+
+    #[test]
+    fn delete_by_surt_urls_removes_every_capture() {
+        let mut store = store_with_samples();
+        let hits = store.urls_matching(|u| u.contains("/page")).unwrap();
+        let surts: Vec<String> = hits.into_iter().map(|(s, _)| s).collect();
+
+        // Both captures of /page go, the three of / and the other.org row stay.
+        assert_eq!(store.delete_by_surt_urls(&surts).unwrap(), 2);
+        assert_eq!(store.count().unwrap(), 4);
+        // Idempotent: a second pass finds nothing left.
+        assert_eq!(store.delete_by_surt_urls(&surts).unwrap(), 0);
     }
 
     // ── helpers ───────────────────────────────────────────────────────────────

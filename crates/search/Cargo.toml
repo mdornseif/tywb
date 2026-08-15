@@ -7,9 +7,11 @@ authors.workspace = true
 license.workspace = true
 
 [dependencies]
-tantivy   = { workspace = true }
-thiserror = { workspace = true }
-serde     = { workspace = true }
+tantivy    = { workspace = true }
+thiserror  = { workspace = true }
+serde      = { workspace = true }
+serde_json = { workspace = true }
+tracing    = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

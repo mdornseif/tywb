@@ -56,6 +56,9 @@ chrono = { workspace = true }
 # blocking HTTP (Tika client)
 ureq = { workspace = true }
 
+# URL skip patterns (domain → regex for the Zeno export)
+regex = { workspace = true }
+
 # misc
 bytes = { workspace = true }
 

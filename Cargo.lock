@@ -3183,6 +3183,7 @@ dependencies = [
  "clap",
  "flate2",
  "futures-util",
+ "regex",
  "serde",
  "serde_json",
  "sha2",
@@ -3346,6 +3347,7 @@ dependencies = [
 name = "warc-search-config"
 version = "0.1.0"
 dependencies = [
+ "regex",
  "serde",
  "serde_yaml",
  "thiserror",
@@ -3375,9 +3377,11 @@ name = "warc-search-search"
 version = "0.1.0"
 dependencies = [
  "serde",
+ "serde_json",
  "tantivy",
  "tempfile",
  "thiserror",
+ "tracing",
 ]
 
 [[package]]

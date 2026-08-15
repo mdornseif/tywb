@@ -1,0 +1,160 @@
+# skip-urls.txt — URL patterns for tywb's skip list.
+#
+# The second half of the skip list. Where the domain list drops a whole site,
+# these drop a *kind of page* on sites that are otherwise worth keeping: the
+# talk pages, version histories and edit links that every wiki hangs off each
+# article, the parameters that serve the same page again under a new URL, and
+# the addresses that were never public to begin with. The article itself is
+# matched by none of them and stays.
+#
+# Wire it up with:
+#     indexer:
+#       blacklisted_url_patterns_path: "/etc/tywb/skip-urls.txt"
+#
+# One regular expression per line, matched against the whole URL. Patterns are
+# unanchored — they match anywhere unless you write `^`. Blank lines and lines
+# starting with `#` are ignored; a trailing `#` is NOT a comment, because `#`
+# is a regex character (`[?&#]`) and truncating a pattern would silently widen
+# it.
+#
+# The syntax is RE2 (Rust's `regex` crate, Go's `regexp`): no backreferences,
+# no lookaround. That is deliberate — this file is the single source for both
+# ends of the pipeline. `GET /skiplist.zeno` on the tywb server serves it as an
+# exclusion list for the Zeno crawler, so one rule keeps cruft out of the crawl
+# *and* out of the index. `/ui/skiplist` shows what is currently in force.
+#
+# A pattern here acts in three places at once: records are skipped at ingest,
+# matching captures are purged from CDX and the fulltext index on the next
+# `tywb index` run, and matches are hidden from search results immediately.
+# The purge deletes index entries, never WARC bytes — the captures are still in
+# the archive, and removing a line here plus a re-index brings them back.
+#
+# Keep patterns narrow. A pattern that matches too much costs content silently.
+# A pattern that matches the empty string is rejected at startup: it would
+# match every URL and purge the whole index.
+
+# ══ Rules shared with the crawler ═════════════════════════════════════════════
+# Everything below this line down to the MediaWiki section came from Zeno's
+# hand-written exclusion file. It lives here now because the flow only works in
+# one direction: tywb serves the list, the crawler consumes it. Anything kept
+# only on the crawler side would be a second, drifting copy.
+#
+# Zeno's file also carried rules for MediaWiki actions, `Spezial:`/`Special:`
+# and `diff=`/`oldid=`/`printable=`. Those are not repeated here — the
+# MediaWiki sections further down already cover them, and more thoroughly.
+
+# ── Addresses that were never public ──────────────────────────────────────────
+# A crawl seeded from browser history picks these up: router config pages, a
+# NAS on the LAN, a dev server on localhost. They are nobody's archive, and
+# several of them are somebody's private data. This is the one group where a
+# match should be treated as a mistake to be purged, not as noise to be tidied.
+^https?://localhost([:/]|$)
+^https?://127\.[0-9]+\.[0-9]+\.[0-9]+([:/]|$)
+^https?://0\.0\.0\.0([:/]|$)
+^https?://10\.[0-9]+\.[0-9]+\.[0-9]+([:/]|$)
+^https?://192\.168\.[0-9]+\.[0-9]+([:/]|$)
+^https?://169\.254\.[0-9]+\.[0-9]+([:/]|$)
+^https?://172\.(1[6-9]|2[0-9]|3[01])\.[0-9]+\.[0-9]+([:/]|$)
+^https?://\[::1\]
+^https?://\[[fF][cCdD][0-9a-fA-F]{2}:
+^https?://\[[fF][eE][89abAB][0-9a-fA-F]:
+^https?://[^/:]+\.(local|lan|internal|intern|home\.arpa|test|invalid|localdomain|onion)([:/]|$)
+
+# ── Endpoints that hold no content ────────────────────────────────────────────
+# Logging in and out: session debris, and often an endless chain.
+(?i)/(logout|log-out|signout|sign-out|abmelden|deconnexion)(/|\?|$)
+(?i)[?&](do=)?logout
+(?i)/wp-login\.php
+(?i)/wp-admin/
+(?i)/xmlrpc\.php
+
+# ── The same page again under a different URL ─────────────────────────────────
+# WordPress renders one URL per comment reply.
+(?i)[?&]replytocom=
+# Calendars run on for ever.
+(?i)[?&](calendar|cal_action|month|ical)=
+(?i)/events/[0-9]{4}-[0-9]{2}/
+# Sort and filter parameters multiply one listing into hundreds. The widest
+# rules in this file: `order=` and `sort=` are ordinary words, and a site that
+# uses them for something other than a re-sorted listing loses those captures.
+(?i)[?&](orderby|order|sort|sortby|filter_|add-to-cart|shopping_cart)=
+# Session IDs — a throwaway URL for a page that also exists without one.
+(?i)[?&](phpsessid|jsessionid|sid|sessionid)=
+
+# ── Share buttons ─────────────────────────────────────────────────────────────
+# Links *to* a social network about a page, not the page.
+(?i)^https?://([^/]+\.)?(facebook|twitter|x)\.com/(sharer|share|intent)
+(?i)^https?://([^/]+\.)?(addtoany|addthis|sharethis|pinterest)\.com/
+(?i)^https?://([^/]+\.)?linkedin\.com/(share|sharing)
+(?i)^https?://([^/]+\.)?reddit\.com/submit
+(?i)^https?://([^/]+\.)?web\.archive\.org/save/
+
+# ══ Wiki cruft ════════════════════════════════════════════════════════════════
+
+# ── MediaWiki: actions ────────────────────────────────────────────────────────
+# Every article carries a fan of `action=` links. They render the same content
+# as a form, a diff or raw wikitext, or they mutate state. The plain article URL
+# is archived separately, so nothing is lost.
+#
+# The same parameter name is used by MoinMoin and PmWiki, whose verbs are
+# folded into the same rule.
+(?i)[?&]action=(edit|editredlink|submit|history|historysubmit|raw|purge|delete|undelete|protect|unprotect|watch|unwatch|rollback|revert|revisiondelete|markpatrolled|credits|info|render|print|source|mcrundo|mcrrestore|visualeditor|dt|feedcontributions|AttachFile|fullsearch|titleindex|recall|refresh|subscribe|userprefs|login|logout)\b
+(?i)[?&]veaction=(edit|editsource)\b
+
+# ── MediaWiki: revisions, diffs and duplicate renderings ──────────────────────
+# Permalinks into the version history, and parameters that re-render an article
+# that is already archived under its canonical URL.
+(?i)[?&](oldid|diff|curid|undo|undoafter|action_digest)=
+# `direction=` is MediaWiki's step through the history, but also a perfectly
+# ordinary sort parameter — so only its two wiki values are matched.
+(?i)[?&]direction=(next|prev)\b
+(?i)[?&](printable|mobileaction|useskin|uselang|safemode|dtenable|withCSS|withJS|ctype)=
+(?i)[?&]redlink=1
+(?i)[?&]feed=(atom|rss)\b
+(?i)[?&]returnto(title)?=
+
+# ── MediaWiki: namespaces that are not content ────────────────────────────────
+# Matched after a `/` or a `title=`, so all three URL shapes are covered:
+# `/wiki/Diskussion:Apfel`, `/index.php/Diskussion:Apfel` and
+# `/w/index.php?title=Diskussion:Apfel`. `%3a` is the encoded colon.
+#
+# Talk namespaces, single-word (Diskussion:, Talk:) …
+(?i)(/|[?&]title=)(Diskussion|Talk)(:|%3a)
+# … and two-word (Benutzer Diskussion:, User talk:, Vorlage Diskussion: …),
+# where the space reaches us as `_`, `+` or `%20` — or, from a crawler that did
+# not encode it, as a literal space.
+(?i)(/|[?&]title=)(Benutzer(in)?|User|Wikipedia|Projekt|Project|Datei|File|Vorlage|Template|Hilfe|Help|Kategorie|Category|Portal|Modul|Module|MediaWiki|Entwurf|Draft)(_|\+|%20| )(Diskussion|Talk)(:|%3a)
+# Special pages: search, random, export, logs, contributions, watchlist,
+# upload, login — machinery, and several of them are infinite.
+(?i)(/|[?&]title=)(Spezial|Special)(:|%3a)
+# Interface messages, templates and Lua modules: wikitext and source code that
+# reads as noise in a fulltext index.
+(?i)(/|[?&]title=)(MediaWiki|Vorlage|Template|Modul|Module)(:|%3a)
+# User pages and everything below them — sandboxes, workbenches, vCards.
+# Someone's scratch space, not the wiki's content, and the one namespace most
+# likely to carry personal data nobody meant to publish twice.
+(?i)(/|[?&]title=)(Benutzer(in)?|User)(:|%3a)
+# Documentation about the wiki itself, project-internal pages and drafts.
+(?i)(/|[?&]title=)(Hilfe|Help|Wikipedia|Projekt|Project|Entwurf|Draft)(:|%3a)
+#
+# Deliberately NOT excluded: Kategorie:/Category:, Datei:/File: and Portal:.
+# Category and portal pages are how a wiki is browsed, and file description
+# pages carry captions, provenance and licence terms. Uncomment to drop them:
+#(?i)(/|[?&]title=)(Kategorie|Category|Datei|File|Portal)(:|%3a)
+
+# ── MediaWiki: endpoints that serve no page ───────────────────────────────────
+(?i)/(api|rest|load|opensearch_desc|thumb_handler|img_auth)\.php\b
+(?i)/index\.php\?search=
+
+# ── DokuWiki ──────────────────────────────────────────────────────────────────
+# The `do=` verb is DokuWiki's `action=`. `rev=` is a revision timestamp.
+(?i)[?&]do=(edit|preview|draft|draftdel|revisions|diff|recent|index|media|login|logout|profile|register|resendpwd|subscribe|unsubscribe|backlink|admin|check|search|revert|cancel|save|sitemap|export_[a-z0-9_]+)\b
+(?i)[?&]rev=[0-9]{6,}
+(?i)/_(detail|export)/
+# Not listed: `idx=`, which only expands the index tree — `do=index` already
+# covers that page, and `idx=` is too plain a name to claim for DokuWiki.
+
+# ── MoinMoin, PmWiki, Foswiki ─────────────────────────────────────────────────
+# `action=` is already covered above; these are the path-shaped equivalents.
+(?i)/bin/(edit|rdiff|oops|attach|manage|register|view/[^/]+/WebChanges)\b
+(?i)/(RecentChanges|FindPage|SiteIndex|WordIndex|TitleIndex|WebChanges|WebSearch)$

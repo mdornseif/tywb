@@ -12,6 +12,7 @@ Written in Rust. Runs on an ordinary Linux server or a headless macOS machine.
 warc-search/
 ├── Cargo.toml              # workspace root
 ├── config.yaml             # runtime configuration (see Configuration below)
+├── skip-urls.txt           # shipped URL skip patterns (wiki cruft, crawler traps)
 ├── CLAUDE.md               # this file
 └── crates/
     ├── warc/               # lib: WARC record types + streaming parser
@@ -148,6 +149,24 @@ Tantivy uses `mmap` for index segments — the OS page cache manages memory.
 RAM usage at idle is ~30 MB regardless of index size.
 Set `indexer.batch_size` higher to speed up ingest at the cost of peak RAM.
 
+### The index schema only ever grows, and old indexes keep working
+Tantivy stores its schema on disk and refuses an index whose schema differs from
+the one it is handed. Fields here have only ever been *appended* (`collection`),
+so the write path opens the index as it stands and reads the field handles back
+from it — `SearchIndex::with_heap`, the same thing `SearchReader::open` always
+did. An index that predates a field stays searchable and writable; the field is
+simply not written, which `add_document` and `search_impl` already handle, and
+startup logs which fields are missing and what that costs (a collection filter
+will not find the new documents; replay is unaffected, the collection lives in
+the CDX).
+
+Do **not** "fix" this by rewriting `meta.json` to append the field. Reads would
+work — and then the first background merge of a pre-field segment with a new one
+dies with `Field norm not found for field`, hours in. Anything but a pure
+suffix of missing fields (a rename, changed options) is refused at startup with
+the field named. `schema_compat` decides which case it is, and the merge is
+under test.
+
 ### Record-per-member `.warc.gz`
 Every part of the replay path assumes a `.warc.gz` stores **one gzip member per
 WARC record** — that is what makes a Range GET of a single record possible.
@@ -203,6 +222,38 @@ functions, not in the handler. The endpoint differs from the indexer in exactly
 two documented ways: it returns quality-gate-rejected OCR text (flagged) and it
 attempts truncated PDFs. See `server::extract_capture_text`.
 
+### One skip list, two halves, three places
+`indexer.blacklisted_domains` drops a whole site; `indexer.blacklisted_url_patterns`
+drops a kind of page on sites that are otherwise wanted — wiki talk pages,
+version histories, `action=edit`. Both are asked the same question through
+`IndexerConfig::is_url_blacklisted`, and that question is asked in three places:
+ingest skips the record, `tywb index` purges what is already stored, and the
+server filters search results at query time. Add a rule in one place and all
+three follow.
+
+Patterns are regexes compiled once into a `RegexSet` at startup — the test runs
+per record over multi-GB WARCs, so it must be one pass, not N. Nothing filters
+until `compile_url_patterns()` has run; a bad pattern is logged and dropped
+rather than fatal, and one that matches the empty string is refused outright,
+because it would match every URL and purge the entire index on the next run.
+The purge deletes index entries, never WARC bytes.
+
+The syntax is deliberately the RE2 subset both Rust's `regex` and Go's `regexp`
+accept, because tywb is the *source* of the list, not just a consumer of it:
+`GET /skiplist.zeno` serves it as an exclusion file for the Zeno crawler
+(`crates/tywb/src/skiplist.rs`), so one rule keeps cruft out of the crawl *and*
+out of the index. A crawl script `curl`s that URL before the run; there is no
+generator step and no second copy to drift. That is also why the crawler-side
+rules — private address ranges, logout chains, share buttons — now live in
+`skip-urls.txt` rather than in the crawler's own file.
+
+Exported is the list *in force* — the patterns that compiled. A rejected pattern
+filters nothing here and must not appear to filter anything there; `/ui/skiplist`
+names it separately instead.
+
+`skip-urls.txt` is the shipped list. It is content that decides what gets
+deleted, so `index.rs` tests it like code.
+
 ### Collections
 The primary WARC bucket is the implicit collection `warc`. `indexer.collections`
 adds further sources; type `pdf_bucket` indexes a bucket of standalone PDFs
@@ -257,6 +308,11 @@ cargo run --release -p tywb -- --config config.local.yaml recompress
 # 5. Size the re-index the wire-format fix needs (read-only; samples records)
 cargo run --release -p tywb -- --config config.local.yaml \
     scan-wire-format --sample 5 --out /var/tmp/affected.txt
+
+# 6. Inspect the skip list:   http://localhost:8080/ui/skiplist
+#    Hand it to the crawler — this is the whole handover, run it in the
+#    crawl script before Zeno starts:
+curl -o exclusions.txt http://localhost:8080/skiplist.zeno
 ```
 
 ---
@@ -280,5 +336,5 @@ CI should fail on any clippy warning. Run both before opening a PR.
 | `config`           | ✅ complete  | YAML + env var loading + full test suite|
 | `cdx`              | ✅ complete  | SURT, SQLite store, closest-match lookup, CDX builder from WarcRecord, `warc_files` metadata table |
 | `s3_store`         | ✅ complete  | Client builder, paginated listing, ETag state, streaming GET, Range GET |
-| `search`           | 🔲 stub      | Next: Tantivy schema, index, query      |
+| `search`           | ✅ complete  | Tantivy schema, writer + reader, timestamp filter, per-file replace, forward-compatible open of older schemas |
 | `tywb`             | 🔄 in progress | `index` working (streaming, throughput, SIGINFO, limits); `server` serving UI, `/search`, `/text`, replay, CDX; `stats` complete; `recompress` complete; `scan-wire-format` complete |

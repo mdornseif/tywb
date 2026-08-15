@@ -75,7 +75,9 @@ impl<R: Read> WarcReader<R> {
     }
 
     fn read_record_body(&mut self, version: WarcVersion) -> Result<WarcRecord> {
-        let record_offset = self.offset - /* version line already consumed */ 0;
+        // `self.offset` still points at the start of the record: the version
+        // line has been consumed but not yet counted.
+        let record_offset = self.offset;
 
         // ── Parse header fields ───────────────────────────────────────────────
         let mut fields: Vec<(String, String)> = Vec::new();

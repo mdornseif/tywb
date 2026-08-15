@@ -192,6 +192,43 @@ fn purge_domain(
     Ok(())
 }
 
+/// Remove every capture whose URL matches one of the configured URL skip
+/// patterns, from both CDX and the fulltext index, and commit.
+///
+/// The domain purge above can ask SQLite for a SURT prefix; a pattern cannot be
+/// expressed in SQL, so this scans the CDX table once and tests each URL in
+/// process. On a multi-million-row index that is seconds, against an index run
+/// measured in hours — but it is why the pass only runs when patterns are
+/// actually configured.
+fn purge_url_patterns(
+    indexer: &warc_search_config::IndexerConfig,
+    cdx: &mut CdxStore,
+    search: &mut SearchIndex,
+) -> anyhow::Result<()> {
+    let matches = cdx
+        .urls_matching(|url| indexer.matches_url_pattern(url))
+        .context("scanning CDX for URLs matching the skip patterns")?;
+    if matches.is_empty() {
+        return Ok(());
+    }
+
+    let (surts, urls): (Vec<String>, Vec<String>) = matches.into_iter().unzip();
+    let cdx_deleted = cdx
+        .delete_by_surt_urls(&surts)
+        .context("deleting CDX records matching the skip patterns")?;
+    let search_queued = search
+        .delete_urls(&urls)
+        .context("queuing search deletions for URLs matching the skip patterns")?;
+
+    info!(
+        urls = surts.len(),
+        cdx_deleted,
+        search_queued,
+        "purged URLs matching the skip patterns"
+    );
+    Ok(())
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 pub async fn run(cfg: Config, args: IndexArgs) -> anyhow::Result<()> {
@@ -207,9 +244,10 @@ pub async fn run(cfg: Config, args: IndexArgs) -> anyhow::Result<()> {
     let mut search = SearchIndex::open_or_create(&cfg.storage.index_path)
         .with_context(|| format!("opening search index at {}", cfg.storage.index_path))?;
 
-    // ── Purge blacklisted domains ─────────────────────────────────────────────
+    // ── Purge the skip list ───────────────────────────────────────────────────
     // Runs before any new ingest so blacklisted data is cleaned up even when
-    // there are no new WARC files to process.
+    // there are no new WARC files to process. Both halves of the list are
+    // purged: whole domains, and single pages matching a URL pattern.
 
     if !cfg.indexer.blacklisted_domains.is_empty() {
         let domains: Vec<String> = cfg.indexer.blacklisted_domains.clone();
@@ -218,6 +256,11 @@ pub async fn run(cfg: Config, args: IndexArgs) -> anyhow::Result<()> {
         }
         // Commit fulltext deletions in one pass.
         search.commit().context("committing fulltext deletions for blacklisted domains")?;
+    }
+
+    if !cfg.indexer.blacklisted_url_patterns.is_empty() {
+        purge_url_patterns(&cfg.indexer, &mut cdx, &mut search)?;
+        search.commit().context("committing fulltext deletions for blacklisted URL patterns")?;
     }
 
     // ── S3 ────────────────────────────────────────────────────────────────────
@@ -1406,5 +1449,127 @@ mod tests {
         assert_eq!(truncate_on_char_boundary(s.clone(), 11).len(), 10);
         assert_eq!(truncate_on_char_boundary(s.clone(), 12).len(), 10);
         assert_eq!(truncate_on_char_boundary(s, 13).len(), 13); // whole thing fits
+    }
+
+    // ── The shipped URL skip list ─────────────────────────────────────────────
+    // `skip-urls.txt` is content, not code, but it is content that decides what
+    // gets deleted from the index — so it is tested like code. This is also the
+    // guard on the RE2 subset the Zeno converter relies on: an expression the
+    // `regex` crate rejects would never have reached Go's `regexp` either.
+
+    /// Load the repository's `skip-urls.txt` into a compiled config.
+    fn shipped_skip_list() -> warc_search_config::IndexerConfig {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../skip-urls.txt");
+        let mut cfg = warc_search_config::IndexerConfig::default();
+        cfg.blacklisted_url_patterns_path = Some(path.to_owned());
+        cfg.load_url_patterns_file().expect("skip-urls.txt is readable");
+        let report = cfg.compile_url_patterns();
+        assert!(
+            report.rejected.is_empty(),
+            "shipped skip-urls.txt has unusable patterns: {:?}",
+            report.rejected,
+        );
+        assert!(report.compiled > 0, "shipped skip-urls.txt compiled to nothing");
+        cfg
+    }
+
+    #[test]
+    fn shipped_skip_list_drops_mediawiki_cruft() {
+        let cfg = shipped_skip_list();
+        for url in [
+            // Actions.
+            "https://de.wikipedia.org/w/index.php?title=Apfel&action=edit",
+            "https://de.wikipedia.org/w/index.php?title=Apfel&action=history",
+            "https://wiki.example.org/index.php?title=Apfel&action=raw&ctype=text/css",
+            "https://wiki.example.org/wiki/Apfel?veaction=edit",
+            // Revisions and duplicate renderings.
+            "https://de.wikipedia.org/w/index.php?title=Apfel&oldid=123456789",
+            "https://de.wikipedia.org/w/index.php?diff=prev&oldid=123456789",
+            "https://wiki.example.org/index.php?curid=42",
+            "https://wiki.example.org/wiki/Apfel?printable=yes",
+            "https://de.m.wikipedia.org/wiki/Apfel?mobileaction=toggle_view_desktop",
+            // Namespaces.
+            "https://de.wikipedia.org/wiki/Diskussion:Apfel",
+            "https://de.wikipedia.org/wiki/Benutzer_Diskussion:Beispiel",
+            "https://en.wikipedia.org/wiki/User_talk:Example",
+            "https://en.wikipedia.org/wiki/Talk:Apple",
+            "https://de.wikipedia.org/wiki/Spezial:Letzte_%C3%84nderungen",
+            "https://en.wikipedia.org/wiki/Special:Random",
+            "https://de.wikipedia.org/wiki/Vorlage:Infobox",
+            "https://de.wikipedia.org/wiki/MediaWiki:Common.css",
+            "https://de.wikipedia.org/wiki/Hilfe:Bearbeiten",
+            // User pages, their subpages, and both spellings of the namespace.
+            "https://de.wikipedia.org/wiki/Benutzer:Beispiel",
+            "https://de.wikipedia.org/wiki/Benutzer:Beispiel/Werkstatt",
+            "https://de.wikipedia.org/wiki/Benutzerin:Beispiel",
+            "https://en.wikipedia.org/wiki/User:Example/sandbox",
+            "https://de.wikipedia.org/w/index.php?title=Benutzer%3ABeispiel",
+            // A crawler that left the namespace separator unencoded.
+            "https://de.wikipedia.org/wiki/Benutzer Diskussion:Beispiel",
+            "https://wiki.example.org/index.php/Diskussion:Apfel",
+            "https://wiki.example.org/w/index.php?title=Diskussion:Apfel",
+            "https://wiki.example.org/w/index.php?title=Spezial%3ASuche",
+            // Endpoints.
+            "https://de.wikipedia.org/w/api.php?action=query&titles=Apfel",
+            "https://wiki.example.org/w/load.php?modules=startup",
+            // DokuWiki.
+            "https://wiki.example.org/doku.php?id=obst:apfel&do=edit",
+            "https://wiki.example.org/doku.php?id=obst:apfel&rev=1699999999",
+        ] {
+            assert!(cfg.is_url_blacklisted(url), "should have been skipped: {url}");
+        }
+    }
+
+    #[test]
+    fn shipped_skip_list_drops_what_the_crawler_also_refuses() {
+        // The rules adopted from Zeno's exclusion file. tywb serves the list to
+        // the crawler, so both ends must agree on them.
+        let cfg = shipped_skip_list();
+        for url in [
+            // Addresses that were never public.
+            "http://localhost:8080/admin",
+            "http://127.0.0.1/status",
+            "http://192.168.1.1/cgi-bin/luci",
+            "http://10.0.0.5/nas",
+            "http://172.16.4.2/",
+            "http://[::1]:9000/",
+            "http://fritz.box.local/",
+            "https://nas.internal/photos",
+            // Endpoints that hold no content.
+            "https://example.org/wp-login.php",
+            "https://example.org/wp-admin/",
+            "https://example.org/xmlrpc.php",
+            "https://example.org/abmelden/",
+            // The same page again under a different URL.
+            "https://example.org/post?replytocom=17",
+            "https://example.org/shop/aepfel?orderby=price",
+            "https://example.org/seite?PHPSESSID=deadbeef",
+            "https://example.org/termine?month=2026-08",
+            // Share buttons.
+            "https://www.facebook.com/sharer/sharer.php?u=https://example.org/",
+            "https://twitter.com/intent/tweet?url=https://example.org/",
+            "https://web.archive.org/save/https://example.org/",
+        ] {
+            assert!(cfg.is_url_blacklisted(url), "should have been skipped: {url}");
+        }
+    }
+
+    #[test]
+    fn shipped_skip_list_keeps_the_articles() {
+        let cfg = shipped_skip_list();
+        for url in [
+            "https://de.wikipedia.org/wiki/Apfel",
+            "https://de.wikipedia.org/wiki/Kategorie:Kernobst",
+            "https://de.wikipedia.org/wiki/Datei:Boskoop.jpg",
+            "https://de.wikipedia.org/wiki/Portal:Essen_und_Trinken",
+            "https://wiki.example.org/doku.php?id=obst:apfel",
+            "https://wiki.example.org/w/index.php?title=Roter_Berlepsch",
+            // Ordinary sites that merely use wiki-ish words.
+            "https://pomologen-verein.de/sortenerhalt/geschichte-der-diskussion",
+            "https://obstsortendatenbank.de/talk-mit-dem-pomologen",
+            "https://biostationeuskirchen.de/downloads/streuobst-historie.pdf",
+        ] {
+            assert!(!cfg.is_url_blacklisted(url), "should have been kept: {url}");
+        }
     }
 }

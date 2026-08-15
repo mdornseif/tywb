@@ -119,7 +119,19 @@ impl PdfExtractor {
                       "PDF text rejected by quality gate (likely OCR noise)");
                 None
             }
-            Err(e @ (ExtractError::TooLarge { .. } | ExtractError::Truncated)) => {
+            // A size limit is a configuration decision that silently drops a
+            // whole document, and the documents it drops are the big scans —
+            // often the most valuable ones. Say so at WARN with the number to
+            // raise: a quiet skip looks like full coverage in the result.
+            Err(e @ ExtractError::TooLarge { .. }) => {
+                warn!(url, bytes = pdf.len(), reason = %e,
+                      "PDF skipped — raise indexer.tika.max_pdf_bytes to index it");
+                None
+            }
+            // Truncation, by contrast, is a property of the capture itself and
+            // affects whole crawls at a time (CommonCrawl caps PDFs at ~1 MiB).
+            // At WARN it would drown out everything else.
+            Err(e @ ExtractError::Truncated) => {
                 debug!(url, bytes = pdf.len(), reason = %e, "PDF skipped");
                 None
             }

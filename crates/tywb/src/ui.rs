@@ -10,7 +10,7 @@
 
 use std::collections::HashMap;
 
-use warc_search_cdx::{CdxRecord, CdxStats, WarcFileRow};
+use warc_search_cdx::{BasicStats, CdxRecord, WarcFileRow};
 use warc_search_search::SearchHit;
 
 // ── CSS ───────────────────────────────────────────────────────────────────────
@@ -268,6 +268,8 @@ fn page_html(title: &str, active: &str, content: &str) -> String {
     nav_link(&mut out, "/ui/browse",  "Browse",     active == "browse");
     nav_link(&mut out, "/ui/url",     "By URL",     active == "url");
     nav_link(&mut out, "/ui/files",   "WARC Files", active == "files");
+    nav_link(&mut out, "/ui/skiplist", "Skip List", active == "skiplist");
+    nav_link(&mut out, "/ui/stats",   "Statistics", active == "stats");
     out.push_str("    <span class=\"nav-right\">");
     out.push_str("<a href=\"/api/stats\">API</a>");
     out.push_str("</span>\n");
@@ -350,8 +352,16 @@ fn short_mime<'a>(mime: Option<&'a str>) -> &'a str {
 
 // ── Homepage ──────────────────────────────────────────────────────────────────
 
-pub fn homepage_html(stats: &CdxStats, num_docs: u64, collections: &[(String, u64)]) -> String {
-    let mut c = String::with_capacity(8192);
+/// The homepage.
+///
+/// Deliberately built from scalar counts alone — no `GROUP BY` runs here. The
+/// breakdowns this page used to carry (content types, HTTP status, collections)
+/// cost seconds each on a large archive, and because every handler shares one
+/// SQLite connection, that cost was charged to replay and search as well as to
+/// whoever loaded `/`. They live on [`stats_html`] now, which runs them
+/// concurrently on connections of its own.
+pub fn homepage_html(stats: &BasicStats, num_docs: u64) -> String {
+    let mut c = String::with_capacity(4096);
 
     // ── Stat cards ────────────────────────────────────────────────────────
     c.push_str("<div class=\"stat-grid\">\n");
@@ -361,30 +371,14 @@ pub fn homepage_html(stats: &CdxStats, num_docs: u64, collections: &[(String, u6
     stat_card(&mut c, &fmt_count(num_docs),            "Fulltext docs");
     c.push_str("</div>\n");
 
-    // ── Collections ───────────────────────────────────────────────────────
-    // Only worth showing once there is more than the default WARC archive.
-    if collections.iter().any(|(name, _)| name != "warc") {
-        c.push_str("<div class=\"coll-section\">\n<h2>Collections</h2>\n<div class=\"coll-row\">\n");
-        for (name, n) in collections {
-            c.push_str("  <a class=\"coll-card\" href=\"/ui/search?q=&collection=");
-            push_url_encoded(&mut c, name);
-            c.push_str("\">\n    <span class=\"coll-name\">");
-            push_esc(&mut c, name);
-            c.push_str("</span>\n    <span class=\"coll-cnt\">");
-            push_esc(&mut c, &fmt_count(*n));
-            c.push_str("</span>\n  </a>\n");
-        }
-        c.push_str("</div>\n</div>\n");
-    }
-
     // ── Date coverage ─────────────────────────────────────────────────────
     match (&stats.oldest_timestamp, &stats.newest_timestamp) {
         (Some(a), Some(b)) => {
             c.push_str("<div class=\"coverage\">Archive coverage: <strong>");
             push_esc(&mut c, &fmt_ts(a));
-            c.push_str("</strong> &nbsp;→&nbsp; <strong>");
+            c.push_str("</strong> &nbsp;\u{2192}&nbsp; <strong>");
             push_esc(&mut c, &fmt_ts(b));
-            c.push_str("</strong></div>\n");
+            c.push_str("</strong> &nbsp;\u{00b7}&nbsp; <a href=\"/ui/stats\">Collections, content types and status codes</a></div>\n");
         }
         _ => {
             c.push_str("<div class=\"coverage\">No data indexed yet. Run <code>tywb index</code> to ingest WARC files.</div>\n");
@@ -416,11 +410,53 @@ pub fn homepage_html(stats: &CdxStats, num_docs: u64, collections: &[(String, u6
 
     c.push_str("</div>\n"); // end cols
 
+    page_html("Home", "home", &c)
+}
+
+/// The statistics page: everything the homepage no longer computes.
+///
+/// `elapsed_ms` is how long the queries took *together*, which is roughly the
+/// slowest one rather than their sum — they run concurrently, each on its own
+/// read-only connection. It is shown because it is the number that decides
+/// whether this page ever belongs on the request path of something else.
+pub fn stats_html(
+    stats: &BasicStats,
+    num_docs: u64,
+    collections: &[(String, u64)],
+    mime_counts: &[(String, u64)],
+    status_counts: &[(Option<u16>, u64)],
+    elapsed_ms: u128,
+) -> String {
+    let mut c = String::with_capacity(8192);
+
+    c.push_str("<div class=\"stat-grid\">\n");
+    stat_card(&mut c, &fmt_count(stats.total_records), "CDX records");
+    stat_card(&mut c, &fmt_count(stats.unique_urls),   "Unique URLs");
+    stat_card(&mut c, &fmt_count(stats.warc_files),    "WARC files");
+    stat_card(&mut c, &fmt_count(num_docs),            "Fulltext docs");
+    c.push_str("</div>\n");
+
+    // ── Collections ───────────────────────────────────────────────────────
+    // Only worth showing once there is more than the default WARC archive.
+    if collections.iter().any(|(name, _)| name != "warc") {
+        c.push_str("<div class=\"coll-section\">\n<h2>Collections</h2>\n<div class=\"coll-row\">\n");
+        for (name, n) in collections {
+            c.push_str("  <a class=\"coll-card\" href=\"/ui/search?q=&collection=");
+            push_url_encoded(&mut c, name);
+            c.push_str("\">\n    <span class=\"coll-name\">");
+            push_esc(&mut c, name);
+            c.push_str("</span>\n    <span class=\"coll-cnt\">");
+            push_esc(&mut c, &fmt_count(*n));
+            c.push_str("</span>\n  </a>\n");
+        }
+        c.push_str("</div>\n</div>\n");
+    }
+
     // ── Content types breakdown ───────────────────────────────────────────
-    if !stats.mime_counts.is_empty() {
-        let max_n = stats.mime_counts.first().map(|(_, n)| *n).unwrap_or(1).max(1);
+    if !mime_counts.is_empty() {
+        let max_n = mime_counts.first().map(|(_, n)| *n).unwrap_or(1).max(1);
         c.push_str("<div class=\"mime-section\">\n<h2>Content types</h2>\n");
-        for (mime, count) in stats.mime_counts.iter().take(12) {
+        for (mime, count) in mime_counts.iter().take(12) {
             let pct = (*count as f64 / max_n as f64 * 100.0) as u32;
             c.push_str("  <div class=\"mime-row\">\n    <div>\n      <div style=\"font-size:.8rem\">");
             push_esc(&mut c, mime);
@@ -434,10 +470,10 @@ pub fn homepage_html(stats: &CdxStats, num_docs: u64, collections: &[(String, u6
     }
 
     // ── HTTP status breakdown ─────────────────────────────────────────────
-    if !stats.status_counts.is_empty() {
+    if !status_counts.is_empty() {
         c.push_str("<div class=\"form-card\" style=\"margin-bottom:1.25rem\">\n<h2>HTTP status codes</h2>\n");
         c.push_str("<div style=\"display:flex;gap:1rem;flex-wrap:wrap;margin-top:.25rem\">\n");
-        for (status, count) in &stats.status_counts {
+        for (status, count) in status_counts {
             let sc  = status_class(*status);
             let ss  = status_str(*status);
             c.push_str("  <div style=\"display:flex;align-items:center;gap:.4rem\">\n");
@@ -452,7 +488,11 @@ pub fn homepage_html(stats: &CdxStats, num_docs: u64, collections: &[(String, u6
         c.push_str("</div>\n</div>\n");
     }
 
-    page_html("Home", "home", &c)
+    c.push_str("<div class=\"coverage\">Four aggregate queries over the whole CDX table, run in parallel: <strong>");
+    push_esc(&mut c, &elapsed_ms.to_string());
+    c.push_str("\u{202f}ms</strong>. They are kept off the homepage for that reason.</div>\n");
+
+    page_html("Statistics", "stats", &c)
 }
 
 fn stat_card(out: &mut String, value: &str, label: &str) {
@@ -1203,6 +1243,124 @@ pub fn push_url_encoded(out: &mut String, s: &str) {
 
 const HEX: &[u8; 16] = b"0123456789ABCDEF";
 
+// ── /ui/skiplist — what never enters the index ───────────────────────────────
+
+/// Render the skip list: the domains and URL patterns in force, what they do,
+/// and a link to the same list in the crawler's format.
+///
+/// Shows the list the server is *actually applying* — the patterns that
+/// compiled. Anything configured but rejected at startup is called out
+/// separately, because a rule that silently does nothing is worse than no rule.
+pub fn skiplist_html(
+    domains: &[String],
+    source_lines: &[String],
+    active_patterns: &[String],
+    rejected: &[String],
+) -> String {
+    let mut c = String::with_capacity(4096 + source_lines.len() * 96);
+
+    c.push_str("<h1 style=\"font-size:1.15rem;font-weight:700;margin-bottom:.35rem\">Skip list</h1>\n");
+    c.push_str(
+        "<p style=\"color:var(--muted);font-size:.875rem;margin-bottom:1rem;max-width:60rem\">\
+         What never enters the index. A match is skipped during ingest, purged from CDX and \
+         the fulltext index on the next <code>tywb index</code> run, and hidden from search \
+         results straight away. Index entries only — the captures stay in the WARC files, so \
+         removing a rule and re-indexing brings them back.</p>\n",
+    );
+
+    // Download row.
+    c.push_str("<div style=\"display:flex;gap:.5rem;align-items:center;flex-wrap:wrap;margin-bottom:1.25rem\">\n");
+    c.push_str(
+        "  <a href=\"/skiplist.zeno\" download style=\"padding:.4rem .8rem;background:var(--navy);\
+         color:#fff;border-radius:6px;font-size:.85rem;font-weight:600;text-decoration:none\">\
+         \u{2b07} Download for Zeno</a>\n",
+    );
+    c.push_str(
+        "  <a href=\"/skiplist.zeno?inline=1\" style=\"padding:.4rem .8rem;border:1px solid #d5dae5;\
+         border-radius:6px;font-size:.85rem;text-decoration:none;color:var(--navy)\">View as text</a>\n",
+    );
+    c.push_str(
+        "  <span style=\"color:var(--muted);font-size:.8rem\">an exclusion file for \
+         <code>Zeno --exclusion-file</code></span>\n",
+    );
+    c.push_str("</div>\n");
+
+    // Counts.
+    c.push_str("<div class=\"stat-grid\" style=\"margin-bottom:1.25rem\">\n");
+    stat_card(&mut c, &fmt_count(domains.len() as u64), "domains");
+    stat_card(&mut c, &fmt_count(active_patterns.len() as u64), "URL patterns");
+    if !rejected.is_empty() {
+        stat_card(&mut c, &fmt_count(rejected.len() as u64), "rejected");
+    }
+    c.push_str("</div>\n");
+
+    if !rejected.is_empty() {
+        c.push_str("<div class=\"error\" style=\"margin-bottom:1.25rem\">\n");
+        c.push_str("  <strong>Not in force.</strong> These were configured but did not compile, \
+                    or would have matched every URL. They filter nothing, here or in the crawler:\n");
+        c.push_str("  <ul style=\"margin:.5rem 0 0 1.1rem\">\n");
+        for pattern in rejected {
+            c.push_str("    <li><code>");
+            push_esc(&mut c, pattern);
+            c.push_str("</code></li>\n");
+        }
+        c.push_str("  </ul>\n</div>\n");
+    }
+
+    // URL patterns, with the comments they were written with.
+    c.push_str("<h2 style=\"font-size:.95rem;font-weight:700;margin:0 0 .5rem\">URL patterns</h2>\n");
+    if active_patterns.is_empty() {
+        c.push_str("<div class=\"empty\">No URL patterns configured.</div>\n");
+    } else {
+        c.push_str(
+            "<pre style=\"background:#fff;border:1px solid #e3e7ef;border-radius:8px;padding:.9rem 1rem;\
+             overflow-x:auto;font-size:.8rem;line-height:1.55;margin-bottom:1.5rem\">",
+        );
+        let active: std::collections::HashSet<&str> =
+            active_patterns.iter().map(String::as_str).collect();
+        if source_lines.is_empty() {
+            for pattern in active_patterns {
+                push_esc(&mut c, pattern);
+                c.push('\n');
+            }
+        } else {
+            for line in source_lines {
+                if line.is_empty() {
+                    c.push('\n');
+                } else if line.starts_with('#') {
+                    c.push_str("<span style=\"color:#8b93a7\">");
+                    push_esc(&mut c, line);
+                    c.push_str("</span>\n");
+                } else if active.contains(line.as_str()) {
+                    push_esc(&mut c, line);
+                    c.push('\n');
+                }
+            }
+        }
+        c.push_str("</pre>\n");
+    }
+
+    // Domains.
+    c.push_str("<h2 style=\"font-size:.95rem;font-weight:700;margin:0 0 .5rem\">Domains</h2>\n");
+    if domains.is_empty() {
+        c.push_str("<div class=\"empty\">No domains blocked.</div>\n");
+    } else {
+        c.push_str(
+            "<p style=\"color:var(--muted);font-size:.8rem;margin-bottom:.5rem\">\
+             Each covers the domain and every subdomain of it.</p>\n",
+        );
+        c.push_str("<div class=\"browse-grid\">\n");
+        for domain in domains {
+            c.push_str("  <div class=\"browse-card\"><span class=\"domain\">");
+            push_esc(&mut c, domain);
+            c.push_str("</span></div>\n");
+        }
+        c.push_str("</div>\n");
+    }
+
+    page_html("Skip list", "skiplist", &c)
+}
+
 // ── API stats response struct (re-exported for server.rs) ─────────────────────
 
 #[derive(serde::Serialize)]
@@ -1230,6 +1388,67 @@ pub struct ApiSearchStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn basic() -> BasicStats {
+        BasicStats {
+            total_records:    4_135_367,
+            unique_urls:      2_000_000,
+            warc_files:       637,
+            oldest_timestamp: Some("20200101120000".to_owned()),
+            newest_timestamp: Some("20260811120000".to_owned()),
+        }
+    }
+
+    // ── Homepage: counts only ─────────────────────────────────────────────
+
+    #[test]
+    fn homepage_shows_the_counts() {
+        let html = homepage_html(&basic(), 2_053_279);
+        assert!(html.contains("CDX records"));
+        assert!(html.contains("WARC files"));
+        assert!(html.contains("Fulltext docs"));
+    }
+
+    #[test]
+    fn homepage_carries_no_group_by_output() {
+        // The point of the split: nothing here may need a GROUP BY. If a
+        // breakdown creeps back onto this page, the query behind it comes with
+        // it, and it is charged to replay and search too — one shared SQLite
+        // connection.
+        let html = homepage_html(&basic(), 2_053_279);
+        assert!(!html.contains("Content types"), "mime breakdown is a GROUP BY");
+        assert!(!html.contains("HTTP status codes"), "status breakdown is a GROUP BY");
+        // Match the rendered element, not the stylesheet, which every page carries.
+        assert!(!html.contains("<h2>Collections</h2>"), "collection counts are a GROUP BY");
+        assert!(html.contains("href=\"/ui/stats\""), "but it must link to where they live");
+    }
+
+    // ── Statistics page: the expensive half ───────────────────────────────
+
+    #[test]
+    fn stats_page_shows_every_breakdown() {
+        let html = stats_html(
+            &basic(),
+            2_053_279,
+            &[("warc".to_owned(), 4_135_367), ("monatshefte".to_owned(), 54)],
+            &[("text/html".to_owned(), 3_000_000), ("application/pdf".to_owned(), 12_000)],
+            &[(Some(200), 3_500_000), (Some(404), 12_000), (None, 3)],
+            2941,
+        );
+        assert!(html.contains("Content types"));
+        assert!(html.contains("text/html"));
+        assert!(html.contains("HTTP status codes"));
+        assert!(html.contains("Collections"));
+        assert!(html.contains("monatshefte"));
+        // The cost is on the page, because it is the number that justifies the split.
+        assert!(html.contains("2941"));
+    }
+
+    #[test]
+    fn stats_page_hides_collections_when_there_is_only_the_archive() {
+        let html = stats_html(&basic(), 1, &[("warc".to_owned(), 10)], &[], &[], 5);
+        assert!(!html.contains("<h2>Collections</h2>"));
+    }
 
     fn hit(url: &str, ts: &str, title: &str) -> SearchHit {
         SearchHit {
@@ -1350,6 +1569,42 @@ mod tests {
         // No hostname card may point back at the hostname listing.
         assert!(!html.contains("browse-card\" href=\"/ui/browse?domain="),
                 "a hostname card still links to the domain level");
+    }
+
+    #[test]
+    fn skiplist_page_shows_the_list_in_force_and_what_is_not() {
+        let html = skiplist_html(
+            &["instagram.com".to_owned()],
+            &[
+                "# ── wiki ──".to_owned(),
+                r"(?i)/wiki/Diskussion:".to_owned(),
+                "[unclosed".to_owned(), // in the file, but never compiled
+            ],
+            &[r"(?i)/wiki/Diskussion:".to_owned()],
+            &["[unclosed".to_owned()],
+        );
+
+        assert!(html.contains("instagram.com"));
+        assert!(html.contains("── wiki ──"), "section comments are kept");
+        assert!(html.contains("/wiki/Diskussion:"));
+        // The rejected pattern appears once, in the warning — never in the
+        // listing, where it would read as a rule that is doing something.
+        assert!(html.contains("Not in force."));
+        assert_eq!(html.matches("[unclosed").count(), 1, "{html}");
+        // Both ways to get the list out are offered.
+        assert!(html.contains("href=\"/skiplist.zeno\" download"));
+        assert!(html.contains("/skiplist.zeno?inline=1"));
+    }
+
+    #[test]
+    fn skiplist_page_escapes_patterns_into_html() {
+        // Patterns are full of `&`, `<` and quotes; none of it may reach the
+        // page as markup.
+        let pattern = r#"(?i)[?&]a=<b>&"x""#.to_owned();
+        let html = skiplist_html(&[], &[], std::slice::from_ref(&pattern), &[]);
+        assert!(!html.contains("<b>"), "raw markup leaked into the page");
+        assert!(html.contains("&lt;b&gt;"));
+        assert!(html.contains("&amp;"));
     }
 
     #[test]

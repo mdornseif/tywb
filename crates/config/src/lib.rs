@@ -33,6 +33,7 @@
 //! | `RUST_LOG`                  | `log.level`                   |
 
 use std::path::Path;
+use regex::{Regex, RegexSet};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -57,6 +58,7 @@ pub type Result<T> = std::result::Result<T, ConfigError>;
 // ── Sub-configs ───────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct S3Config {
     pub bucket: String,
     #[serde(default = "default_region")]
@@ -77,6 +79,7 @@ pub struct S3Config {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StorageConfig {
     #[serde(default = "default_index_path")]
     pub index_path: String,
@@ -87,6 +90,7 @@ pub struct StorageConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IndexerConfig {
     #[serde(default = "default_batch_size")]
     pub batch_size: usize,
@@ -96,8 +100,6 @@ pub struct IndexerConfig {
     pub index_pdfs: bool,
     #[serde(default = "default_true")]
     pub index_warc_responses: bool,
-    #[serde(default)]
-    pub skip_patterns: Vec<String>,
     /// Domains (and all their subdomains) to exclude from indexing and remove
     /// from any existing index.  Plain hostnames without scheme or path, e.g.
     /// `example.com`.  Subdomains are matched automatically: listing `example.com`
@@ -111,6 +113,51 @@ pub struct IndexerConfig {
     /// config.yaml; a re-index purges already-stored entries.
     #[serde(default)]
     pub blacklisted_domains_path: Option<String>,
+    /// Regular expressions matched against the whole URL. The second half of the
+    /// skip list: where [`blacklisted_domains`] removes a *site*, these remove a
+    /// *kind of page* on sites that are otherwise wanted — wiki talk pages,
+    /// version histories, `action=edit` links and the rest of the machinery a
+    /// CMS hangs off every article.
+    ///
+    /// Syntax is the `regex` crate's (RE2-compatible: no backreferences, no
+    /// lookaround), so the same expressions also work as Zeno exclusions —
+    /// which is what the server's `/skiplist.zeno` serves. Prefix `(?i)` for
+    /// case-insensitivity. Patterns are unanchored: they match anywhere in the
+    /// URL unless you write `^`.
+    ///
+    /// Compile with [`compile_url_patterns`] before the list has any effect.
+    ///
+    /// [`blacklisted_domains`]: Self::blacklisted_domains
+    /// [`compile_url_patterns`]: Self::compile_url_patterns
+    #[serde(default)]
+    pub blacklisted_url_patterns: Vec<String>,
+    /// Optional path to a static file of URL patterns, one regex per line.
+    /// Merged into [`blacklisted_url_patterns`] by [`load_url_patterns_file`].
+    ///
+    /// Only whole-line `#` comments are recognised — unlike the domain file, a
+    /// trailing `#` is *not* stripped, because `#` is a legitimate regex
+    /// character (`[?&#]`).
+    ///
+    /// [`blacklisted_url_patterns`]: Self::blacklisted_url_patterns
+    /// [`load_url_patterns_file`]: Self::load_url_patterns_file
+    #[serde(default)]
+    pub blacklisted_url_patterns_path: Option<String>,
+    /// Compiled form of [`blacklisted_url_patterns`], built once at startup by
+    /// [`compile_url_patterns`]. A `RegexSet` tests every pattern in a single
+    /// pass over the URL, which matters: this runs per record over multi-GB
+    /// WARCs. Never serialized — it is derived state.
+    ///
+    /// [`blacklisted_url_patterns`]: Self::blacklisted_url_patterns
+    /// [`compile_url_patterns`]: Self::compile_url_patterns
+    #[serde(skip)]
+    url_patterns: Option<RegexSet>,
+    /// The pattern file exactly as read, minus its header: comments, blank
+    /// lines and patterns in their original order. Kept so the list can be
+    /// handed on — to a crawler, to the UI — with the reasoning that came with
+    /// it. An exclusion file whose rules nobody can explain is one nobody dares
+    /// to edit. Empty when no file was loaded.
+    #[serde(skip)]
+    url_pattern_source: Vec<String>,
     /// Optional Apache Tika backend for extracting text from PDFs. When unset,
     /// PDFs are not fulltext-indexed (they remain browsable and replayable) —
     /// this keeps the dependency-free deployment possible. See [`TikaConfig`].
@@ -125,6 +172,7 @@ pub struct IndexerConfig {
 
 /// An additional indexed source beyond the primary WARC archive.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CollectionConfig {
     /// Unique collection name, stored on every CDX record and used to pick the
     /// bucket at replay time. Must not be `"warc"` (the primary archive).
@@ -148,6 +196,7 @@ pub struct CollectionConfig {
 
 /// Configuration for the optional Apache Tika text-extraction backend.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TikaConfig {
     /// Base URL of a running `tika-server`, e.g. `http://127.0.0.1:9998`.
     pub url: String,
@@ -218,6 +267,135 @@ impl IndexerConfig {
         Ok(added)
     }
 
+    /// Merge the regexes listed in [`blacklisted_url_patterns_path`] into
+    /// [`blacklisted_url_patterns`]. One pattern per line; blank lines and lines
+    /// whose first non-space character is `#` are ignored.
+    ///
+    /// A trailing `# comment` is deliberately *not* stripped here (the domain
+    /// file does strip it): `#` occurs inside real patterns, and silently
+    /// truncating one would leave a shorter, broader regex behind.
+    ///
+    /// Nothing is compiled yet — call [`compile_url_patterns`] afterwards.
+    /// A missing path is a no-op; an unreadable file returns the I/O error.
+    ///
+    /// [`blacklisted_url_patterns_path`]: Self::blacklisted_url_patterns_path
+    /// [`blacklisted_url_patterns`]: Self::blacklisted_url_patterns
+    /// [`compile_url_patterns`]: Self::compile_url_patterns
+    pub fn load_url_patterns_file(&mut self) -> std::io::Result<usize> {
+        let Some(path) = self.blacklisted_url_patterns_path.clone() else {
+            return Ok(0);
+        };
+        let text = std::fs::read_to_string(&path)?;
+        let mut seen: std::collections::HashSet<String> =
+            self.blacklisted_url_patterns.iter().map(|p| p.trim().to_owned()).collect();
+        let mut added = 0;
+        // The file's header — the leading comment block, ending at the first
+        // blank line — explains this file to whoever edits it and is not worth
+        // carrying into an export. Everything after it, section headings
+        // included, is.
+        let mut in_header = true;
+        for line in text.lines() {
+            let entry = line.trim();
+            if in_header {
+                if entry.starts_with('#') {
+                    continue;
+                }
+                in_header = false;
+                if entry.is_empty() {
+                    continue;
+                }
+            }
+            self.url_pattern_source.push(entry.to_owned());
+            if entry.is_empty() || entry.starts_with('#') {
+                continue;
+            }
+            if seen.insert(entry.to_owned()) {
+                self.blacklisted_url_patterns.push(entry.to_owned());
+                added += 1;
+            }
+        }
+        Ok(added)
+    }
+
+    /// Compile [`blacklisted_url_patterns`] into the set used by
+    /// [`is_url_blacklisted`]. Call once at startup, after
+    /// [`load_url_patterns_file`].
+    ///
+    /// Bad patterns are dropped, not fatal: a typo in a skip list must not stop
+    /// the server from serving or the indexer from indexing. Every rejection is
+    /// returned so the caller can log it — a silently ignored pattern is how a
+    /// skip list rots.
+    ///
+    /// Patterns are compiled individually first, both to name the offender and
+    /// to catch the one mistake that is worse than a typo: an expression that
+    /// matches the empty string (`.*`, a stray `(?i)`) matches *every* URL, and
+    /// would purge the whole archive on the next `tywb index`.
+    ///
+    /// [`blacklisted_url_patterns`]: Self::blacklisted_url_patterns
+    /// [`is_url_blacklisted`]: Self::is_url_blacklisted
+    /// [`load_url_patterns_file`]: Self::load_url_patterns_file
+    pub fn compile_url_patterns(&mut self) -> UrlPatternReport {
+        let mut report = UrlPatternReport::default();
+        let mut good: Vec<String> = Vec::new();
+
+        for pattern in &self.blacklisted_url_patterns {
+            let p = pattern.trim();
+            if p.is_empty() {
+                continue;
+            }
+            match Regex::new(p) {
+                Err(e) => report.rejected.push((p.to_owned(), e.to_string())),
+                Ok(re) if re.is_match("") => report.rejected.push((
+                    p.to_owned(),
+                    "matches the empty string — would blacklist every URL".to_owned(),
+                )),
+                Ok(_) => good.push(p.to_owned()),
+            }
+        }
+
+        self.url_patterns = if good.is_empty() {
+            None
+        } else {
+            match RegexSet::new(&good) {
+                Ok(set) => {
+                    report.compiled = good.len();
+                    Some(set)
+                }
+                // Every pattern compiled on its own above, so this is the set's
+                // own size limit. Report it against the list as a whole.
+                Err(e) => {
+                    report.rejected.push(("<pattern set>".to_owned(), e.to_string()));
+                    None
+                }
+            }
+        };
+        report
+    }
+
+    /// Return `true` if the URL matches one of the compiled URL skip patterns.
+    /// Always `false` before [`compile_url_patterns`] has run.
+    ///
+    /// [`compile_url_patterns`]: Self::compile_url_patterns
+    pub fn matches_url_pattern(&self, url: &str) -> bool {
+        self.url_patterns.as_ref().is_some_and(|set| set.is_match(url))
+    }
+
+    /// The patterns actually in force — those that compiled. This is what to
+    /// show and to export: [`blacklisted_url_patterns`] is the *request*, this
+    /// is the answer, and they differ whenever a pattern was rejected.
+    ///
+    /// [`blacklisted_url_patterns`]: Self::blacklisted_url_patterns
+    pub fn active_url_patterns(&self) -> &[String] {
+        self.url_patterns.as_ref().map_or(&[], |set| set.patterns())
+    }
+
+    /// The pattern file as read — comments, blank lines and patterns in their
+    /// original order, header stripped. Empty when the patterns came from
+    /// `config.yaml` alone.
+    pub fn url_pattern_source(&self) -> &[String] {
+        &self.url_pattern_source
+    }
+
     /// Return `true` if `host` (a bare hostname, lower-cased) is covered by
     /// the domain blacklist — i.e. it equals a blacklisted domain or is a
     /// subdomain of one.
@@ -232,28 +410,43 @@ impl IndexerConfig {
         false
     }
 
-    /// Return `true` if the URL's host is covered by the domain blacklist.
-    /// Non-HTTP/HTTPS URLs are never blacklisted.
+    /// Return `true` if the URL is covered by the skip list — either its host is
+    /// a blacklisted domain, or the URL matches one of the compiled URL
+    /// patterns. This is the single question asked at ingest, at purge time and
+    /// by the server's display filter.
+    ///
+    /// The host check only applies to URLs with a scheme; the pattern check runs
+    /// against whatever string it is given.
     pub fn is_url_blacklisted(&self, url: &str) -> bool {
-        if self.blacklisted_domains.is_empty() {
-            return false;
+        if !self.blacklisted_domains.is_empty() {
+            // Fast path: extract host without full URL parsing.
+            if let Some(pos) = url.find("://") {
+                let host = url[pos + 3..]
+                    .split(['/', ':', '?', '#'])
+                    .next()
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                if self.is_host_blacklisted(&host) {
+                    return true;
+                }
+            }
         }
-        // Fast path: extract host without full URL parsing.
-        let after_scheme = if let Some(pos) = url.find("://") {
-            &url[pos + 3..]
-        } else {
-            return false;
-        };
-        let host = after_scheme
-            .split(['/', ':', '?', '#'])
-            .next()
-            .unwrap_or("")
-            .to_ascii_lowercase();
-        self.is_host_blacklisted(&host)
+        self.matches_url_pattern(url)
     }
 }
 
+/// What [`IndexerConfig::compile_url_patterns`] made of the configured URL
+/// patterns.
+#[derive(Debug, Default)]
+pub struct UrlPatternReport {
+    /// Number of patterns that compiled and are now in force.
+    pub compiled: usize,
+    /// `(pattern, reason)` for every pattern that was thrown away.
+    pub rejected: Vec<(String, String)>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ServerConfig {
     #[serde(default = "default_bind")]
     pub bind: String,
@@ -266,6 +459,7 @@ pub struct ServerConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LogConfig {
     #[serde(default = "default_log_level")]
     pub level: String,
@@ -273,7 +467,15 @@ pub struct LogConfig {
 
 // ── Root config ───────────────────────────────────────────────────────────────
 
+/// Every block here rejects keys it does not know (`deny_unknown_fields`).
+///
+/// A misplaced key is otherwise invisible: `tika:` or `collections:` written at
+/// the top level instead of under `indexer:` is silently dropped, the run
+/// reports `nothing to index — all objects are up to date`, and exits happily
+/// having done nothing. Serde's error names the stray key and lists the ones
+/// that block accepts, which is the whole diagnosis.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     pub s3: S3Config,
     #[serde(default)]
@@ -388,9 +590,12 @@ impl Default for IndexerConfig {
             max_text_bytes: default_max_text_bytes(),
             index_pdfs: true,
             index_warc_responses: true,
-            skip_patterns: vec![],
             blacklisted_domains: vec![],
             blacklisted_domains_path: None,
+            blacklisted_url_patterns: vec![],
+            blacklisted_url_patterns_path: None,
+            url_patterns: None,
+            url_pattern_source: vec![],
             tika: None,
             collections: vec![],
         }
@@ -465,9 +670,9 @@ indexer:
   max_text_bytes: 1048576
   index_pdfs: false
   index_warc_responses: true
-  skip_patterns:
-    - "*.css"
-    - "*.js"
+  blacklisted_url_patterns:
+    - "(?i)[?&]action=(edit|history)"
+    - "(?i)/wiki/Diskussion:"
   tika:
     url: "http://127.0.0.1:9998"
     ocr_strategy: "no_ocr"
@@ -502,7 +707,7 @@ log:
         assert_eq!(cfg.indexer.max_text_bytes, 524_288);
         assert!(cfg.indexer.index_pdfs);
         assert!(cfg.indexer.index_warc_responses);
-        assert!(cfg.indexer.skip_patterns.is_empty());
+        assert!(cfg.indexer.blacklisted_url_patterns.is_empty());
         assert!(cfg.indexer.tika.is_none(), "Tika is opt-in — absent by default");
         assert_eq!(cfg.server.bind, "0.0.0.0:8080");
         assert_eq!(cfg.server.max_results, 50);
@@ -525,7 +730,10 @@ log:
         assert_eq!(cfg.storage.sqlite_cache_kib, 32768);
         assert_eq!(cfg.indexer.batch_size, 10000);
         assert!(!cfg.indexer.index_pdfs);
-        assert_eq!(cfg.indexer.skip_patterns, vec!["*.css", "*.js"]);
+        assert_eq!(
+            cfg.indexer.blacklisted_url_patterns,
+            vec!["(?i)[?&]action=(edit|history)", "(?i)/wiki/Diskussion:"],
+        );
         assert_eq!(cfg.server.bind, "127.0.0.1:9000");
         assert_eq!(cfg.server.max_results, 100);
         assert!(!cfg.server.enable_replay);
@@ -552,6 +760,40 @@ log:
         // s3 section missing entirely — bucket has no default
         let result = Config::from_yaml("server:\n  bind: '0.0.0.0:8080'\n");
         assert!(result.is_err());
+    }
+
+    // ── Unknown keys ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn misplaced_top_level_block_is_an_error() {
+        // The real mistake: `tika:` and `collections:` belong under `indexer:`.
+        // Written at the top level they used to be dropped without a word, and
+        // the indexer then found nothing to do and called that success.
+        let err = Config::from_yaml(
+            "s3:\n  bucket: warc\ntika:\n  url: 'http://127.0.0.1:9998'\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("tika"), "error should name the stray key: {err}");
+    }
+
+    #[test]
+    fn unknown_key_inside_a_block_is_an_error() {
+        let err = Config::from_yaml(
+            "s3:\n  bucket: warc\nindexer:\n  max_pdf_bytes: 100\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("max_pdf_bytes"), "error should name the key: {err}");
+    }
+
+    #[test]
+    fn the_shipped_config_still_parses() {
+        // config.yaml is the file every deployment starts from; deny_unknown_fields
+        // makes a drifted key in it fatal, so it is checked here rather than in
+        // production.
+        let yaml = include_str!("../../../config.yaml");
+        Config::from_yaml(yaml).expect("shipped config.yaml must load");
     }
 
     // ── Credentials ───────────────────────────────────────────────────────────
@@ -733,7 +975,7 @@ s3:
         writeln!(f, "# noise domains").unwrap();
         writeln!(f, "instagram.com").unwrap();
         writeln!(f, "  google.com   # search engine").unwrap();
-        writeln!(f, "").unwrap();
+        writeln!(f).unwrap();
         writeln!(f, "PINTEREST.COM").unwrap();     // case-normalised
         writeln!(f, "instagram.com").unwrap();     // duplicate within file
         f.flush().unwrap();
@@ -761,5 +1003,109 @@ s3:
     fn load_blacklist_file_missing_path_is_noop() {
         let mut cfg = IndexerConfig::default();
         assert_eq!(cfg.load_blacklist_file().unwrap(), 0);
+    }
+
+    // ── URL skip patterns ─────────────────────────────────────────────────────
+
+    /// Helper: a config with `patterns` loaded and compiled.
+    fn with_patterns(patterns: &[&str]) -> IndexerConfig {
+        let mut cfg = IndexerConfig {
+            blacklisted_url_patterns: patterns.iter().map(|p| (*p).to_owned()).collect(),
+            ..IndexerConfig::default()
+        };
+        cfg.compile_url_patterns();
+        cfg
+    }
+
+    #[test]
+    fn url_patterns_do_nothing_until_compiled() {
+        let cfg = IndexerConfig {
+            blacklisted_url_patterns: vec!["(?i)action=edit".to_owned()],
+            ..IndexerConfig::default()
+        };
+        assert!(
+            !cfg.is_url_blacklisted("https://wiki.example.org/w/index.php?action=edit"),
+            "an uncompiled list must not filter — compile_url_patterns() is the switch",
+        );
+    }
+
+    #[test]
+    fn url_patterns_catch_mediawiki_cruft_but_spare_the_article() {
+        let cfg = with_patterns(&[
+            r"(?i)[?&]action=(edit|history)",
+            r"(?i)/wiki/(Diskussion|Spezial|Special):",
+        ]);
+        assert!(cfg.is_url_blacklisted("https://wiki.example.org/w/index.php?title=Apfel&action=history"));
+        assert!(cfg.is_url_blacklisted("https://wiki.example.org/wiki/Diskussion:Apfel"));
+        assert!(cfg.is_url_blacklisted("https://wiki.example.org/wiki/Spezial:Letzte_%C3%84nderungen"));
+        // The article itself stays.
+        assert!(!cfg.is_url_blacklisted("https://wiki.example.org/wiki/Apfel"));
+        // …and so does a page that merely mentions the word.
+        assert!(!cfg.is_url_blacklisted("https://example.org/geschichte-des-apfels"));
+    }
+
+    #[test]
+    fn domain_and_url_pattern_lists_are_independent() {
+        let mut cfg = with_patterns(&[r"(?i)[?&]action=edit"]);
+        cfg.blacklisted_domains = vec!["instagram.com".to_owned()];
+
+        assert!(cfg.is_url_blacklisted("https://www.instagram.com/foo"), "domain hit");
+        assert!(cfg.is_url_blacklisted("https://wiki.example.org/w/?action=edit"), "pattern hit");
+        assert!(!cfg.is_url_blacklisted("https://wiki.example.org/wiki/Apfel"), "neither");
+    }
+
+    #[test]
+    fn compile_rejects_broken_and_catch_all_patterns() {
+        let mut cfg = IndexerConfig {
+            blacklisted_url_patterns: vec![
+                r"(?i)/wiki/Diskussion:".to_owned(), // fine
+                r"[unclosed".to_owned(),             // syntax error
+                r".*".to_owned(),                    // matches everything
+                r"(?i)".to_owned(),                  // bare flag: also matches everything
+            ],
+            ..IndexerConfig::default()
+        };
+        let report = cfg.compile_url_patterns();
+
+        assert_eq!(report.compiled, 1);
+        assert_eq!(report.rejected.len(), 3);
+        // The good pattern still works — one bad line does not disarm the list.
+        assert!(cfg.is_url_blacklisted("https://wiki.example.org/wiki/Diskussion:Apfel"));
+        // And the catch-all did not survive to eat the archive.
+        assert!(!cfg.is_url_blacklisted("https://pomologen-verein.de/"));
+    }
+
+    #[test]
+    fn load_url_patterns_file_keeps_case_and_hashes() {
+        use std::io::Write;
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("tywb-skip-urls-{}.txt", std::process::id()));
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f, "# whole-line comment").unwrap();
+        writeln!(f).unwrap();
+        writeln!(f, "  (?i)/wiki/Diskussion:  ").unwrap(); // trimmed
+        writeln!(f, r"[?&#]action=edit").unwrap();          // '#' inside the pattern survives
+        writeln!(f, "(?i)/wiki/Diskussion:").unwrap();      // duplicate within the file
+        f.flush().unwrap();
+
+        let mut cfg = IndexerConfig {
+            blacklisted_url_patterns_path: Some(path.to_string_lossy().into_owned()),
+            ..IndexerConfig::default()
+        };
+        let added = cfg.load_url_patterns_file().unwrap();
+        assert_eq!(added, 2, "two distinct patterns; the comment and the repeat drop out");
+        assert_eq!(cfg.blacklisted_url_patterns[1], r"[?&#]action=edit");
+
+        let report = cfg.compile_url_patterns();
+        assert_eq!(report.compiled, 2, "{:?}", report.rejected);
+        assert!(cfg.is_url_blacklisted("https://wiki.example.org/page#action=edit"));
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn load_url_patterns_file_missing_path_is_noop() {
+        let mut cfg = IndexerConfig::default();
+        assert_eq!(cfg.load_url_patterns_file().unwrap(), 0);
     }
 }

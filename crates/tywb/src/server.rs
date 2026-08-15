@@ -4,10 +4,13 @@
 //!
 //! | Method | Path               | Description              |
 //! |--------|--------------------|--------------------------|
-//! | GET    | `/`                | Web UI — home / stats    |
+//! | GET    | `/`                | Web UI — home (counts)   |
 //! | GET    | `/ui/search`       | Web UI — fulltext search |
 //! | GET    | `/ui/url`          | Web UI — URL captures    |
 //! | GET    | `/ui/files`        | Web UI — WARC file list  |
+//! | GET    | `/ui/skiplist`     | Web UI — skip list       |
+//! | GET    | `/ui/stats`        | Web UI — statistics      |
+//! | GET    | `/skiplist.zeno`   | Skip list as a Zeno exclusion file |
 //! | GET    | `/api/stats`       | JSON stats               |
 //! | GET    | `/search`          | JSON fulltext search     |
 //! | GET    | `/text`            | Plain text of a capture  |
@@ -95,6 +98,10 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         .route("/ui/browse",  get(browse_handler))
         .route("/ui/url",     get(ui_url_handler))
         .route("/ui/files",   get(ui_files_handler))
+        .route("/ui/skiplist", get(ui_skiplist_handler))
+        .route("/ui/stats",   get(ui_stats_handler))
+        // ── Skip list, in the crawler's format ───────────────────────────
+        .route("/skiplist.zeno", get(skiplist_zeno_handler))
         // ── JSON API ─────────────────────────────────────────────────────
         .route("/api/stats", get(api_stats_handler))
         .route("/search",    get(search_handler))
@@ -130,16 +137,83 @@ async fn health_handler() -> impl IntoResponse {
 
 // ── / — homepage ──────────────────────────────────────────────────────────────
 
+/// The homepage asks only for the scalar counts — see `CdxStore::basic_stats`.
+/// The breakdowns it used to show are on `/ui/stats`, which computes them in
+/// parallel; here they would be charged to every other request as well, because
+/// this connection is shared.
 async fn home_handler(State(state): State<Arc<AppState>>) -> Response {
-    let (cdx_stats, collections) = {
-        let store = state.cdx.lock().unwrap();
-        (store.stats(), store.collection_counts().unwrap_or_default())
-    };
-    match cdx_stats {
-        Ok(stats) => Html(ui::homepage_html(&stats, state.search.num_docs(), &collections)).into_response(),
+    let stats = { state.cdx.lock().unwrap().basic_stats() };
+    match stats {
+        Ok(stats) => Html(ui::homepage_html(&stats, state.search.num_docs())).into_response(),
         Err(e) => {
             error!(err = %e, "stats query failed");
             (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+        }
+    }
+}
+
+// ── /ui/stats — the expensive numbers, computed in parallel ──────────────────
+
+/// Run one CDX query on a connection of its own, off the async runtime.
+///
+/// The server's shared connection is deliberately not used: these queries take
+/// seconds, and holding that Mutex for seconds stops replay, search and CDX
+/// lookups dead. A read-only connection per query also lets SQLite run them
+/// concurrently — in WAL mode readers do not block each other — so the page
+/// costs about as much as its slowest query rather than the sum of all of them.
+fn cdx_query<T, F>(path: &str, cache_kib: u32, f: F) -> tokio::task::JoinHandle<anyhow::Result<T>>
+where
+    F: FnOnce(&CdxStore) -> Result<T, warc_search_cdx::CdxError> + Send + 'static,
+    T: Send + 'static,
+{
+    let path = path.to_owned();
+    tokio::task::spawn_blocking(move || {
+        let store = CdxStore::open_readonly(&path)?;
+        store.set_cache_kib(cache_kib)?;
+        Ok(f(&store)?)
+    })
+}
+
+/// Collapse a spawned query's two failure modes into one message: the query
+/// itself failing, and the blocking task panicking.
+fn flatten<T>(r: Result<anyhow::Result<T>, tokio::task::JoinError>) -> Result<T, String> {
+    match r {
+        Ok(Ok(v))  => Ok(v),
+        Ok(Err(e)) => Err(e.to_string()),
+        Err(e)     => Err(e.to_string()),
+    }
+}
+
+async fn ui_stats_handler(State(state): State<Arc<AppState>>) -> Response {
+    let path = state.config.storage.cdx_db_path.clone();
+    let kib  = state.config.storage.sqlite_cache_kib;
+    let started = std::time::Instant::now();
+
+    let (basic, mimes, statuses, colls) = tokio::join!(
+        cdx_query(&path, kib, |s| s.basic_stats()),
+        cdx_query(&path, kib, |s| s.mime_counts()),
+        cdx_query(&path, kib, |s| s.status_counts()),
+        cdx_query(&path, kib, |s| s.collection_counts()),
+    );
+
+    match (flatten(basic), flatten(mimes), flatten(statuses), flatten(colls)) {
+        (Ok(basic), Ok(mimes), Ok(statuses), Ok(colls)) => Html(ui::stats_html(
+            &basic,
+            state.search.num_docs(),
+            &colls,
+            &mimes,
+            &statuses,
+            started.elapsed().as_millis(),
+        ))
+        .into_response(),
+        (b, m, s, c) => {
+            let err = [b.err(), m.err(), s.err(), c.err()]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join("; ");
+            error!(err = %err, "statistics query failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, err).into_response()
         }
     }
 }
@@ -296,6 +370,69 @@ async fn ui_files_handler(State(state): State<Arc<AppState>>) -> Response {
     }
 }
 
+// ── /ui/skiplist + /skiplist.zeno — the skip list, and a crawler's copy ──────
+
+/// The patterns that were configured but are not in force. The difference
+/// between what was asked for and what compiled; empty in the normal case.
+fn rejected_patterns(indexer: &warc_search_config::IndexerConfig) -> Vec<String> {
+    let active: std::collections::HashSet<&str> =
+        indexer.active_url_patterns().iter().map(String::as_str).collect();
+    indexer
+        .blacklisted_url_patterns
+        .iter()
+        .filter(|p| !active.contains(p.trim()))
+        .cloned()
+        .collect()
+}
+
+async fn ui_skiplist_handler(State(state): State<Arc<AppState>>) -> Response {
+    let indexer = &state.config.indexer;
+    Html(ui::skiplist_html(
+        &indexer.blacklisted_domains,
+        indexer.url_pattern_source(),
+        indexer.active_url_patterns(),
+        &rejected_patterns(indexer),
+    ))
+    .into_response()
+}
+
+#[derive(Deserialize)]
+struct SkiplistParams {
+    /// `inline=1` renders in the browser instead of offering a download.
+    inline: Option<String>,
+}
+
+/// Serve the skip list as a Zeno exclusion file.
+///
+/// This is the whole handover: a crawler run fetches this URL and passes the
+/// result to `Zeno --exclusion-file`, so there is one list, edited in one place.
+/// It is deliberately a plain, cacheable GET with no state — `curl -o` in a
+/// crawl script is the intended client.
+async fn skiplist_zeno_handler(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<SkiplistParams>,
+) -> Response {
+    let body = crate::skiplist::to_zeno_exclusions(&state.config.indexer);
+    let disposition = if params.inline.is_some() {
+        "inline"
+    } else {
+        "attachment; filename=\"exclusions.txt\""
+    };
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
+            (header::CONTENT_DISPOSITION, disposition),
+            // The list changes when an operator edits it and the server
+            // restarts — a crawl that starts an hour late should still see the
+            // edit, so this is not cached for long.
+            (header::CACHE_CONTROL, "public, max-age=300"),
+        ],
+        body,
+    )
+        .into_response()
+}
+
 // ── /ui/browse — domain hierarchy browser ────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -397,7 +534,7 @@ async fn browse_handler(
 // ── /api/stats — JSON stats ───────────────────────────────────────────────────
 
 async fn api_stats_handler(State(state): State<Arc<AppState>>) -> Response {
-    let cdx_stats = { state.cdx.lock().unwrap().stats() };
+    let cdx_stats = { state.cdx.lock().unwrap().basic_stats() };
     match cdx_stats {
         Ok(s) => Json(ui::ApiStats {
             cdx: ui::ApiCdxStats {
@@ -1294,6 +1431,29 @@ async fn cdx_timemap_handler(
 mod tests {
     use super::*;
     use std::io::Write as _;
+
+    #[test]
+    fn rejected_patterns_are_the_gap_between_asked_and_active() {
+        let mut indexer = warc_search_config::IndexerConfig::default();
+        indexer.blacklisted_url_patterns = vec![
+            r"(?i)/wiki/Diskussion:".to_owned(), // compiles
+            "[unclosed".to_owned(),              // does not
+            ".*".to_owned(),                     // refused: matches everything
+        ];
+        indexer.compile_url_patterns();
+
+        let rejected = rejected_patterns(&indexer);
+        assert_eq!(rejected, vec!["[unclosed".to_owned(), ".*".to_owned()]);
+        assert_eq!(indexer.active_url_patterns(), [r"(?i)/wiki/Diskussion:"]);
+    }
+
+    #[test]
+    fn nothing_is_rejected_when_every_pattern_compiles() {
+        let mut indexer = warc_search_config::IndexerConfig::default();
+        indexer.blacklisted_url_patterns = vec![r"(?i)[?&]action=edit".to_owned()];
+        indexer.compile_url_patterns();
+        assert!(rejected_patterns(&indexer).is_empty());
+    }
 
     #[test]
     fn pad_timestamp_fills_from_the_start_of_the_period() {

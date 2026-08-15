@@ -8,6 +8,128 @@ this project does not yet publish tagged releases, so everything lands under
 
 ## [Unreleased]
 
+- **The homepage no longer stalls the whole server.** `/` computed six
+  aggregates over the CDX table on every request, three of them `GROUP BY`s
+  with no index: ~7.7 s on a 4.1-million-record archive. Since all handlers
+  share one SQLite connection behind a mutex, those seconds were charged to
+  replay, search and CDX lookups as well — a probe with a 10 s timeout reported
+  the service as unreachable while it was serving fine.
+
+  The homepage now asks for scalar counts only (`CdxStore::basic_stats`), and
+  the breakdowns moved to a new page, `/ui/stats`. That page runs each query on
+  its own short-lived read-only connection, concurrently — WAL mode lets
+  readers overlap — so it costs about its slowest query rather than the sum, and
+  costs the rest of the server nothing. The measured time is printed on the page.
+
+  `/api/stats` only ever exposed the scalar fields and is now cheap too.
+
+- **A re-indexed collection PDF replaces its document instead of adding a
+  second one.** The WARC path has always deleted a file's documents before
+  re-adding them; the PDF-collection path did not, so an object whose ETag
+  changed — a re-OCR'd scan re-uploaded, say — left its old text in the fulltext
+  index beside the new. The CDX row was always an upsert and stayed correct,
+  which is what made the duplication easy to miss.
+
+- **An index one field behind no longer blocks every index run.** `tywb index`
+  against an index written before `collection` existed aborted before touching
+  a single object, with Tantivy's bare *"An index exists but the schema does not
+  match"* — a message that names neither the field nor a remedy, on a run that
+  had nothing to do with collections.
+
+  The write path now opens the index as it stands and reads the field handles
+  back from it, the way the read path always has. An older index stays
+  searchable and writable; documents added to it carry no `collection`, and
+  startup says exactly that, along with what it costs (a collection filter will
+  not find them) and how to get it back (rebuild). Replay is unaffected either
+  way — the collection that picks the bucket lives in the CDX database.
+
+  A schema that differs in any *other* way — a renamed field, changed indexing
+  options — is still refused, but now names the field and says what to do.
+
+  The obvious-looking fix, rewriting `meta.json` in place to append the field,
+  is deliberately not taken: segments written without a field carry no field
+  norms for it, and the first background merge of an old segment with a new one
+  dies with `Field norm not found for field`. There is a test for that merge,
+  which is how we know.
+
+- **Skipped PDFs say so.** A PDF over `indexer.tika.max_pdf_bytes` (default
+  100 MiB) was dropped at `debug` level, i.e. silently in any normal run. The
+  documents this hits are the high-resolution library scans — often the ones
+  most worth having — and a quiet skip is indistinguishable from full coverage
+  in the result. It is a `WARN` now, with the key, the size, and the setting to
+  raise. Truncated PDFs stay at `debug`: whole crawls are capped at ~1 MiB, and
+  at `WARN` they would drown out everything else.
+
+- **Unknown configuration keys are an error.** `tika:` or `collections:`
+  written at the top level instead of under `indexer:` was silently discarded;
+  the run then reported `nothing to index — all objects are up to date` and
+  exited successfully, having done nothing. Every block now rejects keys it
+  does not know, and serde's error names the stray key and lists the ones that
+  block accepts. `config.yaml` itself is parsed by a test, so the shipped file
+  cannot drift out of the schema it documents.
+
+- **`--collections-only` is documented.** The only way to index the PDF
+  collections without re-walking the WARC bucket existed solely in the source.
+
+- **`config.yaml` points at `s3.foxel.org`.** The endpoint it shipped with sits
+  behind a proxy that rewrites `accept-encoding`, which breaks the SigV4
+  signature: every request comes back as
+  `400 InvalidRequest: signed header 'accept-encoding' is not present`, which
+  reads like a credentials problem and is not one. The note above the setting
+  now says so.
+
+- **URL skip patterns.** The skip list gained a second half. Where
+  `indexer.blacklisted_domains` drops a whole site,
+  `indexer.blacklisted_url_patterns` (and
+  `blacklisted_url_patterns_path`) drops a *kind of page* on sites that are
+  otherwise wanted: wiki talk pages, version histories, `action=edit` links —
+  the machinery every wiki hangs off each article, which until now was indexed
+  as if it were content.
+
+  - Each pattern is a regex matched against the whole URL, compiled once into a
+    `RegexSet` at startup because the test runs per record over multi-GB WARCs.
+  - Patterns act in the same three places domains already did: skipped at
+    ingest, purged from CDX and the fulltext index on the next `tywb index`
+    run, hidden from search results at query time. The purge is one sequential
+    CDX scan — a pattern cannot be pushed into SQL the way a SURT prefix can —
+    so it only runs when patterns are configured. Index entries are deleted,
+    never WARC bytes: remove the rule, re-index, and the captures return.
+  - A pattern that fails to compile is logged and dropped, not fatal. One that
+    matches the empty string is refused outright: it would match every URL and
+    purge the whole index.
+  - `skip-urls.txt` ships the list. For wikis: talk namespaces in German and
+    English, user pages and their subpages, `Spezial:`/`Special:`, the
+    `action=`/`do=` verbs, `oldid=`/`diff=` permalinks, `api.php` and friends.
+    `Kategorie:`, `Datei:` and `Portal:` are deliberately kept — navigation and
+    provenance are not cruft. It is tested like code, because it decides what
+    gets deleted.
+  - It also absorbed the rules that used to live only in the Zeno crawler's own
+    exclusion file: private address ranges and internal TLDs (a crawl seeded
+    from browser history reaches router config pages and NAS boxes — nobody's
+    archive, and sometimes somebody's private data), login/logout endpoints,
+    `wp-admin`, session IDs, sort and calendar parameters, share buttons. The
+    flow only works in one direction now, so a rule kept on the crawler side
+    would have been a second, drifting copy.
+  - The unimplemented `indexer.skip_patterns` glob field is gone. It never did
+    anything; keeping a second, dead spelling of "URL patterns to skip" next to
+    a working one only invites configuring the wrong one.
+
+- **The skip list in the web UI, and in the crawler's format.**
+  `GET /ui/skiplist` shows what is in force — domains, URL patterns with the
+  comments they were written with, and separately anything configured that did
+  not compile. A rule that silently does nothing is worse than no rule, so the
+  page names it rather than leaving it to a log line at startup.
+
+  `GET /skiplist.zeno` serves the same list as a Zeno `--exclusion-file`.
+  Because both sides speak RE2 the patterns transfer unchanged; only domains
+  are translated, to `^https?://([^/]*\.)?host([:/?#]|$)`. A crawl script
+  `curl`s the URL before the run, which is the whole handover — one list, one
+  place to edit it, no generator step. `?inline=1` reads it in the browser.
+
+  This replaced a Python converter that did the same job offline. Two
+  implementations of one conversion drift; and the machine it ran on had no
+  PyYAML, so half of it did not run there at all.
+
 - **Text endpoint.** `GET /text?url=…[&timestamp=…][&output=json]` (and the
   replay-shaped `GET /text/<timestamp>/<url>`) returns the readable text of an
   archived capture: HTML stripped, chunk framing and `Content-Encoding` undone,

@@ -150,6 +150,23 @@ async fn index_one_pdf(
     };
     cdx.upsert(&record).context("CDX upsert")?;
 
+    // Replace this object's fulltext document rather than adding a second one.
+    // `add_document` appends unconditionally, and the CDX row above is an upsert
+    // on (surt_url, timestamp) — so without this, re-indexing an object whose
+    // ETag changed left the old text in the index next to the new, and every
+    // re-upload of a re-OCR'd PDF added another copy.
+    //
+    // Keyed on `s3_key` like the WARC path, not on URL: a capture of this same
+    // public URL may well sit in the main archive too, and that one belongs to
+    // its WARC file, not to us. `delete_term` only affects already-committed
+    // documents, so the add below survives the shared commit at the end of the
+    // collection run. On a first index it matches nothing.
+    //
+    // The deletion is unconditional, before extraction: this runs only for
+    // objects the lister reports as new or changed, and text extracted from the
+    // previous bytes no longer describes the object.
+    search.delete_s3_key(&obj.key).context("search delete_s3_key")?;
+
     let Some(extractor) = extractor else {
         return Ok(false);
     };
