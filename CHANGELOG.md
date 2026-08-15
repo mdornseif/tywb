@@ -35,6 +35,20 @@ this project does not yet publish tagged releases, so everything lands under
   the lock failed on the spot — and on the indexer that loses a record, because
   a failed object is marked as seen regardless.
 
+- **A PDF whose extraction failed is tried again.** The collection indexer
+  marked every object as seen the moment it had written a CDX record —
+  including objects where Tika had just crashed or timed out. The next run
+  skipped them, so a transient failure became permanent: a CDX entry, a
+  replayable PDF, and no searchable text, forever. Observed live on 480 MB
+  library scans that took the Tika server down with them.
+
+  `mark_seen` is now only written when the object really was handled. The
+  reason decides: too large, truncated, or text that failed the quality gate is
+  an answer about the file and counts as done; a crashed extractor, a timeout
+  or a failed S3 GET is an answer about the run, and the object comes back next
+  time. `index_one_pdf` returns a `PdfOutcome` instead of a bare bool, because
+  the caller cannot make that distinction from "no text".
+
 - **A re-indexed collection PDF replaces its document instead of adding a
   second one.** The WARC path has always deleted a file's documents before
   re-adding them; the PDF-collection path did not, so an object whose ETag

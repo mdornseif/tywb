@@ -17,7 +17,7 @@ use warc_search_config::{CollectionConfig, IndexerConfig};
 use warc_search_search::{IndexDoc, SearchIndex};
 use warc_search_s3::{get_bytes, ListState, Lister};
 
-use crate::pdf::PdfExtractor;
+use crate::pdf::{ExtractError, PdfExtractor};
 
 /// Per-collection ingest counters.
 #[derive(Debug, Default)]
@@ -91,19 +91,34 @@ pub async fn index_pdf_collection(
             continue;
         }
 
+        // `mark_seen` records that this object, at this ETag, has been dealt
+        // with — the next run skips it. It is therefore only written when the
+        // object really has been dealt with. A crashed or timed-out Tika, or a
+        // failed S3 GET, leaves the object unseen so the next run picks it up
+        // again; marking it done is how an archive quietly accumulates records
+        // that have a CDX entry and no searchable text at all.
         match index_one_pdf(coll, &url, obj, s3, cdx, search, extractor.as_ref()).await {
-            Ok(did_index) => {
+            Ok(outcome) => {
                 stats.cdx_new += 1;
-                if did_index {
-                    stats.indexed += 1;
+                match outcome {
+                    PdfOutcome::Indexed => {
+                        stats.indexed += 1;
+                        state.mark_seen(&obj.key, obj.etag.clone());
+                    }
+                    PdfOutcome::NoText => state.mark_seen(&obj.key, obj.etag.clone()),
+                    PdfOutcome::ExtractionFailed => {
+                        stats.errors += 1;
+                        warn!(name = %coll.name, key = %obj.key,
+                              "text extraction failed — leaving the object for the next run");
+                    }
                 }
             }
             Err(e) => {
-                warn!(name = %coll.name, key = %obj.key, err = %format!("{e:#}"), "PDF indexing failed — skipping");
+                warn!(name = %coll.name, key = %obj.key, err = %format!("{e:#}"),
+                      "PDF indexing failed — leaving the object for the next run");
                 stats.errors += 1;
             }
         }
-        state.mark_seen(&obj.key, obj.etag.clone());
     }
 
     search.commit().context("search commit for PDF collection")?;
@@ -116,8 +131,23 @@ pub async fn index_pdf_collection(
     Ok(stats)
 }
 
+/// What became of one PDF, and whether the next run should try it again.
+#[derive(Debug, PartialEq)]
+enum PdfOutcome {
+    /// Text extracted and queued for the fulltext index.
+    Indexed,
+    /// A CDX record, but no text — and no reason to expect a different answer
+    /// next time: no Tika backend is configured, the file is larger than
+    /// `max_pdf_bytes`, it is truncated, or what came back did not read like
+    /// text. The object counts as handled.
+    NoText,
+    /// A CDX record, but no text because the *extractor* failed — Tika crashed,
+    /// timed out, or returned nothing at all. That is a statement about this
+    /// run, not about the file, so the object is left unseen and tried again.
+    ExtractionFailed,
+}
+
 /// Fetch one PDF, write its CDX record, and (if extractable) its fulltext doc.
-/// Returns whether a fulltext document was added.
 async fn index_one_pdf(
     coll: &CollectionConfig,
     url: &str,
@@ -126,7 +156,7 @@ async fn index_one_pdf(
     cdx: &mut CdxStore,
     search: &mut SearchIndex,
     extractor: Option<&PdfExtractor>,
-) -> Result<bool> {
+) -> Result<PdfOutcome> {
     let surt = warc_search_cdx::surt::to_surt(url)
         .with_context(|| format!("SURT for {url}"))?;
     let timestamp = last_modified_to_ts(obj.last_modified.as_deref());
@@ -168,19 +198,38 @@ async fn index_one_pdf(
     search.delete_s3_key(&obj.key).context("search delete_s3_key")?;
 
     let Some(extractor) = extractor else {
-        return Ok(false);
+        return Ok(PdfOutcome::NoText);
     };
 
     // Tika extraction is a blocking call; keep it off the async runtime.
+    // `try_extract` rather than `extract`, because here the *reason* decides
+    // whether the object is done or has to be tried again.
     let extractor = extractor.clone();
     let url_owned = url.to_owned();
     let bytes_owned = bytes.to_vec();
-    let doc = tokio::task::spawn_blocking(move || extractor.extract(&url_owned, &bytes_owned))
-        .await
-        .context("spawn_blocking panicked")?;
+    let doc = tokio::task::spawn_blocking(move || {
+        extractor.try_extract(&url_owned, &bytes_owned, false)
+    })
+    .await
+    .context("spawn_blocking panicked")?;
 
-    let Some(pdf_doc) = doc else {
-        return Ok(false);
+    let pdf_doc = match doc {
+        Ok(doc) if doc.quality_ok => doc,
+        Ok(doc) => {
+            warn!(url, chars = doc.body.len(),
+                  "PDF text rejected by quality gate (likely OCR noise)");
+            return Ok(PdfOutcome::NoText);
+        }
+        // The file itself, or a limit set for it: the same answer next time.
+        Err(e @ (ExtractError::TooLarge { .. } | ExtractError::Truncated)) => {
+            warn!(url, bytes = bytes.len(), reason = %e, "PDF not extracted");
+            return Ok(PdfOutcome::NoText);
+        }
+        // Tika: this run, not this file.
+        Err(e) => {
+            warn!(url, err = %e, "PDF extraction failed");
+            return Ok(PdfOutcome::ExtractionFailed);
+        }
     };
 
     let ts: u64 = timestamp.parse().unwrap_or(0);
@@ -196,7 +245,7 @@ async fn index_one_pdf(
         collection: coll.name.clone(),
     };
     search.add_document(&index_doc).context("search add_document")?;
-    Ok(true)
+    Ok(PdfOutcome::Indexed)
 }
 
 /// Convert an S3 `LastModified` (RFC3339, e.g. `2026-02-27T22:18:43Z`) into a
@@ -216,6 +265,31 @@ fn last_modified_to_ts(last_modified: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Which failures are the object's, and which are the run's ──────────
+
+    #[test]
+    fn only_a_handled_object_counts_as_handled() {
+        // The distinction that keeps an archive from filling up with CDX
+        // records that have no searchable text: Tika falling over is a fact
+        // about this run, so the object must come back next time.
+        assert_ne!(PdfOutcome::ExtractionFailed, PdfOutcome::NoText);
+        for outcome in [PdfOutcome::Indexed, PdfOutcome::NoText] {
+            assert!(
+                marks_seen(&outcome),
+                "{outcome:?} is a final answer and must not be retried forever",
+            );
+        }
+        assert!(
+            !marks_seen(&PdfOutcome::ExtractionFailed),
+            "a crashed extractor must leave the object for the next run",
+        );
+    }
+
+    /// Mirrors the decision the indexing loop makes about `state.mark_seen`.
+    fn marks_seen(outcome: &PdfOutcome) -> bool {
+        !matches!(outcome, PdfOutcome::ExtractionFailed)
+    }
 
     #[test]
     fn last_modified_parses_rfc3339() {
