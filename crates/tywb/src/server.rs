@@ -142,14 +142,62 @@ async fn health_handler() -> impl IntoResponse {
 /// parallel; here they would be charged to every other request as well, because
 /// this connection is shared.
 async fn home_handler(State(state): State<Arc<AppState>>) -> Response {
-    let stats = { state.cdx.lock().unwrap().basic_stats() };
-    match stats {
-        Ok(stats) => Html(ui::homepage_html(&stats, state.search.num_docs())).into_response(),
+    let result = {
+        let store = state.cdx.lock().unwrap();
+        store
+            .basic_stats()
+            .map(|stats| (collection_cards(&store, &state.config, &stats), stats))
+    };
+    match result {
+        Ok((collections, stats)) => {
+            Html(ui::homepage_html(&stats, state.search.num_docs(), &collections)).into_response()
+        }
         Err(e) => {
             error!(err = %e, "stats query failed");
             (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
         }
     }
+}
+
+/// Records per collection, cheaply enough for the homepage.
+///
+/// The names come from the configuration rather than from a `GROUP BY` over the
+/// table, and each is counted through `idx_cdx_collection`, which touches only
+/// that collection's index entries. The primary archive is never counted: it is
+/// what is left when the others are subtracted from the total, and counting it
+/// is precisely the part that took seconds.
+///
+/// The trade is that a collection sitting in the CDX but no longer configured
+/// does not appear, and its records fall into the archive's count instead.
+/// `/ui/stats` discovers the names from the data and shows those too.
+fn collection_cards(
+    store: &CdxStore,
+    cfg: &Config,
+    stats: &warc_search_cdx::BasicStats,
+) -> Vec<(String, u64)> {
+    let mut cards: Vec<(String, u64)> = Vec::new();
+    let mut named_total = 0u64;
+
+    for coll in &cfg.indexer.collections {
+        match store.collection_count(&coll.name) {
+            Ok(0) => {}
+            Ok(n) => {
+                named_total += n;
+                cards.push((coll.name.clone(), n));
+            }
+            Err(e) => warn!(collection = %coll.name, err = %e, "collection count failed"),
+        }
+    }
+    if cards.is_empty() {
+        return cards;
+    }
+
+    cards.push((
+        warc_search_cdx::DEFAULT_COLLECTION.to_owned(),
+        stats.total_records.saturating_sub(named_total),
+    ));
+    cards.sort_by(|a, b| b.1.cmp(&a.1));
+    cards
 }
 
 // ── /ui/stats — the expensive numbers, computed in parallel ──────────────────

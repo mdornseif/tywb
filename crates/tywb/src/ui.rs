@@ -360,7 +360,7 @@ fn short_mime<'a>(mime: Option<&'a str>) -> &'a str {
 /// SQLite connection, that cost was charged to replay and search as well as to
 /// whoever loaded `/`. They live on [`stats_html`] now, which runs them
 /// concurrently on connections of its own.
-pub fn homepage_html(stats: &BasicStats, num_docs: u64) -> String {
+pub fn homepage_html(stats: &BasicStats, num_docs: u64, collections: &[(String, u64)]) -> String {
     let mut c = String::with_capacity(4096);
 
     // ── Stat cards ────────────────────────────────────────────────────────
@@ -370,6 +370,12 @@ pub fn homepage_html(stats: &BasicStats, num_docs: u64) -> String {
     stat_card(&mut c, &fmt_count(stats.warc_files),    "WARC files");
     stat_card(&mut c, &fmt_count(num_docs),            "Fulltext docs");
     c.push_str("</div>\n");
+
+    // ── Collections ───────────────────────────────────────────────────────
+    // Cheap here on purpose: counted per configured name through
+    // idx_cdx_collection, with the archive itself derived by subtraction.
+    // See server::collection_cards.
+    push_collection_cards(&mut c, collections);
 
     // ── Date coverage ─────────────────────────────────────────────────────
     match (&stats.oldest_timestamp, &stats.newest_timestamp) {
@@ -437,20 +443,7 @@ pub fn stats_html(
     c.push_str("</div>\n");
 
     // ── Collections ───────────────────────────────────────────────────────
-    // Only worth showing once there is more than the default WARC archive.
-    if collections.iter().any(|(name, _)| name != "warc") {
-        c.push_str("<div class=\"coll-section\">\n<h2>Collections</h2>\n<div class=\"coll-row\">\n");
-        for (name, n) in collections {
-            c.push_str("  <a class=\"coll-card\" href=\"/ui/search?q=&collection=");
-            push_url_encoded(&mut c, name);
-            c.push_str("\">\n    <span class=\"coll-name\">");
-            push_esc(&mut c, name);
-            c.push_str("</span>\n    <span class=\"coll-cnt\">");
-            push_esc(&mut c, &fmt_count(*n));
-            c.push_str("</span>\n  </a>\n");
-        }
-        c.push_str("</div>\n</div>\n");
-    }
+    push_collection_cards(&mut c, collections);
 
     // ── Content types breakdown ───────────────────────────────────────────
     if !mime_counts.is_empty() {
@@ -493,6 +486,27 @@ pub fn stats_html(
     c.push_str("\u{202f}ms</strong>. They are kept off the homepage for that reason.</div>\n");
 
     page_html("Statistics", "stats", &c)
+}
+
+/// The collection cards, shown on both the homepage and the statistics page.
+///
+/// Only worth showing once there is more than the default WARC archive — a
+/// single card saying "everything" is noise.
+fn push_collection_cards(out: &mut String, collections: &[(String, u64)]) {
+    if !collections.iter().any(|(name, _)| name != "warc") {
+        return;
+    }
+    out.push_str("<div class=\"coll-section\">\n<h2>Collections</h2>\n<div class=\"coll-row\">\n");
+    for (name, n) in collections {
+        out.push_str("  <a class=\"coll-card\" href=\"/ui/search?q=&collection=");
+        push_url_encoded(out, name);
+        out.push_str("\">\n    <span class=\"coll-name\">");
+        push_esc(out, name);
+        out.push_str("</span>\n    <span class=\"coll-cnt\">");
+        push_esc(out, &fmt_count(*n));
+        out.push_str("</span>\n  </a>\n");
+    }
+    out.push_str("</div>\n</div>\n");
 }
 
 fn stat_card(out: &mut String, value: &str, label: &str) {
@@ -1403,7 +1417,7 @@ mod tests {
 
     #[test]
     fn homepage_shows_the_counts() {
-        let html = homepage_html(&basic(), 2_053_279);
+        let html = homepage_html(&basic(), 2_053_279, &[]);
         assert!(html.contains("CDX records"));
         assert!(html.contains("WARC files"));
         assert!(html.contains("Fulltext docs"));
@@ -1415,12 +1429,31 @@ mod tests {
         // breakdown creeps back onto this page, the query behind it comes with
         // it, and it is charged to replay and search too — one shared SQLite
         // connection.
-        let html = homepage_html(&basic(), 2_053_279);
+        let html = homepage_html(&basic(), 2_053_279, &[]);
         assert!(!html.contains("Content types"), "mime breakdown is a GROUP BY");
         assert!(!html.contains("HTTP status codes"), "status breakdown is a GROUP BY");
-        // Match the rendered element, not the stylesheet, which every page carries.
-        assert!(!html.contains("<h2>Collections</h2>"), "collection counts are a GROUP BY");
         assert!(html.contains("href=\"/ui/stats\""), "but it must link to where they live");
+    }
+
+
+    #[test]
+    fn homepage_shows_collection_cards() {
+        // Back on the homepage, but counted per name through the collection
+        // index rather than by grouping the whole table — see
+        // server::collection_cards.
+        let html = homepage_html(
+            &basic(),
+            2_053_279,
+            &[("warc".to_owned(), 4_133_667), ("monatshefte".to_owned(), 54)],
+        );
+        assert!(html.contains("<h2>Collections</h2>"));
+        assert!(html.contains("coll-card\" href=\"/ui/search?q=&collection=monatshefte\""));
+    }
+
+    #[test]
+    fn homepage_hides_the_collection_row_for_a_plain_archive() {
+        let html = homepage_html(&basic(), 1, &[("warc".to_owned(), 10)]);
+        assert!(!html.contains("<h2>Collections</h2>"));
     }
 
     // ── Statistics page: the expensive half ───────────────────────────────

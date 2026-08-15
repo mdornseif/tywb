@@ -31,6 +31,10 @@ CREATE TABLE IF NOT EXISTS cdx (
 
 CREATE INDEX IF NOT EXISTS idx_cdx_ts      ON cdx(timestamp);
 CREATE INDEX IF NOT EXISTS idx_cdx_s3_key  ON cdx(s3_key);
+-- Lets a single collection be counted without reading the whole table, which
+-- is what puts the collection cards back on the homepage. See
+-- `CdxStore::collection_count`.
+CREATE INDEX IF NOT EXISTS idx_cdx_collection ON cdx(collection);
 
 CREATE TABLE IF NOT EXISTS warc_files (
     s3_key           TEXT    PRIMARY KEY,
@@ -69,6 +73,11 @@ PRAGMA journal_mode       = WAL;
 PRAGMA synchronous        = NORMAL;
 PRAGMA foreign_keys       = ON;
 PRAGMA wal_autocheckpoint = 0;
+-- The server and the indexer run as separate processes against the same file.
+-- Without this, a write that lands while the other holds the lock fails
+-- immediately with SQLITE_BUSY — and on the indexer that costs a record, since
+-- a failed object is still marked as seen.
+PRAGMA busy_timeout       = 10000;
 ";
 
 // ── WARC file metadata ────────────────────────────────────────────────────────
@@ -512,8 +521,34 @@ impl CdxStore {
     }
 
     /// Aggregate statistics over the whole CDX table.
-    /// Record count per collection, most populous first. Drives the collections
-    /// section on the homepage.
+    /// Record count for one collection by name.
+    ///
+    /// Backed by `idx_cdx_collection`, so this reads only that collection's
+    /// index entries — microseconds for a collection of a few thousand records,
+    /// whatever the size of the archive around it.
+    ///
+    /// This is how the homepage gets its collection cards back without the
+    /// `GROUP BY` that made it slow: the collection *names* are known from the
+    /// configuration, so they can be counted one by one, and the primary
+    /// archive — the one collection large enough for counting to hurt — is
+    /// derived by subtraction rather than counted at all. See
+    /// [`collection_counts`] for the authoritative version that discovers names
+    /// from the data.
+    ///
+    /// [`collection_counts`]: Self::collection_counts
+    pub fn collection_count(&self, name: &str) -> Result<u64> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM cdx WHERE collection = ?1", params![name], |r| r.get(0))?;
+        Ok(n as u64)
+    }
+
+    /// Record count per collection, most populous first — discovered from the
+    /// data, so it also finds collections no longer in the configuration.
+    ///
+    /// A full `GROUP BY`: seconds on a large archive. The statistics page runs
+    /// it on a connection of its own; the homepage uses [`collection_count`].
+    ///
+    /// [`collection_count`]: Self::collection_count
     pub fn collection_counts(&self) -> Result<Vec<(String, u64)>> {
         let mut stmt = self.conn.prepare(
             "SELECT collection, COUNT(*) AS n FROM cdx GROUP BY collection ORDER BY n DESC")?;
@@ -918,6 +953,36 @@ mod tests {
     }
 
     // ── Split statistics ──────────────────────────────────────────────────
+
+    #[test]
+    fn collection_count_agrees_with_the_group_by() {
+        let store = store_with_samples();
+        let mut pdf = sample("nu,23,obst-pdfs)/a.pdf", "20260101000000", "https://obst-pdfs.23.nu/a.pdf");
+        pdf.collection = "monatshefte".to_owned();
+        store.upsert(&pdf).unwrap();
+
+        // The homepage counts one name at a time; the statistics page groups.
+        // They must not disagree.
+        let grouped: std::collections::HashMap<String, u64> =
+            store.collection_counts().unwrap().into_iter().collect();
+        assert_eq!(store.collection_count("monatshefte").unwrap(), grouped["monatshefte"]);
+        assert_eq!(store.collection_count("warc").unwrap(), grouped["warc"]);
+        assert_eq!(store.collection_count("nonexistent").unwrap(), 0);
+    }
+
+    #[test]
+    fn the_archive_count_can_be_derived_by_subtraction() {
+        // What the homepage does instead of counting the one collection large
+        // enough for counting to hurt.
+        let store = store_with_samples();
+        let mut pdf = sample("nu,23,obst-pdfs)/a.pdf", "20260101000000", "https://obst-pdfs.23.nu/a.pdf");
+        pdf.collection = "monatshefte".to_owned();
+        store.upsert(&pdf).unwrap();
+
+        let total = store.basic_stats().unwrap().total_records;
+        let named = store.collection_count("monatshefte").unwrap();
+        assert_eq!(total - named, store.collection_count("warc").unwrap());
+    }
 
     #[test]
     fn basic_stats_matches_the_scalar_half_of_stats() {

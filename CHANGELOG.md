@@ -23,6 +23,18 @@ this project does not yet publish tagged releases, so everything lands under
 
   `/api/stats` only ever exposed the scalar fields and is now cheap too.
 
+  The collection cards stayed on the homepage: with a new `idx_cdx_collection`
+  the *configured* collection names can be counted one at a time, touching only
+  their own index entries, and the primary archive — the one collection large
+  enough for counting to hurt — is derived by subtracting them from the total
+  rather than counted at all. `/ui/stats` keeps the grouping version, which
+  also finds collections no longer in the configuration.
+
+- **`PRAGMA busy_timeout`.** The server and the indexer are separate processes
+  on one database file. Without a timeout, a write landing while the other held
+  the lock failed on the spot — and on the indexer that loses a record, because
+  a failed object is marked as seen regardless.
+
 - **A re-indexed collection PDF replaces its document instead of adding a
   second one.** The WARC path has always deleted a file's documents before
   re-adding them; the PDF-collection path did not, so an object whose ETag
