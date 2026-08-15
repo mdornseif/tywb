@@ -575,7 +575,11 @@ pub fn search_html(
 </details>
 "#);
 
-    if q.is_empty() {
+    // No terms and nothing to show: the bare search page, just the form and the
+    // syntax help. With hits in hand there *is* something to show even without
+    // terms — browsing a collection is exactly that, and the collection cards on
+    // the homepage link to it.
+    if q.is_empty() && hits.is_empty() {
         return page_html("Search", "search", &c);
     }
 
@@ -1435,6 +1439,25 @@ mod tests {
         assert!(html.contains("href=\"/ui/stats\""), "but it must link to where they live");
     }
 
+
+    #[test]
+    fn an_empty_query_with_hits_still_renders_them() {
+        // Browsing a collection: no terms, but results. The page used to stop
+        // at the search form and drop them on the floor, which is what made the
+        // homepage collection cards look broken.
+        let mut h = hit("https://obst-pdfs.23.nu/monatshefte-ocr/Band_01.pdf", "20260814173550", "Band 01");
+        h.collection = Some("monatshefte".to_owned());
+        let html = search_html("", &[h], None, None, Some("monatshefte"), false);
+        assert!(html.contains("Band 01"), "the hit must be rendered");
+        assert!(html.contains("in collection"));
+    }
+
+    #[test]
+    fn the_bare_search_page_stays_bare() {
+        let html = search_html("", &[], None, None, None, false);
+        assert!(!html.contains("class=\"result-title\""));
+        assert!(html.contains("Query language"));
+    }
 
     #[test]
     fn homepage_shows_collection_cards() {
