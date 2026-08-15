@@ -35,6 +35,20 @@ this project does not yet publish tagged releases, so everything lands under
   the lock failed on the spot — and on the indexer that loses a record, because
   a failed object is marked as seen regardless.
 
+- **The collection filter is a query, not a sieve over the results.** `/search`
+  and `/ui/search` retrieved the top N and then dropped everything not in the
+  requested collection. With 4.1 million web captures next to a few thousand
+  books, the whole first page is archive long before a book appears — so the
+  filter reliably returned nothing, and the collection cards on the homepage led
+  to an empty result page. The collection is indexed as a raw string precisely
+  so Tantivy can do this itself; it is now a `TermQuery` combined with the
+  parsed terms.
+
+  An empty query with a collection now means "browse this collection" rather
+  than "no results", which is what a collection card is asking for. Against an
+  index written before the field existed, a collection filter returns nothing —
+  no document there has a collection — rather than silently ignoring the filter.
+
 - **A PDF whose extraction failed is tried again.** The collection indexer
   marked every object as seen the moment it had written a CDX record —
   including objects where Tika had just crashed or timed out. The next run

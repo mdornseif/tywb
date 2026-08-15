@@ -6,10 +6,10 @@
 
 use std::path::Path;
 use tantivy::{
-    Index, IndexWriter, IndexReader, ReloadPolicy, TantivyDocument,
-    schema::{Schema, Field, NumericOptions, STRING, TEXT, STORED},
+    Index, IndexWriter, IndexReader, ReloadPolicy, TantivyDocument, Term,
+    schema::{Schema, Field, IndexRecordOption, NumericOptions, STRING, TEXT, STORED},
     directory::MmapDirectory,
-    query::QueryParser,
+    query::{AllQuery, BooleanQuery, Occur, Query, QueryParser, TermQuery},
     collector::TopDocs,
 };
 use thiserror::Error;
@@ -217,19 +217,59 @@ fn schema_compat(stored: &Schema, target: &Schema) -> Result<SchemaCompat> {
 
 // ── Shared search implementation ──────────────────────────────────────────────
 
+/// What to search for: terms, a collection, or both.
+///
+/// The collection is a *query* filter, not a filter over the results. Applying
+/// it afterwards looks equivalent and is not: the archive holds millions of web
+/// captures and a collection holds thousands of books, so on any ordinary word
+/// the whole result page is filled by the archive long before a single book
+/// appears, and filtering that page yields nothing. The collection is indexed
+/// as a raw string precisely so Tantivy can do this itself.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SearchQuery<'a> {
+    /// Terms for the title and body fields. Empty means "everything", which is
+    /// what a collection card links to — browse this collection.
+    pub terms: &'a str,
+    /// Restrict to one collection by name.
+    pub collection: Option<&'a str>,
+    pub limit: usize,
+    /// Optional 14-digit timestamp bounds, applied after retrieval.
+    pub from_ts: Option<u64>,
+    pub to_ts: Option<u64>,
+}
+
 fn search_impl(
     index: &Index,
     reader: &IndexReader,
     fields: &Fields,
-    query_str: &str,
-    limit: usize,
-    from_ts: Option<u64>,
-    to_ts: Option<u64>,
+    q: SearchQuery<'_>,
 ) -> Result<Vec<SearchHit>> {
+    let SearchQuery { terms, collection, limit, from_ts, to_ts } = q;
     let searcher = reader.searcher();
 
-    let qp = QueryParser::for_index(index, vec![fields.title, fields.body]);
-    let query = qp.parse_query(query_str)?;
+    let terms = terms.trim();
+    let text_query: Box<dyn Query> = if terms.is_empty() {
+        // No terms: every document, so a collection filter alone can browse.
+        Box::new(AllQuery)
+    } else {
+        let qp = QueryParser::for_index(index, vec![fields.title, fields.body]);
+        qp.parse_query(terms)?
+    };
+
+    let query: Box<dyn Query> = match collection {
+        None => text_query,
+        // An index written before the field existed carries no collection on
+        // any document, so no document can match — say so by returning nothing
+        // rather than by quietly ignoring the filter.
+        Some(_) if fields.collection.is_none() => return Ok(Vec::new()),
+        Some(name) => {
+            let term = Term::from_field_text(fields.collection.expect("checked above"), name);
+            Box::new(BooleanQuery::new(vec![
+                (Occur::Must, text_query),
+                (Occur::Must, Box::new(TermQuery::new(term, IndexRecordOption::Basic))),
+            ]))
+        }
+    };
 
     // Fetch extra results when post-filtering by timestamp is needed.
     let fetch_limit = if from_ts.is_some() || to_ts.is_some() {
@@ -410,14 +450,8 @@ impl SearchIndex {
     ///
     /// `from_ts` / `to_ts` are optional 14-digit timestamps (as u64) to filter
     /// by capture date.  Filtering is applied post-retrieval.
-    pub fn search(
-        &self,
-        query_str: &str,
-        limit: usize,
-        from_ts: Option<u64>,
-        to_ts: Option<u64>,
-    ) -> Result<Vec<SearchHit>> {
-        search_impl(&self.index, &self.reader, &self.fields, query_str, limit, from_ts, to_ts)
+    pub fn search(&self, q: SearchQuery<'_>) -> Result<Vec<SearchHit>> {
+        search_impl(&self.index, &self.reader, &self.fields, q)
     }
 
     /// Total number of documents visible to the current reader.
@@ -453,14 +487,8 @@ impl SearchReader {
     }
 
     /// Fulltext search (same semantics as [`SearchIndex::search`]).
-    pub fn search(
-        &self,
-        query_str: &str,
-        limit: usize,
-        from_ts: Option<u64>,
-        to_ts: Option<u64>,
-    ) -> Result<Vec<SearchHit>> {
-        search_impl(&self.index, &self.reader, &self.fields, query_str, limit, from_ts, to_ts)
+    pub fn search(&self, q: SearchQuery<'_>) -> Result<Vec<SearchHit>> {
+        search_impl(&self.index, &self.reader, &self.fields, q)
     }
 
     /// Total number of indexed documents.
@@ -567,7 +595,7 @@ mod tests {
         .unwrap();
         idx.commit().unwrap();
 
-        let hits = idx.search("illustrative", 10, None, None).unwrap();
+        let hits = idx.search(SearchQuery { terms: "illustrative", limit: 10, from_ts: None, to_ts: None, ..Default::default() }).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].url, "https://example.com/");
     }
@@ -585,7 +613,7 @@ mod tests {
         .unwrap();
         idx.commit().unwrap();
 
-        let hits = idx.search("UniqueXYZTitle", 10, None, None).unwrap();
+        let hits = idx.search(SearchQuery { terms: "UniqueXYZTitle", limit: 10, from_ts: None, to_ts: None, ..Default::default() }).unwrap();
         assert_eq!(hits.len(), 1);
     }
 
@@ -597,7 +625,7 @@ mod tests {
             .unwrap();
         idx.commit().unwrap();
 
-        let hits = idx.search("xyzzy_nonexistent_term", 10, None, None).unwrap();
+        let hits = idx.search(SearchQuery { terms: "xyzzy_nonexistent_term", limit: 10, from_ts: None, to_ts: None, ..Default::default() }).unwrap();
         assert!(hits.is_empty());
     }
 
@@ -616,7 +644,7 @@ mod tests {
         }
         idx.commit().unwrap();
 
-        let hits = idx.search("rust", 3, None, None).unwrap();
+        let hits = idx.search(SearchQuery { terms: "rust", limit: 3, from_ts: None, to_ts: None, ..Default::default() }).unwrap();
         assert!(hits.len() <= 3);
     }
 
@@ -634,7 +662,7 @@ mod tests {
             .unwrap();
         idx.commit().unwrap();
 
-        let hits = idx.search("rust", 10, Some(20240601000000), None).unwrap();
+        let hits = idx.search(SearchQuery { terms: "rust", limit: 10, from_ts: Some(20240601000000), to_ts: None, ..Default::default() }).unwrap();
         assert_eq!(hits.len(), 2);
         for h in &hits {
             let ts: u64 = h.timestamp.parse().unwrap();
@@ -654,7 +682,7 @@ mod tests {
             .unwrap();
         idx.commit().unwrap();
 
-        let hits = idx.search("rust", 10, None, Some(20240601235959)).unwrap();
+        let hits = idx.search(SearchQuery { terms: "rust", limit: 10, from_ts: None, to_ts: Some(20240601235959), ..Default::default() }).unwrap();
         assert_eq!(hits.len(), 2);
     }
 
@@ -671,7 +699,7 @@ mod tests {
         idx.commit().unwrap();
 
         let hits = idx
-            .search("rust", 10, Some(20240601000000), Some(20240701000000))
+            .search(SearchQuery { terms: "rust", limit: 10, from_ts: Some(20240601000000), to_ts: Some(20240701000000), ..Default::default() })
             .unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].url, "https://b.com/");
@@ -690,7 +718,7 @@ mod tests {
         }
         let idx = SearchIndex::open_or_create(dir.path()).unwrap();
         assert_eq!(idx.num_docs(), 1);
-        let hits = idx.search("content", 10, None, None).unwrap();
+        let hits = idx.search(SearchQuery { terms: "content", limit: 10, from_ts: None, to_ts: None, ..Default::default() }).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].url, "https://persist.com/");
     }
@@ -706,7 +734,7 @@ mod tests {
         }
         let reader = SearchReader::open(dir.path()).unwrap();
         assert_eq!(reader.num_docs(), 1);
-        let hits = reader.search("content", 10, None, None).unwrap();
+        let hits = reader.search(SearchQuery { terms: "content", limit: 10, from_ts: None, to_ts: None, ..Default::default() }).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].url, "https://reader-test.com/");
     }
@@ -731,7 +759,7 @@ mod tests {
         .unwrap();
         idx.commit().unwrap();
 
-        let hits = idx.search("complete", 1, None, None).unwrap();
+        let hits = idx.search(SearchQuery { terms: "complete", limit: 1, from_ts: None, to_ts: None, ..Default::default() }).unwrap();
         assert_eq!(hits.len(), 1);
         let h = &hits[0];
         assert_eq!(h.url, "https://full.com/page");
@@ -752,8 +780,116 @@ mod tests {
             .unwrap();
         idx.commit().unwrap();
 
-        let hits = idx.search("keyword", 1, None, None).unwrap();
+        let hits = idx.search(SearchQuery { terms: "keyword", limit: 1, from_ts: None, to_ts: None, ..Default::default() }).unwrap();
         assert_eq!(hits[0].timestamp, "20240101090501");
+    }
+
+    // ── Collection as a query filter ──────────────────────────────────────
+
+    /// An archive that dwarfs its collections, which is the situation the
+    /// filter has to survive: thousands of web captures, a handful of books.
+    fn lopsided_index(dir: &Path) -> SearchIndex {
+        let mut idx = SearchIndex::open_or_create(dir).unwrap();
+        for i in 0..300u64 {
+            idx.add_document(&doc(
+                &format!("https://example.com/{i}"),
+                &format!("Seite {i}"),
+                "obstbau im garten",
+                20240101000000 + i,
+            ))
+            .unwrap();
+        }
+        let mut book = doc(
+            "https://obst-pdfs.23.nu/monatshefte-ocr/Band_01.pdf",
+            "Pomologische Monatshefte Band 1",
+            "obstbau im garten",
+            20260101000000,
+        );
+        book.collection = "monatshefte".to_owned();
+        idx.add_document(&book).unwrap();
+        idx.commit().unwrap();
+        idx
+    }
+
+    #[test]
+    fn collection_filter_finds_a_needle_the_archive_would_bury() {
+        // The whole point: post-filtering the top N returns nothing here,
+        // because 300 web pages outrank one book on the same term.
+        let dir = tempdir().unwrap();
+        let idx = lopsided_index(dir.path());
+
+        let unfiltered = idx.search(SearchQuery { terms: "obstbau", limit: 10, ..Default::default() }).unwrap();
+        assert_eq!(unfiltered.len(), 10);
+        assert!(
+            unfiltered.iter().all(|h| h.collection.as_deref() != Some("monatshefte")),
+            "the book does not make the first page — that is why filtering afterwards fails",
+        );
+
+        let filtered = idx.search(SearchQuery {
+            terms: "obstbau",
+            collection: Some("monatshefte"),
+            limit: 10,
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].collection.as_deref(), Some("monatshefte"));
+    }
+
+    #[test]
+    fn an_empty_query_browses_one_collection() {
+        // What a collection card on the homepage links to: no terms, just a
+        // collection. It must list that collection, not everything and not
+        // nothing.
+        let dir = tempdir().unwrap();
+        let idx = lopsided_index(dir.path());
+
+        let hits = idx.search(SearchQuery {
+            terms: "   ",
+            collection: Some("monatshefte"),
+            limit: 50,
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].title, "Pomologische Monatshefte Band 1");
+
+        // Without a collection, an empty query is still "everything".
+        let all = idx.search(SearchQuery { terms: "", limit: 500, ..Default::default() }).unwrap();
+        assert_eq!(all.len(), 301);
+    }
+
+    #[test]
+    fn filtering_an_unknown_collection_finds_nothing() {
+        let dir = tempdir().unwrap();
+        let idx = lopsided_index(dir.path());
+        let hits = idx.search(SearchQuery {
+            terms: "obstbau",
+            collection: Some("does-not-exist"),
+            limit: 10,
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn a_pre_collection_index_answers_a_collection_filter_with_nothing() {
+        // No document in such an index has a collection, so none can match.
+        // Ignoring the filter instead would answer a question nobody asked.
+        let dir = tempdir().unwrap();
+        write_legacy_index(dir.path(), &["https://old.com/1"]);
+        let idx = SearchIndex::open_or_create(dir.path()).unwrap();
+
+        assert_eq!(idx.search(SearchQuery { terms: "legacy", limit: 10, ..Default::default() }).unwrap().len(), 1);
+        assert!(idx.search(SearchQuery {
+            terms: "legacy",
+            collection: Some("warc"),
+            limit: 10,
+            ..Default::default()
+        })
+        .unwrap()
+        .is_empty());
     }
 
     // ── Schema compatibility ──────────────────────────────────────────────────
@@ -847,7 +983,7 @@ mod tests {
         let idx = SearchIndex::open_or_create(dir.path()).unwrap();
         assert_eq!(idx.num_docs(), 2, "existing documents are left alone");
 
-        let hits = idx.search("legacy", 10, None, None).unwrap();
+        let hits = idx.search(SearchQuery { terms: "legacy", limit: 10, from_ts: None, to_ts: None, ..Default::default() }).unwrap();
         assert_eq!(hits.len(), 2);
         assert!(hits.iter().all(|h| h.collection.is_none()));
     }
@@ -866,7 +1002,7 @@ mod tests {
 
         // The document is indexed and findable — only its collection is lost,
         // which is what the warning on open says.
-        let hits = idx.search("Bigarreau", 10, None, None).unwrap();
+        let hits = idx.search(SearchQuery { terms: "Bigarreau", limit: 10, from_ts: None, to_ts: None, ..Default::default() }).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].url, "https://obst.example/1.pdf");
         assert!(hits[0].collection.is_none());
@@ -895,7 +1031,7 @@ mod tests {
 
         assert_eq!(idx.index.searchable_segment_ids().unwrap().len(), 1);
         assert_eq!(idx.num_docs(), 3);
-        assert_eq!(idx.search("legacy", 10, None, None).unwrap().len(), 3);
+        assert_eq!(idx.search(SearchQuery { terms: "legacy", limit: 10, from_ts: None, to_ts: None, ..Default::default() }).unwrap().len(), 3);
     }
 
     // ── Per-file replace (delete_s3_key) ────────────────────────────────────────
@@ -914,7 +1050,7 @@ mod tests {
         idx.delete_s3_key("fileA.warc.gz").unwrap();
         idx.commit().unwrap();
         assert_eq!(idx.num_docs(), 1);
-        let hits = idx.search("indexable", 10, None, None).unwrap();
+        let hits = idx.search(SearchQuery { terms: "indexable", limit: 10, from_ts: None, to_ts: None, ..Default::default() }).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].s3_key, "fileB.warc.gz");
     }

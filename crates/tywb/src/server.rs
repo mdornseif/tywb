@@ -37,7 +37,7 @@ use tracing::{debug, error, info, warn};
 use warc_search_cdx::{CdxRecord, CdxStore, surt::to_surt};
 use warc_search_config::Config;
 use warc_search_s3::build_client;
-use warc_search_search::SearchReader;
+use warc_search_search::{SearchQuery, SearchReader};
 
 use crate::http_payload::{MAX_DECODED_BYTES, parse_http_block};
 use crate::pdf::PdfExtractor;
@@ -312,12 +312,16 @@ async fn ui_search_handler(
 
     debug!(q = %q, from = ?from_ts, to = ?to_ts, limit, "ui search");
 
-    match state.search.search(&q, limit, from_ts, to_ts) {
+    // The collection goes into the query, not over the results: see SearchQuery.
+    match state.search.search(SearchQuery {
+        terms: &q,
+        collection: params.collection.as_deref().filter(|c| !c.is_empty()),
+        limit,
+        from_ts,
+        to_ts,
+    }) {
         Ok(mut hits) => {
             hits.retain(|h| !state.config.indexer.is_url_blacklisted(&h.url));
-            if let Some(coll) = params.collection.as_deref() {
-                hits.retain(|h| h.collection.as_deref() == Some(coll));
-            }
             Html(ui::search_html(
                 &q, &hits,
                 params.from.as_deref(),
@@ -624,12 +628,15 @@ async fn search_handler(
 
     debug!(q = %params.q, from = ?from_ts, to = ?to_ts, limit, "search");
 
-    match state.search.search(&params.q, limit, from_ts, to_ts) {
+    match state.search.search(SearchQuery {
+        terms: &params.q,
+        collection: params.collection.as_deref().filter(|c| !c.is_empty()),
+        limit,
+        from_ts,
+        to_ts,
+    }) {
         Ok(mut hits) => {
             hits.retain(|h| !state.config.indexer.is_url_blacklisted(&h.url));
-            if let Some(coll) = params.collection.as_deref() {
-                hits.retain(|h| h.collection.as_deref() == Some(coll));
-            }
             Json(hits).into_response()
         }
         Err(e) => {
