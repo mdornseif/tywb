@@ -221,11 +221,16 @@ async fn index_one_pdf(
             return Ok(PdfOutcome::NoText);
         }
         // The file itself, or a limit set for it: the same answer next time.
-        Err(e @ (ExtractError::TooLarge { .. } | ExtractError::Truncated)) => {
+        // `Empty` belongs here — Tika parsed the document and found no text,
+        // which is a fact about the document (a scan with no text layer, with
+        // OCR off). Retrying it would re-download and re-parse hundreds of
+        // megabytes every run to be told the same thing.
+        Err(e @ (ExtractError::TooLarge { .. } | ExtractError::Truncated | ExtractError::Empty)) => {
             warn!(url, bytes = bytes.len(), reason = %e, "PDF not extracted");
             return Ok(PdfOutcome::NoText);
         }
-        // Tika: this run, not this file.
+        // Tika crashed, timed out, or refused the connection: this run, not
+        // this file.
         Err(e) => {
             warn!(url, err = %e, "PDF extraction failed");
             return Ok(PdfOutcome::ExtractionFailed);
