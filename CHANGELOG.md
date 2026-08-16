@@ -35,6 +35,20 @@ this project does not yet publish tagged releases, so everything lands under
   the lock failed on the spot — and on the indexer that loses a record, because
   a failed object is marked as seen regardless.
 
+- **A collection can narrow its prefix with `key_pattern`.** A prefix names a
+  contiguous run of keys, and the material worth separating is not always stored
+  that way: the 23 library digitisations in the pomologie bucket each sit in a
+  directory of their own, interleaved with 1,800 other volumes under the same
+  prefix. They are also the only ones with no text layer, so they are the one
+  body of material that OCR is for — and pointing OCR at the whole prefix
+  instead would have been days of Tesseract for nothing.
+
+  Objects that do not match are left untouched rather than recorded as seen, so
+  a later collection over the same prefix still gets them; within a run the
+  first collection to claim an object keeps it, so the narrower one is listed
+  first. A pattern that fails to compile stops that collection — a rule written
+  to narrow a prefix must not fail open.
+
 - **Text extraction is configured per collection.** `indexer.tika` was one
   block for every source, and a digitised library corpus and a web crawl want
   opposite settings from it. The compromise cost both: `auto` sent pre-OCR'd

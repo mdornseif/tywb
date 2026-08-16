@@ -165,6 +165,13 @@ indexer:
   #     bucket: obst-pdfs.23.nu
   #     public_base_url: "https://obst-pdfs.23.nu/"
   #     # prefix: ""   # optional key prefix
+  #     # key_pattern: ""  # optional regex over the key, on top of the prefix.
+  #     #   A prefix can only name a contiguous run of keys. When the material
+  #     #   worth separating is interleaved with the rest — a digitisation whose
+  #     #   volumes each sit in their own directory — the pattern names the rest
+  #     #   of the rule. Non-matching objects are left untouched, not recorded as
+  #     #   seen, so a later collection over the same prefix still gets them:
+  #     #   list the narrower collection first and it claims what is its.
   #   - name: pomologie
   #     type: pdf_bucket
   #     bucket: obst-pdfs.23.nu

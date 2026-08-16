@@ -187,6 +187,21 @@ pub struct CollectionConfig {
     /// Optional key prefix to restrict which objects are indexed.
     #[serde(default)]
     pub prefix: Option<String>,
+    /// Optional regex over the object key, applied on top of [`prefix`].
+    ///
+    /// A prefix can only describe a contiguous run of keys, and material worth
+    /// separating is not always stored that way: a digitisation whose volumes
+    /// each live in their own directory shares its prefix with everything else
+    /// under it. The pattern names the rest of the rule.
+    ///
+    /// Same RE2 syntax as the URL skip list. Objects that do not match are left
+    /// untouched — *not* recorded as seen — so a later collection over the same
+    /// prefix still gets them. That is what lets one prefix be split between
+    /// two collections by listing the narrower one first.
+    ///
+    /// [`prefix`]: Self::prefix
+    #[serde(default)]
+    pub key_pattern: Option<String>,
     /// For `pdf_bucket`: the public base URL an object is reachable at. The
     /// record's original URL is `public_base_url` + key, e.g.
     /// `https://obst-pdfs.23.nu/` + `1152-hochstamm.pdf`.
@@ -200,6 +215,20 @@ pub struct CollectionConfig {
     /// wrong for both. See [`TikaOverride`].
     #[serde(default)]
     pub tika: Option<TikaOverride>,
+}
+
+impl CollectionConfig {
+    /// Compile [`key_pattern`], if set.
+    ///
+    /// An error here must stop the collection rather than be logged and
+    /// ignored: without the pattern the collection covers its whole prefix, and
+    /// for a rule that exists to *narrow* a prefix that is the opposite of what
+    /// was asked for — it would index, and possibly OCR, everything.
+    ///
+    /// [`key_pattern`]: Self::key_pattern
+    pub fn compile_key_pattern(&self) -> std::result::Result<Option<Regex>, regex::Error> {
+        self.key_pattern.as_deref().map(Regex::new).transpose()
+    }
 }
 
 /// Text-extraction settings for one collection.
@@ -890,6 +919,55 @@ indexer:
         .unwrap_err()
         .to_string();
         assert!(err.contains("ocr"), "error should name the stray key: {err}");
+    }
+
+    // ── Collection key patterns ───────────────────────────────────────────────
+
+    const KEY_PATTERN_YAML: &str = r#"
+s3:
+  bucket: warc
+indexer:
+  collections:
+    - name: bsb-scans
+      type: pdf_bucket
+      bucket: obst-pdfs
+      prefix: "archive-org/"
+      key_pattern: "^archive-org/[0-9]+bsb/"
+      public_base_url: "https://obst-pdfs.23.nu/"
+    - name: archive-org
+      type: pdf_bucket
+      bucket: obst-pdfs
+      prefix: "archive-org/"
+      public_base_url: "https://obst-pdfs.23.nu/"
+"#;
+
+    #[test]
+    fn a_key_pattern_narrows_a_prefix_the_two_collections_share() {
+        let cfg = Config::from_yaml(KEY_PATTERN_YAML).unwrap();
+        let narrow = cfg.indexer.collections[0].compile_key_pattern().unwrap().unwrap();
+
+        // The digitisations, each in a directory of its own — no prefix can
+        // describe them, which is why the pattern exists.
+        assert!(narrow.is_match("archive-org/10229044bsb/10229044bsb.pdf"));
+        assert!(narrow.is_match("archive-org/11756677bsb/11756677bsb.pdf"));
+        // Everything else under the same prefix stays with the wider collection.
+        assert!(!narrow.is_match("archive-org/dictionnairedepo01lero/dictionnairedepo01lero.pdf"));
+        assert!(!narrow.is_match("archive-org/CAT31309742003/cat31309742003.pdf"));
+        // And the wider collection has no pattern at all.
+        assert!(cfg.indexer.collections[1].compile_key_pattern().unwrap().is_none());
+    }
+
+    #[test]
+    fn a_broken_key_pattern_is_reported_not_swallowed() {
+        // The caller must be able to stop: a collection whose narrowing rule
+        // failed covers its whole prefix instead, which is the opposite of what
+        // the rule asked for.
+        let cfg = Config::from_yaml(
+            "s3:\n  bucket: warc\nindexer:\n  collections:\n    - name: c\n      \
+             type: pdf_bucket\n      bucket: b\n      key_pattern: \"[unclosed\"\n",
+        )
+        .unwrap();
+        assert!(cfg.indexer.collections[0].compile_key_pattern().is_err());
     }
 
     // ── Unknown keys ──────────────────────────────────────────────────────────

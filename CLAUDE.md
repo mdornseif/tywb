@@ -254,6 +254,16 @@ names it separately instead.
 `skip-urls.txt` is the shipped list. It is content that decides what gets
 deleted, so `index.rs` tests it like code.
 
+### One prefix, two collections
+`prefix` describes a contiguous run of keys; `key_pattern` (RE2, as in the skip
+list) narrows it further, for material that is interleaved rather than grouped —
+digitisations whose volumes each sit in their own directory. Non-matching
+objects are deliberately *not* marked as seen, because the ETag state is shared
+across collections within a run: the first collection to claim an object keeps
+it, so the narrower collection is listed first and the wider one takes the rest.
+A pattern that fails to compile stops that collection rather than being ignored;
+failing open would widen exactly the rule that was written to narrow.
+
 ### Tika settings belong to the collection, not to the deployment
 A digitised corpus and a web crawl want opposite extraction settings, and one
 `indexer.tika` block forced a compromise that was wrong for both: `auto` re-OCRs

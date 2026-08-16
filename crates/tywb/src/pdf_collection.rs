@@ -10,7 +10,7 @@
 //! whose ETag changed.
 
 use anyhow::{Context, Result};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use warc_search_cdx::{CdxRecord, CdxStore};
 use warc_search_config::{CollectionConfig, IndexerConfig};
@@ -71,6 +71,18 @@ pub async fn index_pdf_collection(
         warn!(name = %coll.name, "no Tika backend configured — PDFs will be listed but not searchable");
     }
 
+    // A bad key pattern stops this collection instead of being ignored: without
+    // it the collection covers its entire prefix, and a rule written to narrow a
+    // prefix must never fail open — here that would mean OCR-ing the lot.
+    let key_pattern = match coll.compile_key_pattern() {
+        Ok(p) => p,
+        Err(e) => {
+            error!(name = %coll.name, pattern = ?coll.key_pattern, err = %e,
+                   "collection key_pattern does not compile — skipping the collection");
+            return Ok(CollStats::default());
+        }
+    };
+
     let lister = {
         let l = Lister::new(s3, coll.bucket.clone());
         match &coll.prefix {
@@ -88,6 +100,11 @@ pub async fn index_pdf_collection(
     let mut stats = CollStats::default();
 
     for obj in &objects {
+        // Not ours: leave it entirely alone, without marking it seen, so a
+        // later collection over the same prefix still picks it up.
+        if key_pattern.as_ref().is_some_and(|re| !re.is_match(&obj.key)) {
+            continue;
+        }
         if !obj.is_pdf() {
             stats.skipped += 1;
             state.mark_seen(&obj.key, obj.etag.clone());

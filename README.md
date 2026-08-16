@@ -399,6 +399,37 @@ To use tywb as a deduplication server with Zeno, pass:
 | `/ui/url?url=<url>` | All archived captures for a specific URL, sorted by date |
 | `/ui/files` | List of indexed WARC files with per-file statistics |
 
+#### Splitting one prefix between two collections
+
+`prefix` can only describe a contiguous run of keys. When the material worth
+separating is interleaved with the rest — a digitisation whose volumes each sit
+in a directory of their own — add `key_pattern`, a regex over the object key in
+the same RE2 syntax as the skip list:
+
+```yaml
+    - name: bsb-scans          # listed first — it claims what is its
+      type: pdf_bucket
+      bucket: obst-pdfs.23.nu
+      prefix: "archive-org/"
+      key_pattern: "^archive-org/[0-9]+bsb/"
+      tika:
+        ocr_strategy: "ocr_only"
+    - name: archive-org        # everything else under the same prefix
+      type: pdf_bucket
+      bucket: obst-pdfs.23.nu
+      prefix: "archive-org/"
+```
+
+An object that does not match is left untouched — not recorded as seen — so a
+later collection over the same prefix still picks it up. Order therefore
+decides: within one run the first collection to claim an object keeps it, so the
+narrower one goes first.
+
+A `key_pattern` that fails to compile stops that collection rather than being
+logged and ignored. A rule written to *narrow* a prefix must not fail open:
+without it the collection would cover the whole prefix, which here would mean
+sending 1,800 volumes through OCR.
+
 #### Per-collection text extraction
 
 A collection is a body of documents with properties of its own. A digitised
