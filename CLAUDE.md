@@ -254,6 +254,15 @@ names it separately instead.
 `skip-urls.txt` is the shipped list. It is content that decides what gets
 deleted, so `index.rs` tests it like code.
 
+### Page boundaries are structure, not whitespace
+The PDF extractor asks Tika for XHTML (`/rmeta`), not plain text (`/rmeta/text`):
+only the former marks pages. `xhtml_to_text` flattens it with pages separated by
+U+000C, matching `pdftotext`/`ocrmypdf` so text from any source is handled alike.
+Two invariants keep the page numbers trustworthy, and both have tests: blank
+pages keep their slot (dropping one shifts every later page number), and
+`normalize_ws` works page by page because `trim`/`split_whitespace` treat U+000C
+as whitespace and would silently delete every marker.
+
 ### Extraction is expensive; keep what it produced
 The fulltext index does not store the body it indexes, so extracted text exists
 nowhere after a run. For scanned material that is not a detail: OCR of 23

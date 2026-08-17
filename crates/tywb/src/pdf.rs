@@ -95,9 +95,14 @@ impl PdfExtractor {
         let base = cfg.url.trim_end_matches('/');
         Self {
             agent,
-            // /rmeta/text returns text *and* metadata (title, page count) from a
-            // single parse — one request, not one for text and one for the title.
-            endpoint:      format!("{base}/rmeta/text"),
+            // /rmeta returns metadata *and* content from a single parse — one
+            // request, not one for the text and one for the title.
+            //
+            // The XHTML variant, not /rmeta/text: only this one marks page
+            // boundaries (`<div class="page">`). Plain text arrives as one
+            // undivided block, and a corpus of 400-page volumes cannot be cut
+            // into per-cultivar excerpts without knowing where a page ends.
+            endpoint:      format!("{base}/rmeta"),
             ocr_strategy:  cfg.ocr_strategy.clone(),
             ocr_languages: cfg.ocr_languages.clone(),
             max_pdf_bytes: cfg.max_pdf_bytes,
@@ -222,7 +227,7 @@ fn parse_rmeta(json: &str) -> Option<(String, String)> {
     let mut text = String::new();
     for doc in arr {
         if let Some(c) = doc.get("X-TIKA:content").and_then(Value::as_str) {
-            text.push_str(c);
+            text.push_str(&xhtml_to_text(c));
             text.push('\n');
         }
     }
@@ -231,8 +236,117 @@ fn parse_rmeta(json: &str) -> Option<(String, String)> {
     Some((title, text))
 }
 
+/// Flatten Tika's XHTML into text, keeping the one thing only it knows: where
+/// each page ends.
+///
+/// Pages are separated by U+000C FORM FEED, the convention `pdftotext` and
+/// `ocrmypdf` already use, so text from this path and text produced by those
+/// tools can be treated alike. Everything before the first page marker — Tika's
+/// `<head>` full of `<meta>` elements — is dropped rather than indexed.
+fn xhtml_to_text(xhtml: &str) -> String {
+    const PAGE_MARK: &str = "<div class=\"page\">";
+
+    let body = match xhtml.find(PAGE_MARK) {
+        Some(i) => &xhtml[i..],
+        // No page markers: not the XHTML we expect (an older Tika, or a format
+        // whose parser emits none). Take it as it is rather than lose it.
+        None => xhtml,
+    };
+
+    let mut out = String::with_capacity(body.len());
+    if !body.starts_with(PAGE_MARK) {
+        strip_tags_into(body, &mut out);
+        return out;
+    }
+    // `split` on a string that starts with the marker yields an empty first
+    // element; the pages follow. Blank pages keep their slot: dropping them
+    // would shift every page number after them, and a page number that is off
+    // by one points at the wrong cultivar.
+    for (i, page) in body.split(PAGE_MARK).skip(1).enumerate() {
+        if i > 0 {
+            out.push('\u{000c}');
+        }
+        strip_tags_into(page, &mut out);
+    }
+    out
+}
+
+/// Append `xhtml` to `out` with its tags removed and its entities resolved.
+/// Tags that end a block become a newline, so paragraphs do not run together.
+fn strip_tags_into(xhtml: &str, out: &mut String) {
+    let mut rest = xhtml;
+    while let Some(lt) = rest.find('<') {
+        push_entities(&rest[..lt], out);
+        let Some(gt) = rest[lt..].find('>') else {
+            // Unclosed tag: the remainder is not markup, keep it as text.
+            push_entities(&rest[lt..], out);
+            return;
+        };
+        let tag = &rest[lt + 1..lt + gt];
+        let name = tag.trim_start_matches('/').split([' ', '/']).next().unwrap_or("");
+        if matches!(name, "p" | "div" | "br" | "li" | "tr" | "h1" | "h2" | "h3" | "table") {
+            out.push('\n');
+        }
+        rest = &rest[lt + gt + 1..];
+    }
+    push_entities(rest, out);
+}
+
+/// Append text, resolving the XML entities Tika emits.
+fn push_entities(s: &str, out: &mut String) {
+    let mut rest = s;
+    while let Some(amp) = rest.find('&') {
+        out.push_str(&rest[..amp]);
+        let after = &rest[amp..];
+        let Some(semi) = after.find(';').filter(|i| *i <= 10) else {
+            out.push('&');
+            rest = &rest[amp + 1..];
+            continue;
+        };
+        let ent = &after[1..semi];
+        let ch = match ent {
+            "amp" => Some('&'),
+            "lt" => Some('<'),
+            "gt" => Some('>'),
+            "quot" => Some('"'),
+            "apos" => Some('\''),
+            "nbsp" => Some(' '),
+            _ => ent
+                .strip_prefix('#')
+                .and_then(|n| match n.strip_prefix(['x', 'X']) {
+                    Some(hex) => u32::from_str_radix(hex, 16).ok(),
+                    None => n.parse::<u32>().ok(),
+                })
+                .and_then(char::from_u32),
+        };
+        match ch {
+            Some(c) => out.push(c),
+            // Not an entity we know: leave it exactly as written.
+            None => out.push_str(&after[..=semi]),
+        }
+        rest = &after[semi + 1..];
+    }
+    out.push_str(rest);
+}
+
 /// Collapse whitespace: many single spaces and newlines, one blank line max.
 fn normalize_ws(s: &str) -> String {
+    // Page by page: `trim` and `split_whitespace` both treat U+000C as ordinary
+    // whitespace and would quietly eat every page marker — the one piece of
+    // structure the XHTML parse exists to preserve.
+    let mut out = String::with_capacity(s.len());
+    let mut first = true;
+    for page in s.split('\u{000c}') {
+        if !first {
+            out.push('\u{000c}');
+        }
+        first = false;
+        out.push_str(&normalize_ws_page(page));
+    }
+    out
+}
+
+fn normalize_ws_page(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut blank_run = 0;
     for line in s.lines() {
@@ -429,6 +543,88 @@ mod tests {
             "Vanicek - Obstbau im Garten",
         );
         assert_eq!(title_from_url("https://x.de/a/b/"), "b");
+    }
+
+    // ── XHTML → text, with page boundaries ────────────────────────────────
+
+    #[test]
+    fn pages_are_separated_by_a_form_feed() {
+        // The whole reason for using Tika's XHTML: /rmeta/text hands back one
+        // undivided block, and a 400-page volume cannot be cut into per-cultivar
+        // excerpts without knowing where a page ends.
+        let xhtml = concat!(
+            "<html><head><meta name=\"pdf:PDFVersion\" content=\"1.6\"/></head><body>",
+            "<div class=\"page\"><p>Seite eins</p></div>",
+            "<div class=\"page\"><p>Seite zwei</p></div>",
+            "</body></html>",
+        );
+        let text = xhtml_to_text(xhtml);
+        let pages: Vec<&str> = text.split('\u{000c}').map(str::trim).collect();
+        assert_eq!(pages.len(), 2);
+        assert_eq!(pages[0], "Seite eins");
+        assert_eq!(pages[1], "Seite zwei");
+    }
+
+    #[test]
+    fn the_metadata_head_is_not_indexed() {
+        // Tika's <head> is a wall of <meta> elements. It is markup about the
+        // document, not text of it.
+        let xhtml = "<html><head><meta name=\"xmp:CreatorTool\" content=\"Acrobat PDFMaker\"/>\
+                     </head><body><div class=\"page\"><p>Obstbau</p></div></body></html>";
+        let text = xhtml_to_text(xhtml);
+        assert!(!text.contains("PDFMaker"), "got: {text:?}");
+        assert!(text.contains("Obstbau"));
+    }
+
+    #[test]
+    fn entities_come_back_as_characters() {
+        let xhtml = "<div class=\"page\"><p>Gr&#246;&#223;e &amp; G&uuml;te &lt;1 kg&gt;</p></div>";
+        // &uuml; is HTML, not XML — Tika emits numeric references, and anything
+        // unknown must survive rather than be swallowed.
+        let text = xhtml_to_text(xhtml);
+        assert!(text.contains("Größe & G"), "got: {text:?}");
+        assert!(text.contains("<1 kg>"));
+        assert!(text.contains("&uuml;"), "an unknown entity is left as written");
+    }
+
+    #[test]
+    fn a_blank_page_keeps_its_slot() {
+        // Page numbers are the whole point. Dropping an empty scan would shift
+        // every page after it, and an off-by-one page number points at the
+        // wrong cultivar.
+        let xhtml = concat!(
+            "<div class=\"page\"><p>eins</p></div>",
+            "<div class=\"page\"></div>",
+            "<div class=\"page\"><p>drei</p></div>",
+        );
+        let pages: Vec<String> = normalize_ws(&xhtml_to_text(xhtml))
+            .split('\u{000c}')
+            .map(|p| p.trim().to_owned())
+            .collect();
+        assert_eq!(pages, vec!["eins", "", "drei"]);
+    }
+
+    #[test]
+    fn whitespace_normalisation_keeps_the_page_markers() {
+        // Runs of blank lines collapse to one, as documented — the marker
+        // between the pages is what must not be swallowed.
+        let text = normalize_ws("Apfel   und\n\n\n  Birne\u{000c}\n Kirsche  \n");
+        assert_eq!(text, "Apfel und\n\nBirne\u{000c}Kirsche");
+    }
+
+    #[test]
+    fn xhtml_without_page_markers_is_kept_whole() {
+        // An older Tika, or a parser that emits no pages: take the text rather
+        // than lose the document.
+        let text = xhtml_to_text("<html><body><p>Kein Seitenmarker</p></body></html>");
+        assert!(text.contains("Kein Seitenmarker"));
+        assert!(!text.contains('\u{000c}'));
+    }
+
+    #[test]
+    fn block_tags_keep_paragraphs_apart() {
+        let text = xhtml_to_text("<div class=\"page\"><p>Apfel</p><p>Birne</p></div>");
+        assert!(text.contains("Apfel\nBirne") || text.contains("Apfel\n\nBirne"), "got: {text:?}");
     }
 
     #[test]

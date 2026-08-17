@@ -35,6 +35,21 @@ this project does not yet publish tagged releases, so everything lands under
   the lock failed on the spot — and on the indexer that loses a record, because
   a failed object is marked as seen regardless.
 
+- **Extraction keeps page boundaries.** Tika was asked for `/rmeta/text`, which
+  returns a document as one undivided block. That is enough to search a page and
+  not enough to do anything with a 400-page volume: cutting a per-cultivar
+  excerpt out of a pomological work needs to know where a page ends. Only the
+  XHTML variant marks them (`<div class="page">`), so that is what the extractor
+  asks for now, flattened to text with pages separated by U+000C — the
+  convention `pdftotext` and `ocrmypdf` already use, so text from either source
+  can be handled alike.
+
+  Two details decide whether the page numbers are worth anything, and both are
+  under test: a blank page keeps its slot (dropping it would shift every page
+  after it, and an off-by-one page number points at the wrong cultivar), and
+  whitespace normalisation no longer eats the markers — `trim` treats U+000C as
+  ordinary whitespace.
+
 - **OCR of Fraktur is folded into the letters people type.** Tesseract returns
   what is printed, and Fraktur prints the long s: `ſ` is a different code point
   from `s`, so an index built from it answers `Obſt` and not `Obst`. Measured on
