@@ -35,6 +35,34 @@ this project does not yet publish tagged releases, so everything lands under
   the lock failed on the spot — and on the indexer that loses a record, because
   a failed object is marked as seen regardless.
 
+- **OCR of Fraktur is folded into the letters people type.** Tesseract returns
+  what is printed, and Fraktur prints the long s: `ſ` is a different code point
+  from `s`, so an index built from it answers `Obſt` and not `Obst`. Measured on
+  22 freshly OCR'd library volumes — `Obst` found none of them, `Obſt` found 21.
+  A corpus nobody can search with modern spelling is not searchable.
+
+  `pdf::normalise_historic_forms` folds the long s and the `ﬁ`/`ﬂ`/`ﬀ`
+  ligatures before the quality gate sees the text, so both the indexer and
+  `/text` get it. Deliberately a short explicit table rather than Unicode NFKC,
+  which would also rewrite fractions, superscripts and full-width forms — none
+  of which is the problem.
+
+- **`store_text`: the extracted text is kept beside the object.** Extraction is
+  the expensive half of indexing scanned material (17.5 hours for 23 volumes)
+  and its result existed nowhere afterwards — the fulltext index does not store
+  the body it indexes. Every later improvement to text handling therefore cost
+  those hours again, which in practice means it does not happen: the long-s fix
+  above needed a second full OCR run purely to re-derive text we had already
+  produced.
+
+  With `store_text: true` a collection writes `<key>.tywb.txt` next to each
+  object and reads it back on the next run instead of extracting again. The
+  first line binds the text to the ETag it came from, so a re-uploaded file is
+  re-extracted rather than served a stale copy. Off by default — writing into
+  someone's bucket is not something to start doing unasked — and the suffix is
+  not a bare `.txt`, because these buckets already carry `.txt` files from the
+  tools that made the PDFs.
+
 - **A collection can narrow its prefix with `key_pattern`.** A prefix names a
   contiguous run of keys, and the material worth separating is not always stored
   that way: the 23 library digitisations in the pomologie bucket each sit in a

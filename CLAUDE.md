@@ -254,6 +254,21 @@ names it separately instead.
 `skip-urls.txt` is the shipped list. It is content that decides what gets
 deleted, so `index.rs` tests it like code.
 
+### Extraction is expensive; keep what it produced
+The fulltext index does not store the body it indexes, so extracted text exists
+nowhere after a run. For scanned material that is not a detail: OCR of 23
+library volumes took 17.5 hours, and the first improvement to text handling
+(folding the Fraktur long s) had to pay for all of it again just to re-derive
+text we already had. A collection with `store_text: true` writes
+`<key>.tywb.txt` beside each object and reads it back next time; the header line
+binds it to the source ETag, so replaced objects are re-extracted rather than
+served stale. Off by default: writing into someone's bucket is not a default.
+
+`pdf::normalise_historic_forms` runs before the quality gate, so the indexer and
+`/text` see the same text. It folds the long s (`ſ`) and the f-ligatures and
+nothing else — NFKC would also rewrite fractions and full-width forms, which is
+a much larger promise than the problem needs.
+
 ### One prefix, two collections
 `prefix` describes a contiguous run of keys; `key_pattern` (RE2, as in the skip
 list) narrows it further, for material that is interleaved rather than grouped —

@@ -207,6 +207,22 @@ pub struct CollectionConfig {
     /// `https://obst-pdfs.23.nu/` + `1152-hochstamm.pdf`.
     #[serde(default)]
     pub public_base_url: Option<String>,
+    /// Keep the extracted text next to the object in the bucket, as
+    /// `<key>.tywb.txt`, and read it back instead of extracting again.
+    ///
+    /// Extraction is the expensive half of indexing this kind of material —
+    /// OCR-ing 23 library scans took 17.5 hours — and its result exists nowhere
+    /// afterwards: the fulltext index does not store the body it indexed. So
+    /// any later improvement to text handling costs those hours again. With the
+    /// text kept beside the object, it costs minutes.
+    ///
+    /// The sidecar records the ETag of the object it came from and is ignored
+    /// when that no longer matches, so a re-uploaded file is re-extracted
+    /// rather than served from a stale copy. Requires write access to the
+    /// bucket; off by default, because writing into someone's bucket is not
+    /// something to start doing unasked.
+    #[serde(default)]
+    pub store_text: bool,
     /// Per-collection text-extraction settings, layered over the global
     /// [`IndexerConfig::tika`]. A collection is a body of documents with
     /// properties of its own — one that arrives pre-OCR'd wants `no_ocr` and a

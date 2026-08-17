@@ -399,6 +399,30 @@ To use tywb as a deduplication server with Zeno, pass:
 | `/ui/url?url=<url>` | All archived captures for a specific URL, sorted by date |
 | `/ui/files` | List of indexed WARC files with per-file statistics |
 
+#### Keeping the extracted text
+
+The fulltext index does not store the body it indexes, so after a run the
+extracted text exists nowhere. For born-digital PDFs that hardly matters; for a
+scanned corpus it decides what is possible later. OCR-ing 23 library volumes
+took 17.5 hours, and the first improvement to text handling afterwards — folding
+the Fraktur long s so `Obst` finds `Obſt` — had to pay all of it again purely to
+re-derive text that had already been produced once.
+
+```yaml
+    - name: bsb-scans
+      type: pdf_bucket
+      store_text: true
+```
+
+The collection then writes `<key>.tywb.txt` beside each object and reads it back
+on the next run instead of calling Tika. The first line binds the text to the
+ETag it came from, so a replaced object is re-extracted rather than served a
+stale copy. The suffix is not a bare `.txt` on purpose: these buckets already
+carry `.txt` files from the tools that produced the PDFs.
+
+Off by default — it needs write access to the bucket, and writing into someone's
+bucket is not a sensible default.
+
 #### Splitting one prefix between two collections
 
 `prefix` can only describe a contiguous run of keys. When the material worth

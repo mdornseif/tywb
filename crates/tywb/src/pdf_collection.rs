@@ -10,12 +10,12 @@
 //! whose ETag changed.
 
 use anyhow::{Context, Result};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use warc_search_cdx::{CdxRecord, CdxStore};
 use warc_search_config::{CollectionConfig, IndexerConfig};
 use warc_search_search::{IndexDoc, SearchIndex};
-use warc_search_s3::{get_bytes, ListState, Lister};
+use warc_search_s3::{get_bytes, put_object, ListState, Lister};
 
 use crate::pdf::{ExtractError, PdfExtractor};
 
@@ -159,6 +159,66 @@ pub async fn index_pdf_collection(
     Ok(stats)
 }
 
+// ── Extracted text, kept beside the object ────────────────────────────────────
+//
+// Extraction is the expensive half of indexing a scanned corpus — OCR of 23
+// library volumes took 17.5 hours — and afterwards the result exists nowhere:
+// the fulltext index does not store the body it indexed. Every later
+// improvement to text handling therefore costs those hours again, which in
+// practice means the improvement does not happen.
+//
+// With `store_text`, the text is written back beside the object and read from
+// there next time. The first line binds it to the exact bytes it came from, so
+// a re-uploaded file is re-extracted instead of being served a stale copy.
+
+/// Suffix for the sidecar. Deliberately not a bare `.txt`: these buckets
+/// already carry `.txt` files from other tools, and overwriting somebody else's
+/// text with ours would be a silent loss.
+const TEXT_SIDECAR_SUFFIX: &str = ".tywb.txt";
+/// First line of a sidecar: the format, and the ETag it was extracted from.
+const TEXT_SIDECAR_MAGIC: &str = "tywb-text/1";
+
+fn text_sidecar_key(key: &str) -> String {
+    format!("{key}{TEXT_SIDECAR_SUFFIX}")
+}
+
+/// Render a sidecar: one header line binding it to its source, then the text.
+fn render_text_sidecar(etag: Option<&str>, title: &str, text: &str) -> String {
+    format!(
+        "{TEXT_SIDECAR_MAGIC} source-etag={} title={}\n{text}",
+        etag.unwrap_or("-").trim_matches('"'),
+        title.replace(['\n', '\r'], " "),
+    )
+}
+
+/// Read a sidecar back, if it belongs to this exact object.
+///
+/// Returns `None` when the header is missing or names a different ETag — the
+/// object has been replaced since, and its old text describes bytes that are
+/// gone.
+fn parse_text_sidecar(body: &str, etag: Option<&str>) -> Option<(String, String)> {
+    let (header, text) = body.split_once('\n')?;
+    let header = header.strip_prefix(TEXT_SIDECAR_MAGIC)?;
+
+    let field = |name: &str| {
+        header
+            .split(&format!(" {name}="))
+            .nth(1)
+            .map(|rest| rest.split(" title=").next().unwrap_or(rest).trim().to_owned())
+    };
+    let stored_etag = field("source-etag")?;
+    let want = etag.unwrap_or("-").trim_matches('"');
+    if stored_etag != want {
+        return None;
+    }
+    let title = header
+        .split(" title=")
+        .nth(1)
+        .map(|t| t.trim().to_owned())
+        .unwrap_or_default();
+    Some((title, text.to_owned()))
+}
+
 /// What became of one PDF, and whether the next run should try it again.
 #[derive(Debug, PartialEq)]
 enum PdfOutcome {
@@ -229,17 +289,44 @@ async fn index_one_pdf(
         return Ok(PdfOutcome::NoText);
     };
 
-    // Tika extraction is a blocking call; keep it off the async runtime.
-    // `try_extract` rather than `extract`, because here the *reason* decides
-    // whether the object is done or has to be tried again.
-    let extractor = extractor.clone();
-    let url_owned = url.to_owned();
-    let bytes_owned = bytes.to_vec();
-    let doc = tokio::task::spawn_blocking(move || {
-        extractor.try_extract(&url_owned, &bytes_owned, false)
-    })
-    .await
-    .context("spawn_blocking panicked")?;
+    // Text kept from an earlier run, if it belongs to these exact bytes. This
+    // is what turns a 17-hour OCR run into a one-off.
+    let sidecar = if coll.store_text {
+        read_text_sidecar(s3, &coll.bucket, &obj.key, obj.etag.as_deref()).await
+    } else {
+        None
+    };
+
+    let doc = match sidecar {
+        Some((title, body)) => {
+            debug!(key = %obj.key, chars = body.len(), "text read from sidecar — no extraction");
+            let quality_ok = crate::pdf::looks_like_text(&body);
+            Ok(crate::pdf::PdfDoc { title, body, quality_ok })
+        }
+        None => {
+            // Tika extraction is a blocking call; keep it off the async runtime.
+            // `try_extract` rather than `extract`, because here the *reason*
+            // decides whether the object is done or has to be tried again.
+            let extractor = extractor.clone();
+            let url_owned = url.to_owned();
+            let bytes_owned = bytes.to_vec();
+            let extracted = tokio::task::spawn_blocking(move || {
+                extractor.try_extract(&url_owned, &bytes_owned, false)
+            })
+            .await
+            .context("spawn_blocking panicked")?;
+
+            // Store what the expensive step produced, before anything can go
+            // wrong with it. Quality-gate failures are stored too: the gate is a
+            // judgement about the text, and re-running OCR would not change it.
+            if coll.store_text {
+                if let Ok(d) = &extracted {
+                    write_text_sidecar(s3, &coll.bucket, &obj.key, obj.etag.as_deref(), d).await;
+                }
+            }
+            extracted
+        }
+    };
 
     let pdf_doc = match doc {
         Ok(doc) if doc.quality_ok => doc,
@@ -281,6 +368,52 @@ async fn index_one_pdf(
     Ok(PdfOutcome::Indexed)
 }
 
+/// Fetch the sidecar for `key`, if it exists and matches `etag`.
+///
+/// Every failure here is a miss, not an error: a missing, unreadable or stale
+/// sidecar just means the text has to be extracted, which is the normal path.
+async fn read_text_sidecar(
+    s3: &aws_sdk_s3::Client,
+    bucket: &str,
+    key: &str,
+    etag: Option<&str>,
+) -> Option<(String, String)> {
+    let sidecar = text_sidecar_key(key);
+    let bytes = match get_bytes(s3, bucket, &sidecar).await {
+        Ok(b) => b,
+        Err(warc_search_s3::S3Error::NotFound { .. }) => return None,
+        Err(e) => {
+            debug!(key = %sidecar, err = %e, "text sidecar unreadable — extracting instead");
+            return None;
+        }
+    };
+    let body = String::from_utf8_lossy(&bytes);
+    match parse_text_sidecar(&body, etag) {
+        Some(v) => Some(v),
+        None => {
+            debug!(key = %sidecar, "text sidecar does not match this object — extracting instead");
+            None
+        }
+    }
+}
+
+/// Write the extracted text beside the object. Best effort: a bucket that
+/// refuses the write costs nothing but the next extraction.
+async fn write_text_sidecar(
+    s3: &aws_sdk_s3::Client,
+    bucket: &str,
+    key: &str,
+    etag: Option<&str>,
+    doc: &crate::pdf::PdfDoc,
+) {
+    let sidecar = text_sidecar_key(key);
+    let body = render_text_sidecar(etag, &doc.title, &doc.body);
+    match put_object(s3, bucket, &sidecar, body.into(), "text/plain; charset=utf-8").await {
+        Ok(()) => info!(key = %sidecar, chars = doc.body.len(), "extracted text stored"),
+        Err(e) => warn!(key = %sidecar, err = %e, "could not store extracted text"),
+    }
+}
+
 /// Convert an S3 `LastModified` (RFC3339, e.g. `2026-02-27T22:18:43Z`) into a
 /// 14-digit `YYYYMMDDHHMMSS` CDX timestamp. Falls back to all-zeros when the
 /// value is missing or unparseable, which sorts before any real capture.
@@ -298,6 +431,45 @@ fn last_modified_to_ts(last_modified: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── The text sidecar ──────────────────────────────────────────────────
+
+    #[test]
+    fn a_sidecar_round_trips() {
+        let doc = crate::pdf::PdfDoc {
+            title: "Band 01".to_owned(),
+            body: "Obst und Kirschen\nzweite Zeile".to_owned(),
+            quality_ok: true,
+        };
+        let raw = render_text_sidecar(Some("\"abc123\""), &doc.title, &doc.body);
+        let (title, text) = parse_text_sidecar(&raw, Some("\"abc123\"")).unwrap();
+        assert_eq!(title, "Band 01");
+        assert_eq!(text, doc.body, "the text must come back byte for byte, newlines and all");
+    }
+
+    #[test]
+    fn a_sidecar_from_other_bytes_is_refused() {
+        // The object was re-uploaded: its old text describes bytes that no
+        // longer exist, and serving it would be worse than extracting again.
+        let raw = render_text_sidecar(Some("old-etag"), "T", "alter Text");
+        assert!(parse_text_sidecar(&raw, Some("new-etag")).is_none());
+    }
+
+    #[test]
+    fn junk_in_the_sidecar_is_a_miss_not_a_crash() {
+        for body in ["", "no header at all", "tywb-text/9 source-etag=x\ntext", "\n"] {
+            assert!(parse_text_sidecar(body, Some("x")).is_none() || body.starts_with("tywb-text/1"));
+        }
+    }
+
+    #[test]
+    fn the_sidecar_key_does_not_collide_with_other_tools() {
+        // These buckets already carry `.txt` files from the OCR pipeline that
+        // produced the PDFs; overwriting one would be a silent loss.
+        assert_eq!(text_sidecar_key("archive-org/10229044bsb/10229044bsb.pdf"),
+                   "archive-org/10229044bsb/10229044bsb.pdf.tywb.txt");
+        assert_ne!(text_sidecar_key("a/b.pdf"), "a/b.txt");
+    }
 
     // ── Which failures are the object's, and which are the run's ──────────
 

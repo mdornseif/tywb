@@ -190,6 +190,8 @@ impl PdfExtractor {
             return Err(ExtractError::Empty);
         }
 
+        // Before the gate, so the gate judges the text a reader would search.
+        let text = normalise_historic_forms(&text);
         let quality_ok = looks_like_text(&text);
 
         let title = if title.trim().is_empty() {
@@ -274,6 +276,51 @@ fn pdf_has_eof(pdf: &[u8]) -> bool {
     tail.windows(5).any(|w| w == b"%%EOF")
 }
 
+/// Fold the typography of historic prints into the letters people type.
+///
+/// OCR of Fraktur returns what is printed, and what is printed is not what
+/// anyone will search for: the long s (`ſ`) is a distinct code point from `s`,
+/// so an index built from that text answers `Obſt` and not `Obst`. Measured on
+/// 22 OCR'd library volumes: `Obst` found none of them, `Obſt` found 21. The
+/// same goes for the `ﬁ`/`ﬂ`/`ﬀ` ligatures that both Fraktur and older
+/// born-digital PDFs carry.
+///
+/// This is deliberately a short, explicit table rather than Unicode NFKC.
+/// NFKC would also fold `½` into `1⁄2`, superscripts into digits and full-width
+/// forms into ASCII — defensible for search, but a much larger change to reason
+/// about, and none of it is the problem in front of us.
+///
+/// The scan is the hot path — it runs over every extracted document — so text
+/// without any of these characters is returned untouched, with no allocation.
+pub fn normalise_historic_forms(s: &str) -> String {
+    fn replacement(c: char) -> Option<&'static str> {
+        Some(match c {
+            'ſ' => "s",   // U+017F LATIN SMALL LETTER LONG S
+            'ﬀ' => "ff",
+            'ﬁ' => "fi",
+            'ﬂ' => "fl",
+            'ﬃ' => "ffi",
+            'ﬄ' => "ffl",
+            'ﬅ' => "st",  // long s + t
+            'ﬆ' => "st",
+            _ => return None,
+        })
+    }
+
+    // ASCII-only text — nearly everything — leaves here without allocating.
+    if s.is_ascii() || !s.chars().any(|c| replacement(c).is_some()) {
+        return s.to_owned();
+    }
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match replacement(c) {
+            Some(r) => out.push_str(r),
+            None => out.push(c),
+        }
+    }
+    out
+}
+
 /// Does `s` read like prose rather than OCR noise?
 ///
 /// The guard against wrong-language or wrong-script OCR, which returns long
@@ -317,6 +364,37 @@ pub fn looks_like_text(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_long_s_becomes_an_s() {
+        // The finding that made 22 OCR'd volumes unfindable: an index built
+        // from Fraktur answers "Obſt" and not "Obst".
+        assert_eq!(normalise_historic_forms("Obſt und Kirſchen"), "Obst und Kirschen");
+        assert_eq!(normalise_historic_forms("Waſſer"), "Wasser");
+    }
+
+    #[test]
+    fn ligatures_are_spelled_out() {
+        assert_eq!(normalise_historic_forms("ﬁnden"), "finden");
+        assert_eq!(normalise_historic_forms("Pﬂaume"), "Pflaume");
+        assert_eq!(normalise_historic_forms("Schiﬀ"), "Schiff");
+    }
+
+    #[test]
+    fn ordinary_text_is_returned_unchanged() {
+        for s in ["Obst und Kirschen", "", "plain ascii 123", "Äpfel, Birnen — Größe 5"] {
+            assert_eq!(normalise_historic_forms(s), s);
+        }
+    }
+
+    #[test]
+    fn nothing_else_is_touched() {
+        // Explicitly not NFKC: fractions, superscripts and the rest keep their
+        // code points, because none of them is the problem this solves.
+        for s in ["½ Pfund", "m²", "Ｆｕｌｌｗｉｄｔｈ", "Straße"] {
+            assert_eq!(normalise_historic_forms(s), s);
+        }
+    }
 
     #[test]
     fn accepts_ordinary_prose() {

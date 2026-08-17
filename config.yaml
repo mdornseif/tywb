@@ -165,6 +165,13 @@ indexer:
   #     bucket: obst-pdfs.23.nu
   #     public_base_url: "https://obst-pdfs.23.nu/"
   #     # prefix: ""   # optional key prefix
+  #     # store_text: true  # keep the extracted text as <key>.tywb.txt beside
+  #     #   the object and read it back instead of extracting again. Extraction
+  #     #   is the expensive half — OCR of a scanned volume is tens of minutes —
+  #     #   and the index does not keep the text it indexed, so without this
+  #     #   every later improvement to text handling costs the whole run again.
+  #     #   The sidecar records the source ETag and is ignored once that
+  #     #   changes. Needs write access to the bucket; off by default.
   #     # key_pattern: ""  # optional regex over the key, on top of the prefix.
   #     #   A prefix can only name a contiguous run of keys. When the material
   #     #   worth separating is interleaved with the rest — a digitisation whose
