@@ -50,6 +50,11 @@ this project does not yet publish tagged releases, so everything lands under
   whitespace normalisation no longer eats the markers — `trim` treats U+000C as
   ordinary whitespace.
 
+  The sidecar format is versioned for the same reason: text written before this
+  change carries no page separators, and nothing in such a file says so. Reading
+  it back would hand out the cheap answer forever. `tywb-text/2` is accepted,
+  `tywb-text/1` is re-extracted.
+
 - **OCR of Fraktur is folded into the letters people type.** Tesseract returns
   what is printed, and Fraktur prints the long s: `ſ` is a different code point
   from `s`, so an index built from it answers `Obſt` and not `Obst`. Measured on

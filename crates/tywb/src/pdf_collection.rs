@@ -176,7 +176,13 @@ pub async fn index_pdf_collection(
 /// text with ours would be a silent loss.
 const TEXT_SIDECAR_SUFFIX: &str = ".tywb.txt";
 /// First line of a sidecar: the format, and the ETag it was extracted from.
-const TEXT_SIDECAR_MAGIC: &str = "tywb-text/1";
+///
+/// The version is part of the contract, not decoration. Version 1 was written
+/// from Tika's plain-text output and carries no page separators; nothing in the
+/// file says so, and a reader cannot tell the difference between a volume with
+/// no page marks and one that never had any. Bumping the version is what makes
+/// those files re-extract instead of being served forever as the cheap answer.
+const TEXT_SIDECAR_MAGIC: &str = "tywb-text/2";
 
 fn text_sidecar_key(key: &str) -> String {
     format!("{key}{TEXT_SIDECAR_SUFFIX}")
@@ -445,6 +451,18 @@ mod tests {
         let (title, text) = parse_text_sidecar(&raw, Some("\"abc123\"")).unwrap();
         assert_eq!(title, "Band 01");
         assert_eq!(text, doc.body, "the text must come back byte for byte, newlines and all");
+    }
+
+    #[test]
+    fn a_sidecar_in_an_older_format_is_refused() {
+        // Version 1 held Tika's plain text, without page separators. Nothing in
+        // such a file announces what it is missing, so the version has to.
+        let v1 = "tywb-text/1 source-etag=abc title=T\nText ohne Seitenmarken";
+        assert!(parse_text_sidecar(v1, Some("abc")).is_none());
+
+        let v2 = render_text_sidecar(Some("abc"), "T", "Seite eins\u{000c}Seite zwei");
+        let (_, text) = parse_text_sidecar(&v2, Some("abc")).unwrap();
+        assert!(text.contains('\u{000c}'), "page separators must survive the round trip");
     }
 
     #[test]
