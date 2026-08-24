@@ -605,6 +605,24 @@ async fn index_warc_object(
                     }
                     Ok(None) => { *skipped += 1; }
                     Ok(Some(mut cdx_rec)) => {
+                        // Zeno writes a DNS record for every host it resolves:
+                        // "dns:example.org?type=a", mime text/dns. That is
+                        // protocol bookkeeping, not archived content -- there is
+                        // no page behind it, and the URL has no host, so every
+                        // one of them lands in an empty-TLD bucket that /ui/browse
+                        // labels ".". On the production index that bucket held
+                        // 137,476 records (3.3 % of everything, a third again as
+                        // many as all PDFs) and drilling into it listed no hosts
+                        // at all -- the count and the listing disagreed.
+                        //
+                        // The skip list cannot catch these: it matches domains
+                        // and URL patterns, and a dns: URL has no domain to name.
+                        // So the filter belongs here, at ingest.
+                        if is_bookkeeping_url(&cdx_rec.original_url) {
+                            *skipped += 1;
+                            return;
+                        }
+
                         // Skip blacklisted domains.
                         if blacklist.is_url_blacklisted(&cdx_rec.original_url) {
                             tracing::debug!(
@@ -831,6 +849,23 @@ fn truncate_on_char_boundary(mut s: String, max: usize) -> String {
     }
     s.truncate(end);
     s
+}
+
+/// True for URLs that record how the crawl ran rather than what it found.
+///
+/// Zeno writes one `dns:host?type=a` record per resolved host (mime `text/dns`).
+/// They carry no page, and having no host they cannot be named in the skip list
+/// either -- so they are dropped here, at ingest. On the production index they
+/// were 137,476 records, 3.3 % of everything, all collapsed into the empty-TLD
+/// bucket that `/ui/browse` labels ".".
+///
+/// `urn:X-wpull:log` from grab-site is the same kind of thing and belongs here
+/// too if it ever appears in numbers that matter.
+pub(crate) fn is_bookkeeping_url(url: &str) -> bool {
+    const BOOKKEEPING_SCHEMES: [&str; 1] = ["dns:"];
+    BOOKKEEPING_SCHEMES
+        .iter()
+        .any(|s| url.len() > s.len() && url[..s.len()].eq_ignore_ascii_case(s))
 }
 
 fn build_index_doc(
@@ -1303,6 +1338,19 @@ impl<R: Read> Read for CountingReader<R> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn bookkeeping_urls_are_recognised() {
+        use super::is_bookkeeping_url;
+        // Was Zeno je aufgeloestem Host schreibt.
+        assert!(is_bookkeeping_url("dns:images.ndr.de?type=a"));
+        assert!(is_bookkeeping_url("DNS:example.org?type=aaaa"));
+        // Echte Inhalte bleiben unangetastet -- auch solche, die "dns" im
+        // Namen tragen.
+        assert!(!is_bookkeeping_url("https://dns.example.org/artikel"));
+        assert!(!is_bookkeeping_url("http://example.org/dns:faq"));
+        assert!(!is_bookkeeping_url("dns:"));
+    }
+
     use super::{build_index_doc, decode_entities, extract_title, strip_html,
                 truncate_on_char_boundary};
     use std::io::Write as _;
