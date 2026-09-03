@@ -143,6 +143,39 @@ indexer:
   #   # Per-document timeout; OCR of a big scan can be slow.
   #   timeout_secs: 300
 
+  # ── OCR text cache (optional) ──────────────────────────────────────────────
+  # Decouples OCR from the index run: with this block set, `tywb index` never
+  # calls Tika itself. A PDF record's text is read from this cache (keyed by
+  # the record's content digest), and on a miss the record is *queued* for
+  # `tywb ocr-worker`, which extracts in its own process and stores the result
+  # here. The next index run — or the next full rebuild — finds the text on
+  # disk. The cache directory must live outside any per-rebuild directory, so
+  # a rebuild swap ("tywb-reindex-swap") does not move or discard it.
+  #
+  # On the WARC-path side of the indexer, extraction of a scanned PDF without a
+  # text layer is the item that made a full rebuild measure 63.7 hours of idle
+  # time (85 % of its wall time) — the OCR result ran against Tika's timeout,
+  # was discarded just short of the finish, and was forgotten with the run.
+  # See `crates/tywb/src/ocr_cache.rs` and the Arbeitssanweisung Nr. 2.
+  #
+  # ocr_cache:
+  #   path: "/var/lib/warc-search/ocr-cache"
+  #   # documents the worker extracts in parallel (Tika is memory-bound)
+  #   workers: 2
+  #   # attempts before a job is parked in <path>/failed/ (visible, not lost)
+  #   max_attempts: 3
+  #   # The worker's own Tika backend — a full `tika` block, URL included, so it
+  #   # can run against its own server with a generous timeout. Unset: the
+  #   # global indexer.tika above.
+  #   tika:
+  #     url: "http://127.0.0.1:9998"
+  #     timeout_secs: 21600
+  #
+  # Fill the cache before the next rebuild:
+  #   tywb ocr-worker --prefill
+  # then drain the queue:
+  #   tywb ocr-worker
+
   # ── Extra collections (optional) ───────────────────────────────────────────
   # Additional sources indexed alongside the primary WARC bucket (which is the
   # implicit collection "warc"). Each is searched and browsed together with the

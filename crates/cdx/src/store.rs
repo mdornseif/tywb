@@ -606,6 +606,32 @@ impl CdxStore {
         rows.map(|r| r.map_err(CdxError::from)).collect()
     }
 
+    /// Stream every PDF record of the primary WARC collection through `f`.
+    /// Returns how many records were seen.
+    ///
+    /// This is the OCR worker's prefill pass: every capture whose text is not
+    /// in the digest cache yet gets a job, so the next index run — or the next
+    /// full rebuild — starts warm. Restricted to `collection = 'warc'`, because
+    /// records of `pdf_bucket` collections are standalone objects that are not
+    /// fetched the WARC way. Records without a digest are skipped: they have no
+    /// cache key, and the next index run attends to them itself.
+    pub fn for_each_warc_pdf(&self, mut f: impl FnMut(&CdxRecord)) -> Result<usize> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT surt_url, timestamp, original, mime, status, digest, s3_key, offset, length, c_offset, collection
+             FROM cdx
+             WHERE collection = ?1
+               AND mime LIKE 'application/pdf%'
+               AND digest IS NOT NULL",
+        )?;
+        let rows = stmt.query_map(params![crate::record::DEFAULT_COLLECTION], row_to_record)?;
+        let mut seen = 0usize;
+        for rec in rows {
+            f(&rec?);
+            seen += 1;
+        }
+        Ok(seen)
+    }
+
     /// The scalar aggregates only — no `GROUP BY`, and that is the point.
     ///
     /// This is what the homepage asks for. On the production archive (4.1M
@@ -1021,6 +1047,34 @@ mod tests {
         // The schema is not touched on open, and writes are refused — which is
         // what keeps these connections from ever contending with the indexer.
         assert!(ro.upsert(&sample("org,other)/", "20240101120000", "https://other.org/")).is_err());
+    }
+
+    #[test]
+    fn prefill_sees_only_pdf_records_of_the_warc_collection() {
+        // The worker's prefill pass must not enqueue a `pdf_bucket` object:
+        // those are standalone files, fetched from their own bucket, not the
+        // WARC way.
+        let store = CdxStore::open_in_memory().unwrap();
+        let mut pdf_warc = sample("com,example)/band30.pdf", "20260101000000", "https://example.com/band30.pdf");
+        pdf_warc.mime = Some("application/pdf".to_owned());
+        let mut pdf_other = sample("nu,23,obst-pdfs)/a.pdf", "20260101000000", "https://obst-pdfs.23.nu/a.pdf");
+        pdf_other.mime = Some("application/pdf".to_owned());
+        pdf_other.collection = "monatshefte".to_owned();
+        let mut pdf_digestless = pdf_warc.clone();
+        pdf_digestless.surt_url = "com,example)/ohne.pdf".to_owned();
+        pdf_digestless.timestamp = "20260102000000".to_owned();
+        pdf_digestless.digest = None;
+        store.upsert(&pdf_warc).unwrap();
+        store.upsert(&pdf_other).unwrap();
+        store.upsert(&pdf_digestless).unwrap();
+        store.upsert(&sample("com,example)/", "20240101120000", "https://example.com/")).unwrap();
+
+        let mut seen = Vec::new();
+        let n = store
+            .for_each_warc_pdf(|rec| seen.push(rec.original_url.clone()))
+            .unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(seen, vec!["https://example.com/band30.pdf".to_owned()]);
     }
 
     #[test]

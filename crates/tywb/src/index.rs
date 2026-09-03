@@ -13,7 +13,6 @@ use std::time::Instant;
 
 use anyhow::Context;
 use bytes::Bytes;
-use serde_json;
 use tracing::{debug, info, warn, error};
 
 use warc::{WarcIter, WarcReader};
@@ -58,6 +57,10 @@ struct FileStats {
     warc_date_max:    Option<String>,
     /// MIME type → record count.
     mime_counts:      HashMap<String, u64>,
+    /// PDFs whose text came from the OCR cache, and PDFs queued for the
+    /// worker instead of being extracted here.
+    ocr_cache_hits:   usize,
+    ocr_queued:      usize,
 }
 
 impl std::ops::AddAssign<&FileStats> for FileStats {
@@ -69,6 +72,8 @@ impl std::ops::AddAssign<&FileStats> for FileStats {
         self.skipped         += o.skipped;
         self.errors          += o.errors;
         self.bytes_processed += o.bytes_processed;
+        self.ocr_cache_hits += o.ocr_cache_hits;
+        self.ocr_queued    += o.ocr_queued;
     }
 }
 
@@ -263,9 +268,25 @@ pub async fn run(cfg: Config, args: IndexArgs) -> anyhow::Result<()> {
         search.commit().context("committing fulltext deletions for blacklisted URL patterns")?;
     }
 
-    // ── S3 ────────────────────────────────────────────────────────────────────
+    // ── S3 ──────────────────────────────────────────────────────────────────
 
     let s3 = build_client(&cfg.s3).await;
+
+    // ── OCR text cache ─────────────────────────────────────────────────────────
+    // With `indexer.ocr_cache` configured, PDF text never runs in this loop:
+    // hits are read from disk, misses are queued for `tywb ocr-worker`.
+    // Failing to *open* it is fatal on purpose — a silent fallback to
+    // synchronous extraction is exactly the 74-hour run this prevents.
+    let ocr_cache = match &cfg.indexer.ocr_cache {
+        Some(c) => {
+            let cache = crate::ocr_cache::OcrCache::open(std::path::Path::new(&c.path))
+                .with_context(|| format!("opening the OCR text cache at {}", c.path))?;
+            info!(path = %c.path,
+                  "OCR text cache enabled — PDF misses are queued for `tywb ocr-worker`");
+            Some(cache)
+        }
+        None => None,
+    };
 
     let state_path = default_state_path(&cfg.storage.cdx_db_path);
     let mut state = ListState::load(&state_path)
@@ -343,6 +364,7 @@ pub async fn run(cfg: Config, args: IndexArgs) -> anyhow::Result<()> {
             &mut cdx, &mut search,
             &cfg.indexer,
             Arc::clone(&progress),
+            ocr_cache.as_ref(),
         ).await {
             Ok(mut stats) => {
                 stats.duration_secs = file_start.elapsed().as_secs_f64();
@@ -362,6 +384,8 @@ pub async fn run(cfg: Config, args: IndexArgs) -> anyhow::Result<()> {
                     skipped      = stats.skipped,
                     errors       = stats.errors,
                     mb_processed = format!("{:.1}", stats.bytes_processed as f64 / 1_048_576.0),
+                    ocr_hits     = stats.ocr_cache_hits,
+                    ocr_queued   = stats.ocr_queued,
                     duration_s   = format!("{:.1}", stats.duration_secs),
                     rec_per_sec  = format!("{:.0}", rec_per_sec),
                     mb_per_sec   = format!("{:.2}", mb_per_sec),
@@ -454,6 +478,8 @@ pub async fn run(cfg: Config, args: IndexArgs) -> anyhow::Result<()> {
         indexed           = totals.indexed,
         skipped           = totals.skipped,
         errors            = totals.errors,
+        ocr_cache_hits    = totals.ocr_cache_hits,
+        ocr_queued       = totals.ocr_queued,
         mb_processed      = format!("{:.1}", totals.bytes_processed as f64 / 1_048_576.0),
         duration_s        = format!("{:.1}", total_secs),
         rec_per_sec       = format!("{:.0}", total_rec_per_sec),
@@ -477,6 +503,10 @@ struct ParsedObject {
     mime_counts:  HashMap<String, u64>,
     /// The first `warcinfo` record encountered in the file, if any.
     warcinfo:     Option<WarcInfoRecord>,
+    /// PDFs whose text came from the OCR cache.
+    ocr_cache_hits: usize,
+    /// PDFs queued for `tywb ocr-worker` instead of being extracted here.
+    ocr_queued:    usize,
 }
 
 async fn index_warc_object(
@@ -487,6 +517,7 @@ async fn index_warc_object(
     search: &mut SearchIndex,
     cfg: &IndexerConfig,
     progress: Arc<SharedProgress>,
+    ocr_cache: Option<&crate::ocr_cache::OcrCache>,
 ) -> anyhow::Result<FileStats> {
     let stream = get_stream(s3, bucket, key)
         .await
@@ -498,6 +529,7 @@ async fn index_warc_object(
     let max_text = cfg.max_text_bytes;
     let index_responses = cfg.index_warc_responses;
     let cfg_owned = cfg.clone();
+    let ocr_owned = ocr_cache.cloned();
 
     let (tx, rx) = mpsc::sync_channel::<Bytes>(16);
 
@@ -534,6 +566,8 @@ async fn index_warc_object(
             let mut warc_date_max: Option<String> = None;
             let mut mime_counts: HashMap<String, u64> = HashMap::new();
             let mut warcinfo_record: Option<WarcInfoRecord> = None;
+            let mut ocr_hits             = 0usize;
+            let mut ocr_queued           = 0usize;
 
             const PROGRESS_EVERY: usize = 100;
 
@@ -557,6 +591,10 @@ async fn index_warc_object(
                 progress:    &SharedProgress,
                 warc_records_total: usize,
                 pdf:         Option<&crate::pdf::PdfExtractor>,
+                ocr:         Option<&crate::ocr_cache::OcrCache>,
+                bucket:      &str,
+                ocr_hits:    &mut usize,
+                ocr_queued:  &mut usize,
             ) {
                 // Track WARC-Date range.
                 if let Some(d) = record.header.get("WARC-Date") {
@@ -652,7 +690,10 @@ async fn index_warc_object(
                             c_offset,
                             "response record",
                         );
-                        let doc = build_index_doc(record, &cdx_rec, max_text, pdf);
+                        let doc = build_index_doc(
+                            record, &cdx_rec, max_text, pdf,
+                            ocr, bucket, ocr_hits, ocr_queued,
+                        );
                         out.push((cdx_rec, doc));
                     }
                 }
@@ -727,6 +768,8 @@ async fn index_warc_object(
                         &mut out, &mut skipped, &mut errors,
                         &mut mime_counts, &mut warc_date_min, &mut warc_date_max,
                         &progress, warc_records, pdf_extractor.as_ref(),
+                        ocr_owned.as_ref(), &bucket_owned,
+                        &mut ocr_hits, &mut ocr_queued,
                     );
                 }
             } else {
@@ -755,6 +798,8 @@ async fn index_warc_object(
                                 &mut out, &mut skipped, &mut errors,
                                 &mut mime_counts, &mut warc_date_min, &mut warc_date_max,
                                 &progress, warc_records, pdf_extractor.as_ref(),
+                                ocr_owned.as_ref(), &bucket_owned,
+                                &mut ocr_hits, &mut ocr_queued,
                             );
                         }
                     }
@@ -771,6 +816,8 @@ async fn index_warc_object(
                 warc_date_max,
                 mime_counts,
                 warcinfo: warcinfo_record,
+                ocr_cache_hits: ocr_hits,
+                ocr_queued,
             })
         })
         .await
@@ -830,6 +877,8 @@ async fn index_warc_object(
         warc_date_min:   parsed.warc_date_min,
         warc_date_max:   parsed.warc_date_max,
         mime_counts:     parsed.mime_counts,
+        ocr_cache_hits:  parsed.ocr_cache_hits,
+        ocr_queued:      parsed.ocr_queued,
     })
 }
 
@@ -873,6 +922,10 @@ fn build_index_doc(
     cdx: &CdxRecord,
     max_bytes: usize,
     pdf: Option<&crate::pdf::PdfExtractor>,
+    ocr: Option<&crate::ocr_cache::OcrCache>,
+    bucket: &str,
+    ocr_hits: &mut usize,
+    ocr_queued: &mut usize,
 ) -> Option<IndexDoc> {
     // Revisit records have no payload of their own — the content is already
     // indexed via the record they refer to, so they get a CDX entry (capture
@@ -900,27 +953,86 @@ fn build_index_doc(
 
     let ts: u64 = cdx.timestamp.parse().unwrap_or(0);
 
-    // A WARC stores the response as it came off the wire, so the bytes after
-    // the HTTP headers are not the content yet: chunk framing on the outside,
-    // Content-Encoding within. Peel both before anything reads them — an
-    // unpeeled body indexes as U+FFFD noise, and Tika cannot parse a PDF that
-    // still has chunk headers in it.
-    let parts = crate::http_payload::parse_http_block(record.block.as_ref());
-    // HTML and text are truncated anyway, so stop decoding at that point; a PDF
-    // must arrive whole (the xref table a parser needs lives at the end).
-    let decode_limit = if is_pdf { crate::http_payload::MAX_DECODED_BYTES } else { max_bytes * 4 };
-    let payload = match parts.payload(decode_limit) {
-        Ok(p) => p,
-        Err(e) => {
-            debug!(url = %cdx.original_url, err = %e, "undecodable body — not indexed");
-            return None;
-        }
-    };
-
-    // ── PDF: hand the whole payload to Tika (never truncate — the xref table a
-    // parser needs lives at the end of the file). Requires a configured backend.
+    // ── PDF: from the digest cache, or queued for the worker — and only when
+    // neither applies (cache off, or a record without a digest) extracted
+    // synchronously, the way it always was. Never truncate a PDF — the xref
+    // table a parser needs lives at the end of the file.
+    //
+    // The cache paths run *before* the payload is decoded: on a hit the bytes
+    // are not needed at all, and on a miss queuing needs only the record's
+    // coordinates. A multi-hundred-MB scan that OCR would hold the loop on for
+    // half an hour costs nothing here.
     if is_pdf {
+        if let (Some(cache), Some(digest)) = (ocr, cdx.digest.as_deref()) {
+            match cache.get(digest) {
+                Some((title, body)) => {
+                    *ocr_hits += 1;
+                    if body.trim().is_empty() {
+                        // A negative entry: extraction has been tried, and the
+                        // file gave no text (too large, truncated, empty).
+                        // Done — re-queueing it would bill the same answer
+                        // again every run.
+                        debug!(url = %cdx.original_url, "PDF has a cached 'no text' entry");
+                        return None;
+                    }
+                    if !crate::pdf::looks_like_text(&body) {
+                        warn!(url = %cdx.original_url, chars = body.len(),
+                              "cached PDF text rejected by quality gate (likely OCR noise)");
+                        return None;
+                    }
+                    let body_text = truncate_on_char_boundary(body, max_bytes);
+                    return Some(IndexDoc {
+                        url:       cdx.original_url.clone(),
+                        timestamp: ts,
+                        title,
+                        body:      body_text,
+                        mime:      cdx.mime.clone(),
+                        s3_key:    cdx.s3_key.clone(),
+                        offset:    cdx.offset,
+                        length:    cdx.length,
+                        collection: cdx.collection.clone(),
+                    });
+                }
+                None => {
+                    // The one thing an index run must not do is OCR. Queue the
+                    // job and move on: the CDX entry below is still written,
+                    // so the document is findable and replayable — only its
+                    // fulltext arrives with the next run, once the worker has
+                    // filled the cache. Queued jobs need no extractor here,
+                    // which is why the whole branch runs without a Tika
+                    // backend if only the worker has one.
+                    let job = crate::ocr_cache::OcrJob {
+                        digest:     digest.to_owned(),
+                        bucket:     bucket.to_owned(),
+                        s3_key:     cdx.s3_key.clone(),
+                        offset:     cdx.offset,
+                        c_offset:   cdx.c_offset,
+                        length:     cdx.length,
+                        url:        cdx.original_url.clone(),
+                        attempts:   0,
+                    };
+                    if let Err(e) = cache.enqueue(&job) {
+                        warn!(url = %cdx.original_url, err = %e,
+                              "could not queue the PDF for extraction — it stays without fulltext");
+                    } else {
+                        *ocr_queued += 1;
+                    }
+                    return None;
+                }
+            }
+        }
+
+        // The legacy path — no cache configured, or a record the crawler
+        // wrote no digest for. Extract synchronously, inside the run.
         let extractor = pdf?;
+        let parts = crate::http_payload::parse_http_block(record.block.as_ref());
+        let payload = match parts.payload(crate::http_payload::MAX_DECODED_BYTES) {
+            Ok(p) => p,
+            Err(e) => {
+                debug!(url = %cdx.original_url, err = %e, "undecodable body — not indexed");
+                return None;
+            }
+        };
         let doc = extractor.extract(&cdx.original_url, &payload)?;
         let body_text = truncate_on_char_boundary(doc.body, max_bytes);
         return Some(IndexDoc {
@@ -935,6 +1047,21 @@ fn build_index_doc(
             collection: cdx.collection.clone(),
         });
     }
+
+    // A WARC stores the response as it came off the wire, so the bytes after
+    // the HTTP headers are not the content yet: chunk framing on the outside,
+    // Content-Encoding within. Peel both before anything reads them — an
+    // unpeeled body indexes as U+FFFD noise, and Tika cannot parse a PDF that
+    // still has chunk headers in it.
+    let parts = crate::http_payload::parse_http_block(record.block.as_ref());
+    // HTML and text are truncated anyway, so stop decoding at that point.
+    let payload = match parts.payload(max_bytes * 4) {
+        Ok(p) => p,
+        Err(e) => {
+            debug!(url = %cdx.original_url, err = %e, "undecodable body — not indexed");
+            return None;
+        }
+    };
 
     let truncated = if payload.len() > max_bytes * 4 { &payload[..max_bytes * 4] } else { &payload };
     let text = String::from_utf8_lossy(truncated);
@@ -1391,7 +1518,7 @@ mod tests {
             .unwrap()
             .expect("a response record yields a CDX entry");
 
-        let doc = build_index_doc(&record, &cdx, 524288, None)
+        let doc = build_index_doc(&record, &cdx, 524288, None, None, "", &mut 0, &mut 0)
             .expect("an HTML capture is indexable");
 
         // Before the fix this was a string of U+FFFD from the deflate bytes.
@@ -1409,7 +1536,7 @@ mod tests {
         let record = response_record("https://example.com/plain", block);
         let cdx = warc_search_cdx::from_warc_record(&record, "crawl.warc.gz").unwrap().unwrap();
 
-        let doc = build_index_doc(&record, &cdx, 524288, None).unwrap();
+        let doc = build_index_doc(&record, &cdx, 524288, None, None, "", &mut 0, &mut 0).unwrap();
         assert_eq!(doc.title, "Boskoop");
         assert_eq!(doc.body, "Boskoop Apfel");
     }
@@ -1497,6 +1624,129 @@ mod tests {
         assert_eq!(truncate_on_char_boundary(s.clone(), 11).len(), 10);
         assert_eq!(truncate_on_char_boundary(s.clone(), 12).len(), 10);
         assert_eq!(truncate_on_char_boundary(s, 13).len(), 13); // whole thing fits
+    }
+
+    // ── The digest-keyed OCR cache ─────────────────────────────────────────────
+
+    use crate::ocr_cache::OcrCache;
+
+    /// A `response` record whose payload is a PDF, carrying a block digest —
+    /// everything the cache paths look at. The payload itself is never decoded
+    /// on those paths, so its bytes are arbitrary here.
+    fn pdf_record(url: &str, digest: &str) -> (warc::WarcRecord, warc_search_cdx::CdxRecord) {
+        let block = b"HTTP/1.1 200 OK\r\nContent-Type: application/pdf\r\n\r\n%PDF-1.4 notarealfile".to_vec();
+        let raw = warc::reader::build_warc_record(
+            "WARC/1.0",
+            &[
+                ("WARC-Type", "response"),
+                ("WARC-Target-URI", url),
+                ("WARC-Date", "2026-07-20T20:09:29Z"),
+                ("Content-Type", "application/http; msgtype=response"),
+                ("WARC-Block-Digest", digest),
+            ],
+            &block,
+        );
+        let record = warc::WarcReader::new(raw.as_slice()).next_record().unwrap().unwrap();
+        let mut cdx = warc_search_cdx::from_warc_record(&record, "crawls/x.warc.gz")
+            .unwrap()
+            .unwrap();
+        cdx.c_offset = Some(12345);
+        (record, cdx)
+    }
+
+    #[test]
+    fn a_cache_hit_is_indexed_without_tika_and_without_decoding() {
+        // The whole point: the run reads the text the worker already paid
+        // for, and needs neither Tika nor the payload bytes to do it.
+        let dir = tempfile::tempdir().unwrap();
+        let cache = OcrCache::open(dir.path()).unwrap();
+        cache.put("sha1:GARTEN", "Die Gartenwelt 16", "Seite eins\u{000c}Seite zwei\u{000c}Seite drei\u{000c}Seite vier\u{000c}Der Rote Berlepsch\u{000c}Boskoop").unwrap();
+
+        let (record, cdx) = pdf_record("https://example.com/gartenwelt16.pdf", "sha1:GARTEN");
+        // Sanity-check what the record's digest and mime look like.
+        assert_eq!(cdx.digest.as_deref(), Some("sha1:GARTEN"),
+            "the CDX carries the digest from WARC-Block-Digest");
+        assert_eq!(cdx.mime.as_deref(), Some("application/pdf"),
+            "the CDX carries the HTTP Content-Type");
+        // Verify the cache is readable.
+        assert_eq!(cache.get("sha1:GARTEN").as_ref().map(|(t, _)| t.as_str()), Some("Die Gartenwelt 16"),
+            "the cache entry is readable before the index call");
+        let (mut hits, mut queued) = (0, 0);
+        let doc = build_index_doc(&record, &cdx, 524288, None, Some(&cache), "warc", &mut hits, &mut queued)
+            .expect("the cached text indexes the document");
+        assert_eq!(doc.title, "Die Gartenwelt 16");
+        assert!(doc.body.contains("Berlepsch"), "the cached text is indexable");
+        assert_eq!(doc.s3_key, "crawls/x.warc.gz");
+        assert_eq!(doc.offset, cdx.offset);
+        assert_eq!((hits, queued), (1, 0));
+    }
+
+    #[test]
+    fn a_cache_miss_is_queued_not_extracted() {
+        // No extractor is passed — with the cache on, queuing is the only
+        // thing that happens to a miss, and nothing blocks.
+        let dir = tempfile::tempdir().unwrap();
+        let cache = OcrCache::open(dir.path()).unwrap();
+
+        let (record, cdx) = pdf_record("https://example.com/monatshefte-band30.pdf", "sha1:BAND30");
+        let (mut hits, mut queued) = (0, 0);
+        assert!(
+            build_index_doc(&record, &cdx, 524288, None, Some(&cache), "warc", &mut hits, &mut queued).is_none(),
+            "no fulltext this run — the CDX entry is written by the caller regardless",
+        );
+        assert_eq!((hits, queued), (0, 1));
+
+        // The job carries everything the worker needs: one Range GET worth of
+        // coordinates, and the cache key.
+        let jobs = cache.queued_jobs();
+        assert_eq!(jobs.len(), 1, "one miss, one job");
+        let job = &jobs[0].1;
+        assert_eq!(job.digest, "sha1:BAND30");
+        assert_eq!(job.bucket, "warc");
+        assert_eq!(job.s3_key, "crawls/x.warc.gz");
+        assert_eq!(job.c_offset, Some(12345));
+        assert_eq!(job.length, cdx.length);
+        assert_eq!(job.url, "https://example.com/monatshefte-band30.pdf");
+
+        // The same PDF in a second crawl is the same job — the digest
+        // dedupes, in the queue exactly as it will in the cache.
+        let (record2, cdx2) = pdf_record("https://mirror.example/band30.pdf", "sha1:BAND30");
+        assert!(
+            build_index_doc(&record2, &cdx2, 524288, None, Some(&cache), "warc", &mut hits, &mut queued).is_none(),
+            "the second crawl also misses the cache — no fulltext either",
+        );
+        assert_eq!(cache.queued_jobs().len(), 1);
+    }
+
+    #[test]
+    fn gate_rejected_and_negative_entries_are_done_not_requeued() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = OcrCache::open(dir.path()).unwrap();
+        // OCR noise the worker stored anyway — the gate is deterministic, so
+        // re-queueing would bill the same answer every run.
+        cache.put("sha1:SALAT", "t", r"l1 ﬁ 3 rn |\| . ,, '' ° ~ \ / ] [ ; : rn1 l|l ¢").unwrap();
+        // A negative entry: the file has no text to give.
+        cache.put("sha1:LEER", "", "").unwrap();
+
+        let (mut hits, mut queued) = (0, 0);
+        for digest in ["sha1:SALAT", "sha1:LEER"] {
+            let (record, cdx) = pdf_record("https://example.com/x.pdf", digest);
+            assert!(
+                build_index_doc(&record, &cdx, 524288, None, Some(&cache), "warc", &mut hits, &mut queued).is_none(),
+                "{digest} yields no fulltext — and no job either",
+            );
+        }
+        assert_eq!(queued, 0, "a cached answer, even a negative one, is not re-queued");
+        assert_eq!(hits, 2);
+        assert!(cache.queued_jobs().is_empty());
+    }
+
+    #[test]
+    fn without_a_cache_a_pdf_still_takes_the_old_path() {
+        // No cache configured, no extractor: PDFs stay unsearchable, exactly
+        // as before the cache existed.
+        let (record, cdx) = pdf_record("https://example.com/alt.pdf", "sha1:ALT");
+        assert!(build_index_doc(&record, &cdx, 524288, None, None, "warc", &mut 0, &mut 0).is_none());
     }
 
     // ── The shipped URL skip list ─────────────────────────────────────────────

@@ -112,14 +112,17 @@ pub fn from_warc_record(
     // Try to extract HTTP status from the response block
     let status = extract_http_status(&warc.block);
 
-    // For a revisit, the block digest is of the headers-only block; the
-    // *payload* digest is the identity of the referenced content and is what a
-    // later replay resolver would match against. Prefer it for revisits.
-    let digest = match record_type {
-        RecordType::Revisit => warc.header.payload_digest().or_else(|| warc.header.block_digest()),
-        _ => warc.header.block_digest(),
-    }
-    .map(|s| s.to_owned());
+    // The payload digest identifies the *content*; the block digest also
+    // covers the HTTP headers around it, which differ between two crawls of
+    // the same document. Prefer the payload digest and fall back to the block
+    // digest — CDX-11 names the payload digest for this field, and the OCR
+    // text cache keys on it, so two captures of the same PDF must land on one
+    // key.
+    let digest = warc
+        .header
+        .payload_digest()
+        .or_else(|| warc.header.block_digest())
+        .map(|s| s.to_owned());
     let length = warc.header.content_length()? as u64;
 
     Ok(Some(CdxRecord {
@@ -474,6 +477,28 @@ mod tests {
 
     use chrono::Timelike;
     use chrono::Datelike;
+
+    #[test]
+    fn from_warc_prefers_the_payload_digest_for_responses() {
+        // Two crawls of the same PDF differ in their archived HTTP headers, so
+        // their block digests differ — the payload digest is the identity of
+        // the content, and what the OCR cache keys on.
+        let rec = make_warc_record(
+            &[
+                ("WARC-Type", "response"),
+                ("WARC-Date", "2026-07-20T10:00:00Z"),
+                ("WARC-Record-ID", "<urn:uuid:pd-1>"),
+                ("WARC-Target-URI", "https://obst.example/band30.pdf"),
+                ("WARC-Payload-Digest", "sha1:PAYLOAD"),
+                ("WARC-Block-Digest", "sha1:BLOCK"),
+                ("Content-Type", "application/http; msgtype=response"),
+            ],
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/pdf\r\n\r\n%PDF-1.4",
+            0,
+        );
+        let cdx = from_warc_record(&rec, "test.warc.gz").unwrap().unwrap();
+        assert_eq!(cdx.digest.as_deref(), Some("sha1:PAYLOAD"));
+    }
 
     #[test]
     fn from_warc_revisit_record_is_included_with_payload_digest() {

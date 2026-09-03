@@ -8,6 +8,28 @@ this project does not yet publish tagged releases, so everything lands under
 
 ## [Unreleased]
 
+- **OCR is no longer coupled to the index run.** A full rebuild on manas
+  measured 63.7 of its 74.5 hours in gaps at multiples of the Tika timeout
+  (25 min × 81, 2× × 20, 7× × 1), and the OCR results were discarded with the
+  run. With `indexer.ocr_cache` enabled, the WARC path never extracts
+  synchronously: `build_index_doc` looks the record's content digest up in a
+  local disk cache — on a hit the text indexes in seconds; on a miss the record
+  is queued and the loop moves on. `tywb ocr-worker` drains the queue in its
+  own process, parallel, with a generous timeout and optionally its own Tika
+  server. The cache stores text under the content digest, so the same PDF from
+  two crawls is extracted once, and survives every rebuild (the directory lives
+  outside any per-rebuild directory). `/text` reads the cache before it
+  extracts. See `crates/tywb/src/ocr_cache.rs`,
+  `crates/tywb/src/ocr_worker.rs`, the `indexer.ocr_cache` config block, and
+  `main.rs` for the `ocr-worker` subcommand. Details in Arbeitsanweisung Nr. 2.
+
+- **CDX digest now defaults to WARC-Payload-Digest.** Previously the block
+  digest was stored for response records; the payload digest identifies the
+  *content* regardless of the HTTP headers surrounding it, which differ between
+  two crawls of the same PDF and would break the cache key. Revisits already
+  stored the payload digest. Aligns the CDX field with the CDX-11 specification.
+  Existing rows are updated incrementally on the next `tywb index --force`.
+
 - **The homepage no longer stalls the whole server.** `/` computed six
   aggregates over the CDX table on every request, three of them `GROUP BY`s
   with no index: ~7.7 s on a 4.1-million-record archive. Since all handlers

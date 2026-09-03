@@ -35,7 +35,7 @@ use serde::Deserialize;
 use tower_http::trace::TraceLayer;
 use tracing::{debug, error, info, warn};
 
-use warc_search_cdx::{CdxRecord, CdxStore, surt::to_surt};
+use warc_search_cdx::{CdxRecord, CdxStore, surt::to_surt, DEFAULT_COLLECTION};
 use warc_search_config::Config;
 use warc_search_s3::build_client;
 use warc_search_search::{SearchQuery, SearchReader};
@@ -59,6 +59,10 @@ pub struct AppState {
     /// `/text` must read a document the way the indexer read it, or the two
     /// disagree about the same bytes — see `extract_capture_text`.
     pdf_by_collection: HashMap<String, PdfExtractor>,
+    /// The digest-keyed OCR text cache for the primary WARC archive. When
+    /// configured, `/text` reads a PDF's text from here before asking Tika —
+    /// the best case is milliseconds instead of a re-OCR.
+    ocr_cache: Option<crate::ocr_cache::OcrCache>,
 }
 
 impl AppState {
@@ -113,6 +117,25 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         })
         .unwrap_or_default();
 
+    // ── OCR text cache (Arbeitsanweisung Nr. 2) ─────────────────────────
+    // When configured, `/text` reads a PDF's text from the digest-keyed
+    // cache before it reaches Tika — the same text the indexer would read
+    // on its next run, at the same cost (seconds from disk).
+    let ocr_cache = match &cfg.indexer.ocr_cache {
+        Some(c) => match crate::ocr_cache::OcrCache::open(std::path::Path::new(&c.path)) {
+            Ok(cache) => {
+                info!(path = %c.path, "OCR text cache enabled — /text reads PDFs from it");
+                Some(cache)
+            }
+            Err(e) => {
+                warn!(err = %e, path = %c.path,
+                      "could not open the OCR text cache — /text extracts on demand");
+                None
+            }
+        },
+        None => None,
+    };
+
     let state = Arc::new(AppState {
         cdx:    Arc::new(Mutex::new(cdx_store)),
         search: Arc::new(search_reader),
@@ -120,6 +143,7 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
         config: cfg.clone(),
         pdf,
         pdf_by_collection,
+        ocr_cache,
     });
 
     let app = Router::new()
@@ -1097,6 +1121,30 @@ async fn extract_capture_text(
     }
 
     if essence == "application/pdf" {
+        // The digest cache first: for the primary archive the text the worker
+        // already paid for is here in milliseconds, and the OCR of a scanned
+        // volume that the index deferred costs nothing on this path.
+        if rec.collection == DEFAULT_COLLECTION {
+            if let (Some(cache), Some(digest)) = (&state.ocr_cache, rec.digest.as_deref()) {
+                let cached: Option<(String, String)> = cache.get(digest);
+                if let Some((title, text)) = cached {
+                    if text.trim().is_empty() {
+                        return Err((
+                            StatusCode::UNPROCESSABLE_ENTITY,
+                            "no text could be extracted from this PDF".to_owned(),
+                        )
+                            .into_response());
+                    }
+                    let quality_ok = crate::pdf::looks_like_text(&text);
+                    return Ok(CaptureText {
+                        title,
+                        text,
+                        mime,
+                        quality_ok,
+                    });
+                }
+            }
+        }
         let Some(extractor) = state.extractor_for(&rec.collection).cloned() else {
             return Err((
                 StatusCode::NOT_IMPLEMENTED,

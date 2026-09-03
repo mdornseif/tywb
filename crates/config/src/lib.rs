@@ -163,11 +163,54 @@ pub struct IndexerConfig {
     /// this keeps the dependency-free deployment possible. See [`TikaConfig`].
     #[serde(default)]
     pub tika: Option<TikaConfig>,
+    /// The digest-keyed OCR text cache for the WARC path. When set, the index
+    /// run no longer extracts PDF text itself — hits are read from disk, misses
+    /// are queued for `tywb ocr-worker`, which runs with its own time budget
+    /// (and its own Tika, if configured). See [`OcrCacheConfig`].
+    #[serde(default)]
+    pub ocr_cache: Option<OcrCacheConfig>,
     /// Additional named sources indexed alongside the primary WARC bucket
     /// (`s3.bucket`, collection `"warc"`). Currently used for buckets of
     /// standalone PDFs. See [`CollectionConfig`].
     #[serde(default)]
     pub collections: Vec<CollectionConfig>,
+}
+
+/// Configuration of the digest-keyed OCR text cache (`indexer.ocr_cache`).
+///
+/// Present only when the operator opts in. With this block set, the WARC index
+/// run never calls Tika: every PDF record is looked up in a local cache keyed
+/// by its content digest — a hit is seconds from disk, a miss is *queued* and
+/// the run moves on, leaving the record with its CDX entry but no fulltext
+/// yet. `tywb ocr-worker` drains the queue in its own process and stores the
+/// text under the digest; the next index run — or the next full rebuild —
+/// finds it in the cache.
+///
+/// The cache directory must be shared by the indexer, the worker and (for
+/// `/text`) the server, and must live outside any per-rebuild directory: a
+/// rebuild swap must not move or discard it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OcrCacheConfig {
+    /// Root directory of the cache. Created if missing. Holds `text/` (one
+    /// extracted text per content digest), `queue/` (pending jobs) and
+    /// `failed/` (jobs that exhausted their attempts, kept visible).
+    pub path: String,
+    /// How many documents the worker extracts in parallel. Tika is
+    /// memory-bound; two is a sane default.
+    #[serde(default = "default_ocr_workers")]
+    pub workers: usize,
+    /// Attempts before the worker parks a job in `failed/` instead of
+    /// rescheduling it.
+    #[serde(default = "default_ocr_max_attempts")]
+    pub max_attempts: u32,
+    /// The worker's own Tika backend. A full `tika` block, URL included —
+    /// unlike a collection's override, the URL *may* differ, because this is
+    /// a *where* question: the worker can run against its own tika-server
+    /// with a generous timeout while the indexer needs no Tika at all.
+    /// Unset: the global `indexer.tika`.
+    #[serde(default)]
+    pub tika: Option<TikaConfig>,
 }
 
 /// An additional indexed source beyond the primary WARC archive.
@@ -289,7 +332,7 @@ impl TikaConfig {
 }
 
 /// Configuration for the optional Apache Tika text-extraction backend.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TikaConfig {
     /// Base URL of a running `tika-server`, e.g. `http://127.0.0.1:9998`.
@@ -691,6 +734,7 @@ impl Default for IndexerConfig {
             url_patterns: None,
             url_pattern_source: vec![],
             tika: None,
+            ocr_cache: None,
             collections: vec![],
         }
     }
@@ -729,6 +773,8 @@ fn default_tika_ocr_languages() -> String { "deu+frk+eng".to_owned() }
 fn default_max_pdf_bytes()      -> usize  { 100 * 1024 * 1024 }
 fn default_tika_timeout_secs()  -> u64    { 300 }
 fn default_collection_type()    -> String { "pdf_bucket".to_owned() }
+fn default_ocr_workers()        -> usize  { 2 }
+fn default_ocr_max_attempts()   -> u32    { 3 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
@@ -905,6 +951,66 @@ indexer:
         let _ = tika.with_override(cfg.indexer.collections[0].tika.as_ref().unwrap());
         assert_eq!(tika.ocr_strategy, "auto", "the WARC archive keeps its own setting");
         assert_eq!(tika.max_pdf_bytes, 104857600);
+    }
+
+    // ── The OCR cache ───────────────────────────────────────────────────────
+
+    #[test]
+    fn an_absent_ocr_cache_block_leaves_the_feature_off() {
+        let cfg = Config::from_yaml(COLLECTION_YAML).unwrap();
+        assert!(cfg.indexer.ocr_cache.is_none(), "the cache is opt-in");
+        assert_eq!(IndexerConfig::default().ocr_cache, None);
+    }
+
+    #[test]
+    fn an_ocr_cache_block_parses() {
+        let cfg = Config::from_yaml(
+            r#"
+s3:
+  bucket: warc
+indexer:
+  tika:
+    url: "http://127.0.0.1:9998"
+    timeout_secs: 300
+  ocr_cache:
+    path: "/var/lib/warc-search/ocr-cache"
+    tika:
+      url: "http://127.0.0.1:9999"
+      timeout_secs: 21600
+"#,
+        )
+        .unwrap();
+        let ocr = cfg.indexer.ocr_cache.expect("the block enables the feature");
+        assert_eq!(ocr.path, "/var/lib/warc-search/ocr-cache");
+        // Unstated: the worker extracts two documents in parallel and parks
+        // jobs after three attempts.
+        assert_eq!(ocr.workers, 2);
+        assert_eq!(ocr.max_attempts, 3);
+        // The worker's own backend, URL included.
+        let tika = ocr.tika.as_ref().unwrap();
+        assert_eq!(tika.url, "http://127.0.0.1:9999");
+        assert_eq!(tika.timeout_secs, 21600);
+        assert_eq!(tika.ocr_strategy, "auto", "unstated fields fall back");
+    }
+
+    #[test]
+    fn an_ocr_cache_without_its_own_tika_inherits_the_global_one() {
+        let cfg = Config::from_yaml(
+            "s3:\n  bucket: warc\nindexer:\n  tika:\n    url: 'http://x:9998'\n  \
+             ocr_cache:\n    path: /tmp/c\n",
+        )
+        .unwrap();
+        assert!(cfg.indexer.ocr_cache.unwrap().tika.is_none());
+    }
+
+    #[test]
+    fn an_unknown_key_inside_ocr_cache_is_an_error() {
+        let err = Config::from_yaml(
+            "s3:\n  bucket: warc\nindexer:\n  ocr_cache:\n    path: /tmp/c\n    worker: 4\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("worker"), "error should name the stray key: {err}");
     }
 
     #[test]

@@ -22,3 +22,6 @@ config.local.yaml
 # Log files
 *.log
 *~
+
+# Local skip lists
+skip-domains.txt

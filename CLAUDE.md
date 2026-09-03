@@ -20,8 +20,7 @@ warc-search/
     ├── cdx/                # lib: CDX index, SQLite, SURT canonicalization
     ├── s3_store/           # lib: S3 access, streaming, Range GET
     ├── search/             # lib: Tantivy fulltext index wrapper
-    └── tywb/               # bin: tywb — index, server, stats, recompress,
-                            #      scan-wire-format subcommands
+    └── tywb/               # bin: tywb — index, server, stats, recompress,\n                            #      scan-wire-format, ocr-worker subcommands
 ```
 
 ### Dependency rules (enforce strictly)
@@ -278,6 +277,49 @@ served stale. Off by default: writing into someone's bucket is not a default.
 nothing else — NFKC would also rewrite fractions and full-width forms, which is
 a much larger promise than the problem needs.
 
+### OCR runs behind a queue, keyed by content digest
+
+Extracting a scanned PDF is tens of minutes of Tesseract. When that runs inside
+the index loop, the loop stands still — a full rebuild on manas measured 63.7
+of its 74.5 hours in gaps at multiples of the Tika timeout (25 min × 81, 2×
+× 20, 7× × 1), with the S3 connection's receive buffer clogging behind it and
+the workers idle. And since the fulltext index does not store the body it
+indexes, every rebuild paid that OCR again.
+
+With `indexer.ocr_cache` configured (`crates/tywb/src/ocr_cache.rs`), the WARC
+path never extracts synchronously. `build_index_doc` looks the record's digest
+up in a local disk cache — the file format is the same `tywb-text/2` the
+`store_text` sidecars use, but with the digest (payload-or-block, payload first)
+in place of the ETag, and the directory lives outside any per-rebuild directory
+so a swap does not move it. On a hit the text is indexed in seconds; on a miss
+a small JSON job (`OcrJob`) is written into `queue/` and the loop moves on —
+the record still gets its CDX entry, just no fulltext yet.
+
+`tywb ocr-worker` drains the queue in its own process (`crates/tywb/src/
+ocr_worker.rs`). It fetches each record via one S3 Range GET (reusing
+`fetch_warc_record`), extracts with `PdfExtractor::try_extract`, and stores the
+text under the digest. Extractions run in parallel, with a generous timeout and
+optionally against the worker's own Tika server, so the index machine needs no
+Tika at all. The digest dedupes: the same PDF collected in two crawls lands in
+the queue once and is extracted once. `tywb ocr-worker --prefill` scans the CDX
+for PDF records not yet in the cache and fills the queue before a rebuild.
+
+Failures of the *file* (too large, truncated, empty, undecodable) are cached as
+empty entries (`source-digest=… title=\n`) rather than retried: the answer will
+not change, and without this the next rebuild would re-fetch and re-parse it
+every time. Failures of the *run* (S3, Tika) are retried up to `max_attempts`
+and then parked in `failed/`, visible instead of looping.
+
+The digest on every CDX record is now the WARC-Payload-Digest when the crawler
+wrote one — the block digest also covers the HTTP headers surrounding a PDF,
+which differ between two crawls of the same document, and would make the cache
+key miss. The digest change aligns the CDX field with the CDX-11 specification.
+
+The `/text` endpoint reads the cache before it extracts, for the primary WARC
+archive: the same text the indexer read, at the same cost (milliseconds from
+disk). For `pdf_bucket` collections, `store_text` sidecars continue to provide
+the same function.
+
 ### One prefix, two collections
 `prefix` describes a contiguous run of keys; `key_pattern` (RE2, as in the skip
 list) narrows it further, for material that is interleaved rather than grouped —
@@ -348,7 +390,14 @@ cargo run --release -p tywb -- --config config.local.yaml server
 # Plain text:       GET /text?url=https://example.com/&timestamp=2024&output=json
 # CDX API:          GET /cdx?url=example.com/*&output=json
 
-# 4. Repair whole-file-gzip WARCs (see "Record-per-member .warc.gz" below)
+# 4a. Prefill the OCR text cache (fill the queue) — run before a rebuild:
+#     (requires indexer.ocr_cache + indexer.tika in config.yaml)
+cargo run --release -p tywb -- --config config.local.yaml ocr-worker --prefill
+
+# 4b. Drain the OCR queue (extract deferred PDFs):
+cargo run --release -p tywb -- --config config.local.yaml ocr-worker
+
+# 5. Repair whole-file-gzip WARCs (see "Record-per-member .warc.gz" below)
 cargo run --release -p tywb -- --config config.local.yaml recompress --scan-only
 cargo run --release -p tywb -- --config config.local.yaml recompress
 
@@ -384,4 +433,4 @@ CI should fail on any clippy warning. Run both before opening a PR.
 | `cdx`              | ✅ complete  | SURT, SQLite store, closest-match lookup, CDX builder from WarcRecord, `warc_files` metadata table |
 | `s3_store`         | ✅ complete  | Client builder, paginated listing, ETag state, streaming GET, Range GET |
 | `search`           | ✅ complete  | Tantivy schema, writer + reader, timestamp filter, per-file replace, forward-compatible open of older schemas |
-| `tywb`             | 🔄 in progress | `index` working (streaming, throughput, SIGINFO, limits); `server` serving UI, `/search`, `/text`, replay, CDX; `stats` complete; `recompress` complete; `scan-wire-format` complete |
+| `tywb`             | 🔄 in progress | `index` working (streaming, throughput, SIGINFO, limits, +digest-keyed OCR cache decoupling); `server` serving UI, `/search`, `/text` (+cache read), replay, CDX; `stats` complete; `recompress` complete; `scan-wire-format` complete; `ocr-worker` complete (prefill + drain) |

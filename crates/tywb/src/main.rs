@@ -26,6 +26,8 @@ use warc_search_config::Config;
 mod gz_warc;
 mod http_payload;
 mod index;
+mod ocr_cache;
+mod ocr_worker;
 mod pdf;
 mod pdf_collection;
 mod recompress;
@@ -134,6 +136,17 @@ enum Command {
         #[arg(long)]
         salvage_truncated: bool,
     },
+    /// Drain the OCR queue: extract PDF text the index run deferred and store
+    /// it in the digest cache for the next index run.
+    OcrWorker {
+        /// Before draining, walk the CDX index and queue every WARC PDF whose
+        /// text is not in the cache yet — so the next rebuild starts warm.
+        #[arg(long)]
+        prefill: bool,
+        /// Documents extracted in parallel (default: indexer.ocr_cache.workers).
+        #[arg(long)]
+        jobs: Option<usize>,
+    },
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -204,5 +217,7 @@ async fn main() -> anyhow::Result<()> {
             recompress::run(cfg, recompress::RecompressArgs {
                 files, limit, jobs, workdir, dry_run, scan_only, backup_suffix, salvage_truncated,
             }).await,
+        Command::OcrWorker { prefill, jobs } =>
+            ocr_worker::run(cfg, ocr_worker::WorkerArgs { prefill, jobs }).await,
     }
 }
