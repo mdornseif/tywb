@@ -908,10 +908,16 @@ fn truncate_on_char_boundary(mut s: String, max: usize) -> String {
 /// were 137,476 records, 3.3 % of everything, all collapsed into the empty-TLD
 /// bucket that `/ui/browse` labels ".".
 ///
-/// `urn:X-wpull:log` from grab-site is the same kind of thing and belongs here
-/// too if it ever appears in numbers that matter.
+/// `urn:X-wpull:log` from grab-site is the same kind of thing: a log record
+/// grab-site writes into its own WARCs. 39 of them survived the rebuild of
+/// 2026-09-10 and showed up under the same empty-TLD bucket as the dns: records
+/// once those were gone, so it is listed here as well.
+///
+/// Deliberately narrow: `urn:x-wpull:` and not `urn:` at large. A URN is a
+/// perfectly good identifier for real content, and only this one flavour is
+/// known to be bookkeeping.
 pub(crate) fn is_bookkeeping_url(url: &str) -> bool {
-    const BOOKKEEPING_SCHEMES: [&str; 1] = ["dns:"];
+    const BOOKKEEPING_SCHEMES: [&str; 2] = ["dns:", "urn:x-wpull:"];
     BOOKKEEPING_SCHEMES
         .iter()
         .any(|s| url.len() > s.len() && url[..s.len()].eq_ignore_ascii_case(s))
@@ -1476,6 +1482,12 @@ mod tests {
         assert!(!is_bookkeeping_url("https://dns.example.org/artikel"));
         assert!(!is_bookkeeping_url("http://example.org/dns:faq"));
         assert!(!is_bookkeeping_url("dns:"));
+        // grab-sites Protokollsaetze
+        assert!(is_bookkeeping_url("urn:X-wpull:log"));
+        assert!(is_bookkeeping_url("urn:x-wpull:log"));
+        // Andere URNs sind Inhalt, kein Beiwerk.
+        assert!(!is_bookkeeping_url("urn:isbn:9783800112340"));
+        assert!(!is_bookkeeping_url("urn:nbn:de:bvb:12-bsb10229044-8"));
     }
 
     use super::{build_index_doc, decode_entities, extract_title, strip_html,
