@@ -7,9 +7,9 @@
 //! The store is opened in WAL mode so reads never block writes and multiple
 //! concurrent readers are supported without any locking overhead.
 
-use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use crate::error::{CdxError, Result};
-use crate::record::{CdxRecord, parse_timestamp};
+use crate::record::{parse_timestamp, CdxRecord};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 
 // ── DDL ───────────────────────────────────────────────────────────────────────
 
@@ -86,29 +86,29 @@ PRAGMA busy_timeout       = 10000;
 /// a single WARC object after it has been indexed.
 #[derive(Debug, Default)]
 pub struct WarcFileMeta {
-    pub s3_key:           String,
-    pub etag:             Option<String>,
+    pub s3_key: String,
+    pub etag: Option<String>,
     /// Compressed object size in bytes as reported by S3.
-    pub size_bytes:       u64,
+    pub size_bytes: u64,
     /// ISO8601 UTC timestamp of this indexing run.
-    pub indexed_at:       String,
+    pub indexed_at: String,
     /// S3 bucket this file was read from.
-    pub bucket:           Option<String>,
-    pub warc_records:     usize,
-    pub cdx_new:          usize,
-    pub cdx_known:        usize,
+    pub bucket: Option<String>,
+    pub warc_records: usize,
+    pub cdx_new: usize,
+    pub cdx_known: usize,
     pub fulltext_indexed: usize,
-    pub skipped:          usize,
-    pub errors:           usize,
-    pub duration_secs:    f64,
+    pub skipped: usize,
+    pub errors: usize,
+    pub duration_secs: f64,
     /// Uncompressed decompressed bytes / duration.
-    pub bytes_per_sec:    f64,
-    pub records_per_sec:  f64,
+    pub bytes_per_sec: f64,
+    pub records_per_sec: f64,
     /// Earliest / latest `WARC-Date` header value seen in this file.
-    pub warc_date_min:    Option<String>,
-    pub warc_date_max:    Option<String>,
+    pub warc_date_min: Option<String>,
+    pub warc_date_max: Option<String>,
     /// JSON object mapping MIME type → record count.
-    pub mime_summary:     Option<String>,
+    pub mime_summary: Option<String>,
 }
 
 /// One row of the `warcinfo` table — the parsed `warcinfo` WARC record
@@ -116,35 +116,35 @@ pub struct WarcFileMeta {
 #[derive(Debug, Default)]
 pub struct WarcInfoRecord {
     /// S3 key of the WARC file this record came from.
-    pub s3_key:        String,
+    pub s3_key: String,
     /// S3 bucket name.
-    pub bucket:        Option<String>,
+    pub bucket: Option<String>,
     /// `WARC-Date` header value (ISO8601).
-    pub warc_date:     Option<String>,
+    pub warc_date: Option<String>,
     /// `WARC-Filename` header value, if present.
     pub warc_filename: Option<String>,
     /// `WARC-Record-ID` header value.
-    pub record_id:     Option<String>,
+    pub record_id: Option<String>,
     /// All WARC header fields serialized as a JSON array of `[name, value]` pairs.
-    pub headers_json:  Option<String>,
+    pub headers_json: Option<String>,
     /// UTF-8 (lossy) text of the warcinfo block (typically `application/warc-fields`).
-    pub block_text:    Option<String>,
+    pub block_text: Option<String>,
 }
 
 /// Lightweight row returned by [`CdxStore::recent_warc_files`].
 /// All nullable columns from `warc_files` are wrapped in `Option`.
 #[derive(Debug)]
 pub struct WarcFileRow {
-    pub s3_key:           String,
-    pub last_indexed:     String,
-    pub warc_records:     i64,
-    pub cdx_new:          i64,
-    pub cdx_known:        i64,
+    pub s3_key: String,
+    pub last_indexed: String,
+    pub warc_records: i64,
+    pub cdx_new: i64,
+    pub cdx_known: i64,
     pub fulltext_indexed: i64,
-    pub errors:           i64,
-    pub size_bytes:       Option<i64>,
-    pub duration_secs:    Option<f64>,
-    pub records_per_sec:  Option<f64>,
+    pub errors: i64,
+    pub size_bytes: Option<i64>,
+    pub duration_secs: Option<f64>,
+    pub records_per_sec: Option<f64>,
 }
 
 // ── Stats ─────────────────────────────────────────────────────────────────────
@@ -156,9 +156,9 @@ pub struct WarcFileRow {
 /// in [`CdxStats`] are not — see [`CdxStore::basic_stats`].
 #[derive(Debug, Clone, Default)]
 pub struct BasicStats {
-    pub total_records:    u64,
-    pub unique_urls:      u64,
-    pub warc_files:       u64,
+    pub total_records: u64,
+    pub unique_urls: u64,
+    pub warc_files: u64,
     pub oldest_timestamp: Option<String>,
     pub newest_timestamp: Option<String>,
 }
@@ -166,15 +166,15 @@ pub struct BasicStats {
 /// Aggregate statistics over the CDX table, returned by [`CdxStore::stats`].
 #[derive(Debug, Clone)]
 pub struct CdxStats {
-    pub total_records:    u64,
-    pub unique_urls:      u64,
-    pub warc_files:       u64,
+    pub total_records: u64,
+    pub unique_urls: u64,
+    pub warc_files: u64,
     pub oldest_timestamp: Option<String>,
     pub newest_timestamp: Option<String>,
     /// MIME type → record count, sorted descending by count (top 20).
-    pub mime_counts:      Vec<(String, u64)>,
+    pub mime_counts: Vec<(String, u64)>,
     /// HTTP status code (or `None` for unknown) → record count, sorted descending.
-    pub status_counts:    Vec<(Option<u16>, u64)>,
+    pub status_counts: Vec<(Option<u16>, u64)>,
 }
 
 // ── Store ─────────────────────────────────────────────────────────────────────
@@ -225,11 +225,16 @@ impl CdxStore {
         self.conn.execute_batch(PRAGMAS)?;
         self.conn.execute_batch(SCHEMA)?;
         // Migrations: ALTER TABLE ADD COLUMN silently fails if column already exists.
-        let _ = self.conn.execute("ALTER TABLE cdx ADD COLUMN c_offset INTEGER", []);
-        let _ = self.conn.execute("ALTER TABLE warc_files ADD COLUMN bucket TEXT", []);
+        let _ = self
+            .conn
+            .execute("ALTER TABLE cdx ADD COLUMN c_offset INTEGER", []);
+        let _ = self
+            .conn
+            .execute("ALTER TABLE warc_files ADD COLUMN bucket TEXT", []);
         // Existing rows predate collections and belong to the primary WARC archive.
         let _ = self.conn.execute(
-            "ALTER TABLE cdx ADD COLUMN collection TEXT NOT NULL DEFAULT 'warc'", [],
+            "ALTER TABLE cdx ADD COLUMN collection TEXT NOT NULL DEFAULT 'warc'",
+            [],
         );
         Ok(())
     }
@@ -298,16 +303,32 @@ impl CdxStore {
             for r in records {
                 let c_off = r.c_offset.map(|v| v as i64);
                 let inserted = insert_stmt.execute(params![
-                    r.surt_url, r.timestamp, r.original_url, r.mime,
-                    r.status, r.digest, r.s3_key, r.offset as i64, r.length as i64, c_off,
+                    r.surt_url,
+                    r.timestamp,
+                    r.original_url,
+                    r.mime,
+                    r.status,
+                    r.digest,
+                    r.s3_key,
+                    r.offset as i64,
+                    r.length as i64,
+                    c_off,
                     r.collection,
                 ])?;
                 if inserted == 1 {
                     new_count += 1;
                 } else {
                     update_stmt.execute(params![
-                        r.surt_url, r.timestamp, r.original_url, r.mime,
-                        r.status, r.digest, r.s3_key, r.offset as i64, r.length as i64, c_off,
+                        r.surt_url,
+                        r.timestamp,
+                        r.original_url,
+                        r.mime,
+                        r.status,
+                        r.digest,
+                        r.s3_key,
+                        r.offset as i64,
+                        r.length as i64,
+                        c_off,
                         r.collection,
                     ])?;
                     existing_count += 1;
@@ -320,10 +341,9 @@ impl CdxStore {
 
     /// Delete all records belonging to an S3 key (e.g. when re-indexing a file).
     pub fn delete_by_s3_key(&self, s3_key: &str) -> Result<usize> {
-        let n = self.conn.execute(
-            "DELETE FROM cdx WHERE s3_key = ?1",
-            params![s3_key],
-        )?;
+        let n = self
+            .conn
+            .execute("DELETE FROM cdx WHERE s3_key = ?1", params![s3_key])?;
         Ok(n)
     }
 
@@ -335,7 +355,7 @@ impl CdxStore {
     /// (`com,example,www)/…`, `com,example,cdn)/…`, etc.).
     pub fn original_urls_for_domain_surt(&self, surt_host: &str) -> Result<Vec<String>> {
         let apex_pat = format!("{surt_host})%");
-        let sub_pat  = format!("{surt_host},%");
+        let sub_pat = format!("{surt_host},%");
         let mut stmt = self.conn.prepare_cached(
             "SELECT DISTINCT original FROM cdx
              WHERE surt_url LIKE ?1 OR surt_url LIKE ?2",
@@ -354,7 +374,7 @@ impl CdxStore {
     /// Returns the number of rows deleted.
     pub fn delete_by_domain_surt(&self, surt_host: &str) -> Result<usize> {
         let apex_pat = format!("{surt_host})%");
-        let sub_pat  = format!("{surt_host},%");
+        let sub_pat = format!("{surt_host},%");
         let n = self.conn.execute(
             "DELETE FROM cdx WHERE surt_url LIKE ?1 OR surt_url LIKE ?2",
             params![apex_pat, sub_pat],
@@ -444,11 +464,7 @@ impl CdxStore {
     /// the closest later timestamp if nothing earlier exists.
     ///
     /// This is the core lookup for Wayback replay.
-    pub fn closest(
-        &self,
-        surt_url: &str,
-        target_ts: &str,
-    ) -> Result<Option<CdxRecord>> {
+    pub fn closest(&self, surt_url: &str, target_ts: &str) -> Result<Option<CdxRecord>> {
         // Validate the timestamp
         parse_timestamp(target_ts)?;
 
@@ -483,21 +499,21 @@ impl CdxStore {
                 // Pick whichever is numerically closer
                 let dist_b = ts_distance(target_ts, &b.timestamp);
                 let dist_a = ts_distance(target_ts, &a.timestamp);
-                if dist_b <= dist_a { Some(b) } else { Some(a) }
+                if dist_b <= dist_a {
+                    Some(b)
+                } else {
+                    Some(a)
+                }
             }
             (Some(b), None) => Some(b),
             (None, Some(a)) => Some(a),
-            (None, None)    => None,
+            (None, None) => None,
         })
     }
 
     /// Prefix search: return records where `surt_url` starts with `prefix`.
     /// Used for CDX API wildcard queries like `example.com/*`.
-    pub fn get_by_surt_prefix(
-        &self,
-        prefix: &str,
-        limit: usize,
-    ) -> Result<Vec<CdxRecord>> {
+    pub fn get_by_surt_prefix(&self, prefix: &str, limit: usize) -> Result<Vec<CdxRecord>> {
         // SQLite LIKE or GLOB would work but BETWEEN on the prefix is faster
         // and avoids LIKE special-character escaping.
         let end = next_prefix(prefix);
@@ -538,7 +554,10 @@ impl CdxStore {
     /// [`collection_counts`]: Self::collection_counts
     pub fn collection_count(&self, name: &str) -> Result<u64> {
         let n: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM cdx WHERE collection = ?1", params![name], |r| r.get(0))?;
+            "SELECT COUNT(*) FROM cdx WHERE collection = ?1",
+            params![name],
+            |r| r.get(0),
+        )?;
         Ok(n as u64)
     }
 
@@ -551,9 +570,12 @@ impl CdxStore {
     /// [`collection_count`]: Self::collection_count
     pub fn collection_counts(&self) -> Result<Vec<(String, u64)>> {
         let mut stmt = self.conn.prepare(
-            "SELECT collection, COUNT(*) AS n FROM cdx GROUP BY collection ORDER BY n DESC")?;
+            "SELECT collection, COUNT(*) AS n FROM cdx GROUP BY collection ORDER BY n DESC",
+        )?;
         let rows = stmt
-            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64)))?
+            .query_map([], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64))
+            })?
             .filter_map(|r| r.ok())
             .collect();
         Ok(rows)
@@ -562,8 +584,12 @@ impl CdxStore {
     /// MIME prefixes whose records become fulltext documents. Kept here so a
     /// scan can size the index the same way the indexer fills it.
     pub const INDEXABLE_MIME_PREFIXES: [&'static str; 6] = [
-        "text/html", "application/xhtml", "text/xml",
-        "application/xml", "text/plain", "application/pdf",
+        "text/html",
+        "application/xhtml",
+        "text/xml",
+        "application/xml",
+        "text/plain",
+        "application/pdf",
     ];
 
     /// Per WARC object, how many of its records are candidates for the fulltext
@@ -632,6 +658,55 @@ impl CdxStore {
         Ok(seen)
     }
 
+    /// Every distinct original URL of a PDF record, across all collections.
+    ///
+    /// This is the index's own answer to "which PDFs have we seen", and unlike
+    /// one index run — which knows only the objects it processed — it is
+    /// complete: the CDX holds every capture ever indexed. `tywb
+    /// export-pdf-urls` renders it as the URL list for an external consumer,
+    /// which is the reason a full re-index is never needed just to produce
+    /// that list.
+    ///
+    /// Deduplication is SQL's (`DISTINCT`), because a PDF crawled twice has two
+    /// records and one URL. No index covers `mime`, so this is a sequential
+    /// scan; rows stream past and only the URLs are held.
+    pub fn pdf_urls(&self) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT DISTINCT original FROM cdx WHERE mime LIKE 'application/pdf%'",
+        )?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        rows.map(|r| r.map_err(CdxError::from)).collect()
+    }
+
+    /// Stream every HTML-ish record of the primary WARC collection through `f`.
+    /// Returns how many records were seen.
+    ///
+    /// The population `tywb export-pdf-urls --scan-links` parses for links to
+    /// PDFs — the same MIME set the indexer treats as markup. Restricted to
+    /// `collection = 'warc'`: a `pdf_bucket` collection holds standalone PDFs
+    /// and no HTML to read links out of. Unlike [`for_each_warc_pdf`] there is
+    /// no digest requirement; what a link scan needs is the record's
+    /// coordinates and its URL.
+    ///
+    /// [`for_each_warc_pdf`]: Self::for_each_warc_pdf
+    pub fn for_each_html_record(&self, mut f: impl FnMut(&CdxRecord)) -> Result<usize> {
+        let mut stmt = self.conn.prepare_cached(
+            "SELECT surt_url, timestamp, original, mime, status, digest, s3_key, offset, length, c_offset, collection
+             FROM cdx
+             WHERE collection = ?1
+               AND mime IS NOT NULL AND (
+                   mime LIKE 'text/html%'       OR mime LIKE 'application/xhtml%'
+                OR mime LIKE 'text/xml%'        OR mime LIKE 'application/xml%')",
+        )?;
+        let rows = stmt.query_map(params![crate::record::DEFAULT_COLLECTION], row_to_record)?;
+        let mut seen = 0usize;
+        for rec in rows {
+            f(&rec?);
+            seen += 1;
+        }
+        Ok(seen)
+    }
+
     /// The scalar aggregates only — no `GROUP BY`, and that is the point.
     ///
     /// This is what the homepage asks for. On the production archive (4.1M
@@ -643,24 +718,28 @@ impl CdxStore {
     ///
     /// [`stats`]: Self::stats
     pub fn basic_stats(&self) -> Result<BasicStats> {
-        let total_records: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM cdx", [], |r| r.get(0))?;
+        let total_records: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM cdx", [], |r| r.get(0))?;
 
-        let unique_urls: i64 = self.conn.query_row(
-            "SELECT COUNT(DISTINCT surt_url) FROM cdx", [], |r| r.get(0))?;
+        let unique_urls: i64 =
+            self.conn
+                .query_row("SELECT COUNT(DISTINCT surt_url) FROM cdx", [], |r| r.get(0))?;
 
-        let warc_files: i64 = self.conn.query_row(
-            "SELECT COUNT(DISTINCT s3_key) FROM cdx", [], |r| r.get(0))?;
+        let warc_files: i64 =
+            self.conn
+                .query_row("SELECT COUNT(DISTINCT s3_key) FROM cdx", [], |r| r.get(0))?;
 
-        let (oldest_timestamp, newest_timestamp): (Option<String>, Option<String>) =
-            self.conn.query_row(
-                "SELECT MIN(timestamp), MAX(timestamp) FROM cdx", [],
-                |r| Ok((r.get(0)?, r.get(1)?)))?;
+        let (oldest_timestamp, newest_timestamp): (Option<String>, Option<String>) = self
+            .conn
+            .query_row("SELECT MIN(timestamp), MAX(timestamp) FROM cdx", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })?;
 
         Ok(BasicStats {
             total_records: total_records as u64,
-            unique_urls:   unique_urls as u64,
-            warc_files:    warc_files as u64,
+            unique_urls: unique_urls as u64,
+            warc_files: warc_files as u64,
             oldest_timestamp,
             newest_timestamp,
         })
@@ -674,9 +753,12 @@ impl CdxStore {
     pub fn mime_counts(&self) -> Result<Vec<(String, u64)>> {
         let mut stmt = self.conn.prepare_cached(
             "SELECT COALESCE(mime, '(none)'), COUNT(*) AS n \
-             FROM cdx GROUP BY mime ORDER BY n DESC LIMIT 20")?;
+             FROM cdx GROUP BY mime ORDER BY n DESC LIMIT 20",
+        )?;
         let rows = stmt
-            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64)))?
+            .query_map([], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64))
+            })?
             .filter_map(|r| r.ok())
             .collect();
         Ok(rows)
@@ -689,7 +771,8 @@ impl CdxStore {
     pub fn status_counts(&self) -> Result<Vec<(Option<u16>, u64)>> {
         let mut stmt = self.conn.prepare_cached(
             "SELECT status, COUNT(*) AS n \
-             FROM cdx GROUP BY status ORDER BY n DESC")?;
+             FROM cdx GROUP BY status ORDER BY n DESC",
+        )?;
         let rows = stmt
             .query_map([], |r| {
                 let s: Option<i64> = r.get(0)?;
@@ -708,13 +791,13 @@ impl CdxStore {
     pub fn stats(&self) -> Result<CdxStats> {
         let basic = self.basic_stats()?;
         Ok(CdxStats {
-            total_records:    basic.total_records,
-            unique_urls:      basic.unique_urls,
-            warc_files:       basic.warc_files,
+            total_records: basic.total_records,
+            unique_urls: basic.unique_urls,
+            warc_files: basic.warc_files,
             oldest_timestamp: basic.oldest_timestamp,
             newest_timestamp: basic.newest_timestamp,
-            mime_counts:      self.mime_counts()?,
-            status_counts:    self.status_counts()?,
+            mime_counts: self.mime_counts()?,
+            status_counts: self.status_counts()?,
         })
     }
 
@@ -732,16 +815,16 @@ impl CdxStore {
         )?;
         let rows = stmt.query_map(params![limit as i64], |row| {
             Ok(WarcFileRow {
-                s3_key:           row.get(0)?,
-                last_indexed:     row.get(1)?,
-                warc_records:     row.get(2)?,
-                cdx_new:          row.get(3)?,
-                cdx_known:        row.get(4)?,
+                s3_key: row.get(0)?,
+                last_indexed: row.get(1)?,
+                warc_records: row.get(2)?,
+                cdx_new: row.get(3)?,
+                cdx_known: row.get(4)?,
                 fulltext_indexed: row.get(5)?,
-                errors:           row.get(6)?,
-                size_bytes:       row.get(7)?,
-                duration_secs:    row.get(8)?,
-                records_per_sec:  row.get(9)?,
+                errors: row.get(6)?,
+                size_bytes: row.get(7)?,
+                duration_secs: row.get(8)?,
+                records_per_sec: row.get(9)?,
             })
         })?;
         rows.map(|r| r.map_err(CdxError::from)).collect()
@@ -915,17 +998,17 @@ impl CdxStore {
 
 fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<CdxRecord> {
     Ok(CdxRecord {
-        surt_url:     row.get(0)?,
-        timestamp:    row.get(1)?,
+        surt_url: row.get(0)?,
+        timestamp: row.get(1)?,
         original_url: row.get(2)?,
-        mime:         row.get(3)?,
-        status:       row.get::<_, Option<i64>>(4)?.map(|v| v as u16),
-        digest:       row.get(5)?,
-        s3_key:       row.get(6)?,
-        offset:       row.get::<_, i64>(7)? as u64,
-        length:       row.get::<_, i64>(8)? as u64,
-        c_offset:     row.get::<_, Option<i64>>(9)?.map(|v| v as u64),
-        collection:   row.get(10)?,
+        mime: row.get(3)?,
+        status: row.get::<_, Option<i64>>(4)?.map(|v| v as u16),
+        digest: row.get(5)?,
+        s3_key: row.get(6)?,
+        offset: row.get::<_, i64>(7)? as u64,
+        length: row.get::<_, i64>(8)? as u64,
+        c_offset: row.get::<_, Option<i64>>(9)?.map(|v| v as u64),
+        collection: row.get(10)?,
     })
 }
 
@@ -964,17 +1047,17 @@ mod tests {
 
     fn sample(surt: &str, ts: &str, original: &str) -> CdxRecord {
         CdxRecord {
-            surt_url:     surt.to_owned(),
-            timestamp:    ts.to_owned(),
+            surt_url: surt.to_owned(),
+            timestamp: ts.to_owned(),
             original_url: original.to_owned(),
-            mime:         Some("text/html".to_owned()),
-            status:       Some(200),
-            digest:       Some("sha1:TESTHASH".to_owned()),
-            s3_key:       "test/archive.warc.gz".to_owned(),
-            offset:       1024,
-            length:       512,
-            c_offset:     None,
-            collection:   "warc".to_owned(),
+            mime: Some("text/html".to_owned()),
+            status: Some(200),
+            digest: Some("sha1:TESTHASH".to_owned()),
+            s3_key: "test/archive.warc.gz".to_owned(),
+            offset: 1024,
+            length: 512,
+            c_offset: None,
+            collection: "warc".to_owned(),
         }
     }
 
@@ -983,7 +1066,11 @@ mod tests {
     #[test]
     fn collection_count_agrees_with_the_group_by() {
         let store = store_with_samples();
-        let mut pdf = sample("nu,23,obst-pdfs)/a.pdf", "20260101000000", "https://obst-pdfs.23.nu/a.pdf");
+        let mut pdf = sample(
+            "nu,23,obst-pdfs)/a.pdf",
+            "20260101000000",
+            "https://obst-pdfs.23.nu/a.pdf",
+        );
         pdf.collection = "monatshefte".to_owned();
         store.upsert(&pdf).unwrap();
 
@@ -991,7 +1078,10 @@ mod tests {
         // They must not disagree.
         let grouped: std::collections::HashMap<String, u64> =
             store.collection_counts().unwrap().into_iter().collect();
-        assert_eq!(store.collection_count("monatshefte").unwrap(), grouped["monatshefte"]);
+        assert_eq!(
+            store.collection_count("monatshefte").unwrap(),
+            grouped["monatshefte"]
+        );
         assert_eq!(store.collection_count("warc").unwrap(), grouped["warc"]);
         assert_eq!(store.collection_count("nonexistent").unwrap(), 0);
     }
@@ -1001,7 +1091,11 @@ mod tests {
         // What the homepage does instead of counting the one collection large
         // enough for counting to hurt.
         let store = store_with_samples();
-        let mut pdf = sample("nu,23,obst-pdfs)/a.pdf", "20260101000000", "https://obst-pdfs.23.nu/a.pdf");
+        let mut pdf = sample(
+            "nu,23,obst-pdfs)/a.pdf",
+            "20260101000000",
+            "https://obst-pdfs.23.nu/a.pdf",
+        );
         pdf.collection = "monatshefte".to_owned();
         store.upsert(&pdf).unwrap();
 
@@ -1016,10 +1110,10 @@ mod tests {
         // disagree about how many records there are.
         let store = store_with_samples();
         let basic = store.basic_stats().unwrap();
-        let full  = store.stats().unwrap();
-        assert_eq!(basic.total_records,    full.total_records);
-        assert_eq!(basic.unique_urls,      full.unique_urls);
-        assert_eq!(basic.warc_files,       full.warc_files);
+        let full = store.stats().unwrap();
+        assert_eq!(basic.total_records, full.total_records);
+        assert_eq!(basic.unique_urls, full.unique_urls);
+        assert_eq!(basic.warc_files, full.warc_files);
         assert_eq!(basic.oldest_timestamp, full.oldest_timestamp);
         assert_eq!(basic.newest_timestamp, full.newest_timestamp);
     }
@@ -1028,7 +1122,7 @@ mod tests {
     fn breakdowns_match_the_composed_stats() {
         let store = store_with_samples();
         let full = store.stats().unwrap();
-        assert_eq!(store.mime_counts().unwrap(),   full.mime_counts);
+        assert_eq!(store.mime_counts().unwrap(), full.mime_counts);
         assert_eq!(store.status_counts().unwrap(), full.status_counts);
     }
 
@@ -1039,14 +1133,26 @@ mod tests {
         let p = path.to_str().unwrap();
         {
             let store = CdxStore::open(p).unwrap();
-            store.upsert(&sample("com,example)/", "20240101120000", "https://example.com/")).unwrap();
+            store
+                .upsert(&sample(
+                    "com,example)/",
+                    "20240101120000",
+                    "https://example.com/",
+                ))
+                .unwrap();
         }
 
         let ro = CdxStore::open_readonly(p).unwrap();
         assert_eq!(ro.basic_stats().unwrap().total_records, 1);
         // The schema is not touched on open, and writes are refused — which is
         // what keeps these connections from ever contending with the indexer.
-        assert!(ro.upsert(&sample("org,other)/", "20240101120000", "https://other.org/")).is_err());
+        assert!(ro
+            .upsert(&sample(
+                "org,other)/",
+                "20240101120000",
+                "https://other.org/"
+            ))
+            .is_err());
     }
 
     #[test]
@@ -1055,9 +1161,17 @@ mod tests {
         // those are standalone files, fetched from their own bucket, not the
         // WARC way.
         let store = CdxStore::open_in_memory().unwrap();
-        let mut pdf_warc = sample("com,example)/band30.pdf", "20260101000000", "https://example.com/band30.pdf");
+        let mut pdf_warc = sample(
+            "com,example)/band30.pdf",
+            "20260101000000",
+            "https://example.com/band30.pdf",
+        );
         pdf_warc.mime = Some("application/pdf".to_owned());
-        let mut pdf_other = sample("nu,23,obst-pdfs)/a.pdf", "20260101000000", "https://obst-pdfs.23.nu/a.pdf");
+        let mut pdf_other = sample(
+            "nu,23,obst-pdfs)/a.pdf",
+            "20260101000000",
+            "https://obst-pdfs.23.nu/a.pdf",
+        );
         pdf_other.mime = Some("application/pdf".to_owned());
         pdf_other.collection = "monatshefte".to_owned();
         let mut pdf_digestless = pdf_warc.clone();
@@ -1067,7 +1181,13 @@ mod tests {
         store.upsert(&pdf_warc).unwrap();
         store.upsert(&pdf_other).unwrap();
         store.upsert(&pdf_digestless).unwrap();
-        store.upsert(&sample("com,example)/", "20240101120000", "https://example.com/")).unwrap();
+        store
+            .upsert(&sample(
+                "com,example)/",
+                "20240101120000",
+                "https://example.com/",
+            ))
+            .unwrap();
 
         let mut seen = Vec::new();
         let n = store
@@ -1085,7 +1205,13 @@ mod tests {
         let p = path.to_str().unwrap();
         {
             let store = CdxStore::open(p).unwrap();
-            store.upsert(&sample("com,example)/", "20240101120000", "https://example.com/")).unwrap();
+            store
+                .upsert(&sample(
+                    "com,example)/",
+                    "20240101120000",
+                    "https://example.com/",
+                ))
+                .unwrap();
         }
         let a = CdxStore::open_readonly(p).unwrap();
         let b = CdxStore::open_readonly(p).unwrap();
@@ -1095,15 +1221,67 @@ mod tests {
         assert_eq!(c.status_counts().unwrap().len(), 1);
     }
 
+    // ── The PDF URL set ───────────────────────────────────────────────────
+
+    #[test]
+    fn pdf_urls_spans_collections_and_dedupes_captures() {
+        let store = store_with_samples();
+        // Two captures of one PDF in the WARC archive…
+        for ts in ["20260101000000", "20260601000000"] {
+            let mut pdf = sample("com,example)/a.pdf", ts, "https://example.com/a.pdf");
+            pdf.mime = Some("application/pdf".to_owned());
+            store.upsert(&pdf).unwrap();
+        }
+        // …a PDF whose MIME carries parameters, and one from a `pdf_bucket`
+        // collection, which is where a standalone object's public URL lives.
+        let mut parameterised = sample(
+            "com,example)/b.pdf",
+            "20260101000000",
+            "https://example.com/b.pdf",
+        );
+        parameterised.mime = Some("application/pdf; charset=binary".to_owned());
+        store.upsert(&parameterised).unwrap();
+        let mut from_collection = sample(
+            "nu,23,obst-pdfs)/c.pdf",
+            "20260101000000",
+            "https://obst-pdfs.23.nu/c.pdf",
+        );
+        from_collection.mime = Some("application/pdf".to_owned());
+        from_collection.collection = "obst-pdfs".to_owned();
+        store.upsert(&from_collection).unwrap();
+
+        let mut urls = store.pdf_urls().unwrap();
+        urls.sort();
+        assert_eq!(
+            urls,
+            [
+                "https://example.com/a.pdf",
+                "https://example.com/b.pdf",
+                "https://obst-pdfs.23.nu/c.pdf",
+            ],
+            "one URL per document, from every collection",
+        );
+        // The HTML samples in the fixture are not PDFs.
+        assert!(!urls.contains(&"https://example.com/".to_owned()));
+    }
+
     fn store_with_samples() -> CdxStore {
         let mut store = CdxStore::open_in_memory().unwrap();
         let records = vec![
-            sample("com,example)/",     "20240101120000", "https://example.com/"),
-            sample("com,example)/",     "20240601120000", "https://example.com/"),
-            sample("com,example)/",     "20241201120000", "https://example.com/"),
-            sample("com,example)/page", "20240315080000", "https://example.com/page"),
-            sample("com,example)/page", "20240315160000", "https://example.com/page"),
-            sample("org,other)/",       "20240601000000", "https://other.org/"),
+            sample("com,example)/", "20240101120000", "https://example.com/"),
+            sample("com,example)/", "20240601120000", "https://example.com/"),
+            sample("com,example)/", "20241201120000", "https://example.com/"),
+            sample(
+                "com,example)/page",
+                "20240315080000",
+                "https://example.com/page",
+            ),
+            sample(
+                "com,example)/page",
+                "20240315160000",
+                "https://example.com/page",
+            ),
+            sample("org,other)/", "20240601000000", "https://other.org/"),
         ];
         store.upsert_batch(&records).unwrap();
         store
@@ -1127,7 +1305,13 @@ mod tests {
     #[test]
     fn upsert_single_record() {
         let store = CdxStore::open_in_memory().unwrap();
-        store.upsert(&sample("com,example)/", "20240101000000", "https://example.com/")).unwrap();
+        store
+            .upsert(&sample(
+                "com,example)/",
+                "20240101000000",
+                "https://example.com/",
+            ))
+            .unwrap();
         assert_eq!(store.count().unwrap(), 1);
     }
 
@@ -1217,7 +1401,10 @@ mod tests {
     #[test]
     fn closest_exact_match() {
         let store = store_with_samples();
-        let rec = store.closest("com,example)/", "20240601120000").unwrap().unwrap();
+        let rec = store
+            .closest("com,example)/", "20240601120000")
+            .unwrap()
+            .unwrap();
         assert_eq!(rec.timestamp, "20240601120000");
     }
 
@@ -1225,7 +1412,10 @@ mod tests {
     fn closest_prefers_earlier() {
         let store = store_with_samples();
         // Between 20240101 and 20240601 — closer to 20240101
-        let rec = store.closest("com,example)/", "20240201000000").unwrap().unwrap();
+        let rec = store
+            .closest("com,example)/", "20240201000000")
+            .unwrap()
+            .unwrap();
         assert_eq!(rec.timestamp, "20240101120000");
     }
 
@@ -1233,7 +1423,10 @@ mod tests {
     fn closest_picks_later_when_only_later_exists() {
         let store = store_with_samples();
         // Before all records
-        let rec = store.closest("com,example)/", "20230101000000").unwrap().unwrap();
+        let rec = store
+            .closest("com,example)/", "20230101000000")
+            .unwrap()
+            .unwrap();
         assert_eq!(rec.timestamp, "20240101120000");
     }
 
@@ -1241,7 +1434,10 @@ mod tests {
     fn closest_picks_earlier_when_only_earlier_exists() {
         let store = store_with_samples();
         // After all records
-        let rec = store.closest("com,example)/", "20991231235959").unwrap().unwrap();
+        let rec = store
+            .closest("com,example)/", "20991231235959")
+            .unwrap()
+            .unwrap();
         assert_eq!(rec.timestamp, "20241201120000");
     }
 
@@ -1321,14 +1517,20 @@ mod tests {
         let hits = store.urls_matching(|u| u.contains("/page")).unwrap();
         assert_eq!(
             hits,
-            vec![("com,example)/page".to_owned(), "https://example.com/page".to_owned())],
+            vec![(
+                "com,example)/page".to_owned(),
+                "https://example.com/page".to_owned()
+            )],
         );
     }
 
     #[test]
     fn urls_matching_that_selects_nothing_is_empty() {
         let store = store_with_samples();
-        assert!(store.urls_matching(|u| u.contains("action=edit")).unwrap().is_empty());
+        assert!(store
+            .urls_matching(|u| u.contains("action=edit"))
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

@@ -13,17 +13,17 @@ use std::time::Instant;
 
 use anyhow::Context;
 use bytes::Bytes;
-use tracing::{debug, info, warn, error};
+use tracing::{debug, error, info, warn};
 
-use warc::{WarcIter, WarcReader};
-use warc_search_cdx::{CdxRecord, CdxStore, WarcFileMeta, WarcInfoRecord, from_warc_record};
 use crate::gz_warc::GzSplitter;
+use warc::{WarcIter, WarcReader};
+use warc_search_cdx::{from_warc_record, CdxRecord, CdxStore, WarcFileMeta, WarcInfoRecord};
 use warc_search_config::{Config, IndexerConfig};
 use warc_search_s3::{
-    build_client, ListState, Lister, ObjectMeta, S3Error,
-    default_state_path, get_stream, head_object, put_object,
+    build_client, default_state_path, get_stream, head_object, put_object, ListState, Lister,
+    ObjectMeta, S3Error,
 };
-use warc_search_search::{SearchIndex, IndexDoc};
+use warc_search_search::{IndexDoc, SearchIndex};
 
 // ── CLI arguments ─────────────────────────────────────────────────────────────
 
@@ -45,35 +45,44 @@ pub struct IndexArgs {
 
 #[derive(Debug, Default)]
 struct FileStats {
-    warc_records:     usize,
-    cdx_new:          usize,
-    cdx_known:        usize,
-    indexed:          usize,
-    skipped:          usize,
-    errors:           usize,
-    bytes_processed:  u64,
-    duration_secs:    f64,
-    warc_date_min:    Option<String>,
-    warc_date_max:    Option<String>,
+    warc_records: usize,
+    cdx_new: usize,
+    cdx_known: usize,
+    indexed: usize,
+    skipped: usize,
+    errors: usize,
+    bytes_processed: u64,
+    duration_secs: f64,
+    warc_date_min: Option<String>,
+    warc_date_max: Option<String>,
     /// MIME type → record count.
-    mime_counts:      HashMap<String, u64>,
+    mime_counts: HashMap<String, u64>,
     /// PDFs whose text came from the OCR cache, and PDFs queued for the
     /// worker instead of being extracted here.
-    ocr_cache_hits:   usize,
-    ocr_queued:      usize,
+    ocr_cache_hits: usize,
+    ocr_queued: usize,
+    /// PDF URLs seen in this object, for the run's URL export
+    /// (`indexer.pdf_url_export`). Empty unless that block is configured.
+    pdf_urls: Vec<String>,
+    /// PDF URLs *linked from* this object's HTML, one entry per occurrence.
+    /// Deduplicated and filtered against the skip list once, at the end of the
+    /// run — see `pdf_url_export`.
+    pdf_links: Vec<String>,
 }
 
 impl std::ops::AddAssign<&FileStats> for FileStats {
     fn add_assign(&mut self, o: &FileStats) {
-        self.warc_records    += o.warc_records;
-        self.cdx_new         += o.cdx_new;
-        self.cdx_known       += o.cdx_known;
-        self.indexed         += o.indexed;
-        self.skipped         += o.skipped;
-        self.errors          += o.errors;
+        self.warc_records += o.warc_records;
+        self.cdx_new += o.cdx_new;
+        self.cdx_known += o.cdx_known;
+        self.indexed += o.indexed;
+        self.skipped += o.skipped;
+        self.errors += o.errors;
         self.bytes_processed += o.bytes_processed;
         self.ocr_cache_hits += o.ocr_cache_hits;
-        self.ocr_queued    += o.ocr_queued;
+        self.ocr_queued += o.ocr_queued;
+        self.pdf_urls.extend(o.pdf_urls.iter().cloned());
+        self.pdf_links.extend(o.pdf_links.iter().cloned());
     }
 }
 
@@ -85,17 +94,17 @@ struct SharedProgress {
     /// URL of the most-recently-seen WARC response record.
     current_url: RwLock<String>,
     /// Uncompressed bytes read so far in the current file.
-    bytes_read:  AtomicU64,
+    bytes_read: AtomicU64,
     /// WARC records processed so far in the current file.
     warc_records: AtomicUsize,
     /// CDX entries found so far in the current file.
-    cdx_found:   AtomicUsize,
+    cdx_found: AtomicUsize,
     /// Milliseconds at which the current file started (from `run_start`).
     file_start_ms: AtomicU64,
     /// Wall-clock start of the whole `index` run.
-    run_start:   Instant,
+    run_start: Instant,
     /// Number of files finished so far.
-    files_done:  AtomicUsize,
+    files_done: AtomicUsize,
     /// Total files to process (set once before the loop).
     files_total: AtomicUsize,
 }
@@ -103,21 +112,21 @@ struct SharedProgress {
 impl SharedProgress {
     fn new() -> Arc<Self> {
         Arc::new(Self {
-            current_key:  RwLock::new(String::new()),
-            current_url:  RwLock::new(String::new()),
-            bytes_read:   AtomicU64::new(0),
+            current_key: RwLock::new(String::new()),
+            current_url: RwLock::new(String::new()),
+            bytes_read: AtomicU64::new(0),
             warc_records: AtomicUsize::new(0),
-            cdx_found:    AtomicUsize::new(0),
+            cdx_found: AtomicUsize::new(0),
             file_start_ms: AtomicU64::new(0),
-            run_start:    Instant::now(),
-            files_done:   AtomicUsize::new(0),
-            files_total:  AtomicUsize::new(0),
+            run_start: Instant::now(),
+            files_done: AtomicUsize::new(0),
+            files_total: AtomicUsize::new(0),
         })
     }
 
     fn reset_for_file(&self, key: &str) {
-        *self.current_key.write().unwrap()  = key.to_owned();
-        *self.current_url.write().unwrap()  = String::new();
+        *self.current_key.write().unwrap() = key.to_owned();
+        *self.current_url.write().unwrap() = String::new();
         self.bytes_read.store(0, Ordering::Relaxed);
         self.warc_records.store(0, Ordering::Relaxed);
         self.cdx_found.store(0, Ordering::Relaxed);
@@ -126,19 +135,23 @@ impl SharedProgress {
     }
 
     fn print_status(&self) {
-        let key  = self.current_key.read().unwrap().clone();
-        let url  = self.current_url.read().unwrap().clone();
+        let key = self.current_key.read().unwrap().clone();
+        let url = self.current_url.read().unwrap().clone();
         let recs = self.warc_records.load(Ordering::Relaxed);
-        let cdx  = self.cdx_found.load(Ordering::Relaxed);
-        let mb   = self.bytes_read.load(Ordering::Relaxed) as f64 / 1_048_576.0;
+        let cdx = self.cdx_found.load(Ordering::Relaxed);
+        let mb = self.bytes_read.load(Ordering::Relaxed) as f64 / 1_048_576.0;
 
-        let elapsed_ms  = self.run_start.elapsed().as_millis() as u64;
-        let file_start  = self.file_start_ms.load(Ordering::Relaxed);
-        let file_secs   = (elapsed_ms.saturating_sub(file_start)) as f64 / 1000.0;
-        let rec_per_sec = if file_secs > 0.0 { recs as f64 / file_secs } else { 0.0 };
-        let mb_per_sec  = if file_secs > 0.0 { mb / file_secs } else { 0.0 };
+        let elapsed_ms = self.run_start.elapsed().as_millis() as u64;
+        let file_start = self.file_start_ms.load(Ordering::Relaxed);
+        let file_secs = (elapsed_ms.saturating_sub(file_start)) as f64 / 1000.0;
+        let rec_per_sec = if file_secs > 0.0 {
+            recs as f64 / file_secs
+        } else {
+            0.0
+        };
+        let mb_per_sec = if file_secs > 0.0 { mb / file_secs } else { 0.0 };
 
-        let done  = self.files_done.load(Ordering::Relaxed);
+        let done = self.files_done.load(Ordering::Relaxed);
         let total = self.files_total.load(Ordering::Relaxed);
 
         eprintln!(
@@ -164,11 +177,7 @@ fn domain_to_surt_host(domain: &str) -> String {
 
 /// Remove all entries for `domain` (apex + subdomains) from both the CDX SQLite
 /// store and the Tantivy fulltext index, then commit the fulltext changes.
-fn purge_domain(
-    domain: &str,
-    cdx: &CdxStore,
-    search: &mut SearchIndex,
-) -> anyhow::Result<()> {
+fn purge_domain(domain: &str, cdx: &CdxStore, search: &mut SearchIndex) -> anyhow::Result<()> {
     let surt_host = domain_to_surt_host(domain);
 
     // Collect all original URLs before touching CDX, because we need them to
@@ -188,9 +197,7 @@ fn purge_domain(
     if cdx_deleted > 0 || search_queued > 0 {
         info!(
             domain,
-            cdx_deleted,
-            search_queued,
-            "purged blacklisted domain"
+            cdx_deleted, search_queued, "purged blacklisted domain"
         );
     }
 
@@ -227,9 +234,7 @@ fn purge_url_patterns(
 
     info!(
         urls = surts.len(),
-        cdx_deleted,
-        search_queued,
-        "purged URLs matching the skip patterns"
+        cdx_deleted, search_queued, "purged URLs matching the skip patterns"
     );
     Ok(())
 }
@@ -260,12 +265,16 @@ pub async fn run(cfg: Config, args: IndexArgs) -> anyhow::Result<()> {
             purge_domain(domain, &cdx, &mut search)?;
         }
         // Commit fulltext deletions in one pass.
-        search.commit().context("committing fulltext deletions for blacklisted domains")?;
+        search
+            .commit()
+            .context("committing fulltext deletions for blacklisted domains")?;
     }
 
     if !cfg.indexer.blacklisted_url_patterns.is_empty() {
         purge_url_patterns(&cfg.indexer, &mut cdx, &mut search)?;
-        search.commit().context("committing fulltext deletions for blacklisted URL patterns")?;
+        search
+            .commit()
+            .context("committing fulltext deletions for blacklisted URL patterns")?;
     }
 
     // ── S3 ──────────────────────────────────────────────────────────────────
@@ -289,11 +298,10 @@ pub async fn run(cfg: Config, args: IndexArgs) -> anyhow::Result<()> {
     };
 
     let state_path = default_state_path(&cfg.storage.cdx_db_path);
-    let mut state = ListState::load(&state_path)
-        .unwrap_or_else(|e| {
-            warn!(path = %state_path.display(), err = %e, "could not load list state, starting fresh");
-            ListState::default()
-        });
+    let mut state = ListState::load(&state_path).unwrap_or_else(|e| {
+        warn!(path = %state_path.display(), err = %e, "could not load list state, starting fresh");
+        ListState::default()
+    });
 
     // Build list of objects to process
     let objects: Vec<ObjectMeta> = if args.collections_only {
@@ -302,7 +310,12 @@ pub async fn run(cfg: Config, args: IndexArgs) -> anyhow::Result<()> {
     } else if let Some(ref key) = args.file {
         // Single-file mode: synthesise a fake ObjectMeta so the loop is uniform.
         info!(key = %key, "single-file mode");
-        vec![ObjectMeta { key: key.clone(), size: 0, etag: None, last_modified: None }]
+        vec![ObjectMeta {
+            key: key.clone(),
+            size: 0,
+            etag: None,
+            last_modified: None,
+        }]
     } else {
         let lister = {
             let mut l = Lister::new(&s3, &cfg.s3.bucket);
@@ -315,7 +328,10 @@ pub async fn run(cfg: Config, args: IndexArgs) -> anyhow::Result<()> {
             info!("--force: ignoring saved ETag state, all objects will be re-processed");
             lister.list_all().await.context("listing S3 objects")?
         } else {
-            lister.list_new_or_changed(&state).await.context("listing S3 objects")?
+            lister
+                .list_new_or_changed(&state)
+                .await
+                .context("listing S3 objects")?
         }
     };
 
@@ -330,7 +346,7 @@ pub async fn run(cfg: Config, args: IndexArgs) -> anyhow::Result<()> {
     // Apply --max-files cap before we start (so the progress counter is right).
     let objects: Vec<ObjectMeta> = match args.max_files {
         Some(n) => objects.into_iter().take(n).collect(),
-        None    => objects,
+        None => objects,
     };
 
     info!(count = objects.len(), "objects to index");
@@ -360,20 +376,29 @@ pub async fn run(cfg: Config, args: IndexArgs) -> anyhow::Result<()> {
         let file_start = Instant::now();
 
         match index_warc_object(
-            &s3, &cfg.s3.bucket, &obj.key,
-            &mut cdx, &mut search,
+            &s3,
+            &cfg.s3.bucket,
+            &obj.key,
+            &mut cdx,
+            &mut search,
             &cfg.indexer,
             Arc::clone(&progress),
             ocr_cache.as_ref(),
-        ).await {
+        )
+        .await
+        {
             Ok(mut stats) => {
                 stats.duration_secs = file_start.elapsed().as_secs_f64();
                 let rec_per_sec = if stats.duration_secs > 0.0 {
                     stats.warc_records as f64 / stats.duration_secs
-                } else { 0.0 };
+                } else {
+                    0.0
+                };
                 let mb_per_sec = if stats.duration_secs > 0.0 {
                     stats.bytes_processed as f64 / 1_048_576.0 / stats.duration_secs
-                } else { 0.0 };
+                } else {
+                    0.0
+                };
 
                 info!(
                     key          = %obj.key,
@@ -396,23 +421,27 @@ pub async fn run(cfg: Config, args: IndexArgs) -> anyhow::Result<()> {
                 let mime_json = serde_json::to_string(&stats.mime_counts).unwrap_or_default();
                 let now_iso = utc_now_iso();
                 let meta = WarcFileMeta {
-                    s3_key:           obj.key.clone(),
-                    etag:             obj.etag.clone(),
-                    size_bytes:       obj.size,
-                    indexed_at:       now_iso,
-                    bucket:           Some(cfg.s3.bucket.clone()),
-                    warc_records:     stats.warc_records,
-                    cdx_new:          stats.cdx_new,
-                    cdx_known:        stats.cdx_known,
+                    s3_key: obj.key.clone(),
+                    etag: obj.etag.clone(),
+                    size_bytes: obj.size,
+                    indexed_at: now_iso,
+                    bucket: Some(cfg.s3.bucket.clone()),
+                    warc_records: stats.warc_records,
+                    cdx_new: stats.cdx_new,
+                    cdx_known: stats.cdx_known,
                     fulltext_indexed: stats.indexed,
-                    skipped:          stats.skipped,
-                    errors:           stats.errors,
-                    duration_secs:    stats.duration_secs,
-                    bytes_per_sec:    mb_per_sec * 1_048_576.0,
-                    records_per_sec:  rec_per_sec,
-                    warc_date_min:    stats.warc_date_min.clone(),
-                    warc_date_max:    stats.warc_date_max.clone(),
-                    mime_summary:     if mime_json == "{}" { None } else { Some(mime_json) },
+                    skipped: stats.skipped,
+                    errors: stats.errors,
+                    duration_secs: stats.duration_secs,
+                    bytes_per_sec: mb_per_sec * 1_048_576.0,
+                    records_per_sec: rec_per_sec,
+                    warc_date_min: stats.warc_date_min.clone(),
+                    warc_date_max: stats.warc_date_max.clone(),
+                    mime_summary: if mime_json == "{}" {
+                        None
+                    } else {
+                        Some(mime_json)
+                    },
                 };
                 if let Err(e) = cdx.upsert_warc_file(&meta) {
                     warn!(key = %obj.key, err = %e, "could not write warc_files metadata");
@@ -436,7 +465,11 @@ pub async fn run(cfg: Config, args: IndexArgs) -> anyhow::Result<()> {
         // --max-urls check
         if let Some(max_u) = args.max_urls {
             if total_cdx_new >= max_u {
-                info!(total_cdx_new, max_urls = max_u, "reached --max-urls limit, stopping");
+                info!(
+                    total_cdx_new,
+                    max_urls = max_u,
+                    "reached --max-urls limit, stopping"
+                );
                 break;
             }
         }
@@ -448,15 +481,25 @@ pub async fn run(cfg: Config, args: IndexArgs) -> anyhow::Result<()> {
     if args.file.is_none() {
         for coll in &cfg.indexer.collections {
             match crate::pdf_collection::index_pdf_collection(
-                coll, &s3, &mut cdx, &mut search, &cfg.indexer, &mut state,
-            ).await {
+                coll,
+                &s3,
+                &mut cdx,
+                &mut search,
+                &cfg.indexer,
+                &mut state,
+            )
+            .await
+            {
                 Ok(cs) => {
                     totals.cdx_new += cs.cdx_new;
                     totals.indexed += cs.indexed;
                     totals.skipped += cs.skipped;
-                    totals.errors  += cs.errors;
+                    totals.errors += cs.errors;
+                    totals.pdf_urls.extend(cs.pdf_urls);
                 }
-                Err(e) => error!(name = %coll.name, err = %format!("{e:#}"), "collection indexing failed"),
+                Err(e) => {
+                    error!(name = %coll.name, err = %format!("{e:#}"), "collection indexing failed")
+                }
             }
             if let Err(e) = state.save(&state_path) {
                 warn!(err = %e, "could not save list state after collection");
@@ -467,25 +510,60 @@ pub async fn run(cfg: Config, args: IndexArgs) -> anyhow::Result<()> {
     search.commit().context("final search index commit")?;
 
     let total_secs = progress.run_start.elapsed().as_secs_f64();
-    let total_rec_per_sec = if total_secs > 0.0 { totals.warc_records as f64 / total_secs } else { 0.0 };
-    let total_mb_per_sec  = if total_secs > 0.0 { totals.bytes_processed as f64 / 1_048_576.0 / total_secs } else { 0.0 };
+    let total_rec_per_sec = if total_secs > 0.0 {
+        totals.warc_records as f64 / total_secs
+    } else {
+        0.0
+    };
+    let total_mb_per_sec = if total_secs > 0.0 {
+        totals.bytes_processed as f64 / 1_048_576.0 / total_secs
+    } else {
+        0.0
+    };
 
     info!(
         objects_processed = progress.files_done.load(Ordering::Relaxed),
-        warc_records      = totals.warc_records,
-        cdx_new           = totals.cdx_new,
-        cdx_known         = totals.cdx_known,
-        indexed           = totals.indexed,
-        skipped           = totals.skipped,
-        errors            = totals.errors,
-        ocr_cache_hits    = totals.ocr_cache_hits,
-        ocr_queued       = totals.ocr_queued,
-        mb_processed      = format!("{:.1}", totals.bytes_processed as f64 / 1_048_576.0),
-        duration_s        = format!("{:.1}", total_secs),
-        rec_per_sec       = format!("{:.0}", total_rec_per_sec),
-        mb_per_sec        = format!("{:.2}", total_mb_per_sec),
+        warc_records = totals.warc_records,
+        cdx_new = totals.cdx_new,
+        cdx_known = totals.cdx_known,
+        indexed = totals.indexed,
+        skipped = totals.skipped,
+        errors = totals.errors,
+        ocr_cache_hits = totals.ocr_cache_hits,
+        ocr_queued = totals.ocr_queued,
+        mb_processed = format!("{:.1}", totals.bytes_processed as f64 / 1_048_576.0),
+        duration_s = format!("{:.1}", total_secs),
+        rec_per_sec = format!("{:.0}", total_rec_per_sec),
+        mb_per_sec = format!("{:.2}", total_mb_per_sec),
         "run complete",
     );
+
+    // ── PDF URL export ────────────────────────────────────────────────────────
+    // One text file with every PDF URL the run saw, uploaded to
+    // `indexer.pdf_url_export`'s bucket for an external consumer (an ArchiveBox
+    // watcher). Best effort — the indexes are already written and committed.
+    // Two halves go into it: the records that *are* PDFs, and the PDFs those
+    // records' HTML *linked to* — the ones the crawl may never have fetched.
+    //
+    // This covers what the run processed; `tywb export-pdf-urls` produces the
+    // same list for the whole archive (CDX plus `--scan-links`) through the very
+    // same merge, render and upload code.
+    if cfg.indexer.pdf_url_export.is_some() {
+        let report = crate::pdf_url_export::merge(
+            std::mem::take(&mut totals.pdf_urls),
+            std::mem::take(&mut totals.pdf_links),
+            |url| cfg.indexer.is_url_blacklisted(url),
+        );
+        info!(
+            exportable = report.urls.len(),
+            captured = report.captured,
+            linked = report.linked,
+            blacklisted = report.blacklisted,
+            not_http = report.not_http,
+            "PDF URLs collected by this run",
+        );
+        crate::pdf_url_export::upload(&s3, &cfg.indexer.pdf_url_export, &report.urls).await;
+    }
 
     Ok(())
 }
@@ -493,20 +571,25 @@ pub async fn run(cfg: Config, args: IndexArgs) -> anyhow::Result<()> {
 // ── Per-object indexing ───────────────────────────────────────────────────────
 
 struct ParsedObject {
-    records:      Vec<(CdxRecord, Option<IndexDoc>)>,
+    records: Vec<(CdxRecord, Option<IndexDoc>)>,
     warc_records: usize,
-    skipped:      usize,
-    errors:       usize,
-    bytes_read:   u64,
+    skipped: usize,
+    errors: usize,
+    bytes_read: u64,
     warc_date_min: Option<String>,
     warc_date_max: Option<String>,
-    mime_counts:  HashMap<String, u64>,
+    mime_counts: HashMap<String, u64>,
     /// The first `warcinfo` record encountered in the file, if any.
-    warcinfo:     Option<WarcInfoRecord>,
+    warcinfo: Option<WarcInfoRecord>,
     /// PDFs whose text came from the OCR cache.
     ocr_cache_hits: usize,
     /// PDFs queued for `tywb ocr-worker` instead of being extracted here.
-    ocr_queued:    usize,
+    ocr_queued: usize,
+    /// PDF URLs seen in this object, for the run's URL export
+    /// (`indexer.pdf_url_export`).
+    pdf_urls: Vec<String>,
+    /// PDF URLs linked from this object's HTML, one entry per occurrence.
+    pdf_links: Vec<String>,
 }
 
 async fn index_warc_object(
@@ -537,8 +620,15 @@ async fn index_warc_object(
         let mut pinned = Box::pin(stream);
         while let Some(chunk) = pinned.next().await {
             match chunk {
-                Ok(b)  => { if tx.send(b).is_err() { break; } }
-                Err(e) => { warn!(err = %e, "S3 stream error"); break; }
+                Ok(b) => {
+                    if tx.send(b).is_err() {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    warn!(err = %e, "S3 stream error");
+                    break;
+                }
             }
         }
     });
@@ -568,6 +658,8 @@ async fn index_warc_object(
             let mut warcinfo_record: Option<WarcInfoRecord> = None;
             let mut ocr_hits             = 0usize;
             let mut ocr_queued           = 0usize;
+            let mut pdf_urls: Vec<String> = Vec::new();
+            let mut pdf_links: Vec<String> = Vec::new();
 
             const PROGRESS_EVERY: usize = 100;
 
@@ -595,6 +687,8 @@ async fn index_warc_object(
                 bucket:      &str,
                 ocr_hits:    &mut usize,
                 ocr_queued:  &mut usize,
+                pdf_urls:    &mut Vec<String>,
+                pdf_links:   &mut Vec<String>,
             ) {
                 // Track WARC-Date range.
                 if let Some(d) = record.header.get("WARC-Date") {
@@ -678,7 +772,34 @@ async fn index_warc_object(
                             .map(|m| m.split(';').next().unwrap_or(m).trim())
                             .unwrap_or("(none)")
                             .to_owned();
+                        let is_pdf = mime_key.starts_with("application/pdf");
                         *mime_counts.entry(mime_key).or_insert(0) += 1;
+
+                        // ── PDF URL export (`indexer.pdf_url_export`) ─────────
+                        // Two kinds of URL belong on the list, and both are "a
+                        // PDF this run saw":
+                        //
+                        //   1. this record *is* a PDF — the archive holds it;
+                        //   2. this record's HTML *links to* a PDF — collected
+                        //      by build_index_doc below, which is where the
+                        //      decoded markup is in hand. These are the ones the
+                        //      crawl may never have fetched, which is the whole
+                        //      point of handing the list to an external archiver.
+                        //
+                        // Both are collected only after the skip list has had its
+                        // say about *this* record. The links themselves are
+                        // filtered once, at the end of the run: a wanted page
+                        // pointing at a blacklisted site must not put that site
+                        // on the list, and asking once per distinct URL is
+                        // cheaper than asking per occurrence.
+                        let collecting = blacklist.pdf_url_export.is_some();
+                        if is_pdf
+                            && collecting
+                            && (cdx_rec.original_url.starts_with("http://")
+                                || cdx_rec.original_url.starts_with("https://"))
+                        {
+                            pdf_urls.push(cdx_rec.original_url.clone());
+                        }
 
                         *progress.current_url.write().unwrap() =
                             cdx_rec.original_url.clone();
@@ -693,6 +814,7 @@ async fn index_warc_object(
                         let doc = build_index_doc(
                             record, &cdx_rec, max_text, pdf,
                             ocr, bucket, ocr_hits, ocr_queued,
+                            collecting.then_some(&mut *pdf_links),
                         );
                         out.push((cdx_rec, doc));
                     }
@@ -769,7 +891,7 @@ async fn index_warc_object(
                         &mut mime_counts, &mut warc_date_min, &mut warc_date_max,
                         &progress, warc_records, pdf_extractor.as_ref(),
                         ocr_owned.as_ref(), &bucket_owned,
-                        &mut ocr_hits, &mut ocr_queued,
+                        &mut ocr_hits, &mut ocr_queued, &mut pdf_urls, &mut pdf_links,
                     );
                 }
             } else {
@@ -799,7 +921,7 @@ async fn index_warc_object(
                                 &mut mime_counts, &mut warc_date_min, &mut warc_date_max,
                                 &progress, warc_records, pdf_extractor.as_ref(),
                                 ocr_owned.as_ref(), &bucket_owned,
-                                &mut ocr_hits, &mut ocr_queued,
+                                &mut ocr_hits, &mut ocr_queued, &mut pdf_urls, &mut pdf_links,
                             );
                         }
                     }
@@ -818,6 +940,8 @@ async fn index_warc_object(
                 warcinfo: warcinfo_record,
                 ocr_cache_hits: ocr_hits,
                 ocr_queued,
+                pdf_urls,
+                pdf_links,
             })
         })
         .await
@@ -839,10 +963,10 @@ async fn index_warc_object(
     // Spawn a background task to write a CDX sidecar file into the bucket
     // alongside the WARC, skipping if the file already exists.
     {
-        let s3_clone  = s3.clone();
-        let bucket    = bucket.to_owned();
-        let key       = key.to_owned();
-        let recs      = cdx_records.clone();
+        let s3_clone = s3.clone();
+        let bucket = bucket.to_owned();
+        let key = key.to_owned();
+        let recs = cdx_records.clone();
         tokio::spawn(async move {
             write_cdx_sidecar(&s3_clone, &bucket, &key, &recs).await;
         });
@@ -866,19 +990,21 @@ async fn index_warc_object(
     search.commit().context("search commit")?;
 
     Ok(FileStats {
-        warc_records:    parsed.warc_records,
+        warc_records: parsed.warc_records,
         cdx_new,
         cdx_known,
         indexed,
-        skipped:         parsed.skipped,
-        errors:          parsed.errors,
+        skipped: parsed.skipped,
+        errors: parsed.errors,
         bytes_processed: parsed.bytes_read,
-        duration_secs:   0.0, // filled in by caller
-        warc_date_min:   parsed.warc_date_min,
-        warc_date_max:   parsed.warc_date_max,
-        mime_counts:     parsed.mime_counts,
-        ocr_cache_hits:  parsed.ocr_cache_hits,
-        ocr_queued:      parsed.ocr_queued,
+        duration_secs: 0.0, // filled in by caller
+        warc_date_min: parsed.warc_date_min,
+        warc_date_max: parsed.warc_date_max,
+        mime_counts: parsed.mime_counts,
+        ocr_cache_hits: parsed.ocr_cache_hits,
+        ocr_queued: parsed.ocr_queued,
+        pdf_urls: parsed.pdf_urls,
+        pdf_links: parsed.pdf_links,
     })
 }
 
@@ -923,6 +1049,7 @@ pub(crate) fn is_bookkeeping_url(url: &str) -> bool {
         .any(|s| url.len() > s.len() && url[..s.len()].eq_ignore_ascii_case(s))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_index_doc(
     record: &warc::WarcRecord,
     cdx: &CdxRecord,
@@ -932,7 +1059,15 @@ fn build_index_doc(
     bucket: &str,
     ocr_hits: &mut usize,
     ocr_queued: &mut usize,
+    // Where the PDFs this document *links to* are collected, or `None` when
+    // nothing wants them. `None` is the off switch: link discovery is a second
+    // scan of every HTML body, and an index run that exports no list should not
+    // pay for one.
+    pdf_links: Option<&mut Vec<String>>,
 ) -> Option<IndexDoc> {
+    // Rebinding so the two PDF paths below can hand the same collector to the
+    // link scanner without moving out of the parameter.
+    let mut pdf_links = pdf_links;
     // Revisit records have no payload of their own — the content is already
     // indexed via the record they refer to, so they get a CDX entry (capture
     // history) but no duplicate fulltext doc.
@@ -952,7 +1087,7 @@ fn build_index_doc(
         || mime.starts_with("text/xml")   // some sites serve HTML as text/xml
         || mime.starts_with("application/xml");
     let is_text = mime.starts_with("text/plain");
-    let is_pdf  = mime.starts_with("application/pdf");
+    let is_pdf = mime.starts_with("application/pdf");
     if !is_html && !is_text && !is_pdf {
         return None;
     }
@@ -973,6 +1108,20 @@ fn build_index_doc(
             match cache.get(digest) {
                 Some((title, body)) => {
                     *ocr_hits += 1;
+                    // A PDF links out of itself too — a volume's bibliography,
+                    // "download the next chapter", the source of a table. Those
+                    // links exist only in Tika's XHTML, which the flattened text
+                    // in the cache has no markup left to hold, so this reads the
+                    // retained copy (`ocr_cache.keep_xhtml`): no fetch, no
+                    // extraction, one local read. It runs *before* the two
+                    // returns below, because a scan whose text is OCR noise still
+                    // points at other documents, and an empty text entry is not
+                    // an empty document.
+                    if let Some(links) = pdf_links.as_mut() {
+                        if let Some(xhtml) = cache.get_xhtml(digest) {
+                            extract_pdf_links(&xhtml, &cdx.original_url, links);
+                        }
+                    }
                     if body.trim().is_empty() {
                         // A negative entry: extraction has been tried, and the
                         // file gave no text (too large, truncated, empty).
@@ -988,14 +1137,14 @@ fn build_index_doc(
                     }
                     let body_text = truncate_on_char_boundary(body, max_bytes);
                     return Some(IndexDoc {
-                        url:       cdx.original_url.clone(),
+                        url: cdx.original_url.clone(),
                         timestamp: ts,
                         title,
-                        body:      body_text,
-                        mime:      cdx.mime.clone(),
-                        s3_key:    cdx.s3_key.clone(),
-                        offset:    cdx.offset,
-                        length:    cdx.length,
+                        body: body_text,
+                        mime: cdx.mime.clone(),
+                        s3_key: cdx.s3_key.clone(),
+                        offset: cdx.offset,
+                        length: cdx.length,
                         collection: cdx.collection.clone(),
                     });
                 }
@@ -1008,14 +1157,14 @@ fn build_index_doc(
                     // which is why the whole branch runs without a Tika
                     // backend if only the worker has one.
                     let job = crate::ocr_cache::OcrJob {
-                        digest:     digest.to_owned(),
-                        bucket:     bucket.to_owned(),
-                        s3_key:     cdx.s3_key.clone(),
-                        offset:     cdx.offset,
-                        c_offset:   cdx.c_offset,
-                        length:     cdx.length,
-                        url:        cdx.original_url.clone(),
-                        attempts:   0,
+                        digest: digest.to_owned(),
+                        bucket: bucket.to_owned(),
+                        s3_key: cdx.s3_key.clone(),
+                        offset: cdx.offset,
+                        c_offset: cdx.c_offset,
+                        length: cdx.length,
+                        url: cdx.original_url.clone(),
+                        attempts: 0,
                     };
                     if let Err(e) = cache.enqueue(&job) {
                         warn!(url = %cdx.original_url, err = %e,
@@ -1039,17 +1188,32 @@ fn build_index_doc(
                 return None;
             }
         };
-        let doc = extractor.extract(&cdx.original_url, &payload)?;
+        let doc = extractor.extract(
+            &cdx.original_url,
+            &payload,
+            crate::pdf::ExtractOpts {
+                allow_truncated: false,
+                // Only when somebody wants the links: the markup of an OCR'd
+                // volume is tens of megabytes, and this path throws it away
+                // after reading the hrefs out of it.
+                keep_xhtml: pdf_links.is_some(),
+            },
+        )?;
+        // Same discovery as the cache path above, from the XHTML this extraction
+        // just produced rather than from a retained copy.
+        if let (Some(links), Some(xhtml)) = (pdf_links.as_mut(), doc.xhtml.as_deref()) {
+            extract_pdf_links(xhtml, &cdx.original_url, links);
+        }
         let body_text = truncate_on_char_boundary(doc.body, max_bytes);
         return Some(IndexDoc {
-            url:       cdx.original_url.clone(),
+            url: cdx.original_url.clone(),
             timestamp: ts,
-            title:     doc.title,
-            body:      body_text,
-            mime:      cdx.mime.clone(),
-            s3_key:    cdx.s3_key.clone(),
-            offset:    cdx.offset,
-            length:    cdx.length,
+            title: doc.title,
+            body: body_text,
+            mime: cdx.mime.clone(),
+            s3_key: cdx.s3_key.clone(),
+            offset: cdx.offset,
+            length: cdx.length,
             collection: cdx.collection.clone(),
         });
     }
@@ -1069,31 +1233,48 @@ fn build_index_doc(
         }
     };
 
-    let truncated = if payload.len() > max_bytes * 4 { &payload[..max_bytes * 4] } else { &payload };
+    let truncated = if payload.len() > max_bytes * 4 {
+        &payload[..max_bytes * 4]
+    } else {
+        &payload
+    };
     let text = String::from_utf8_lossy(truncated);
 
     let (title, body_text) = if is_html {
+        // The decoded HTML is in hand and about to be thrown away — the index
+        // stores text, not markup. This is the only moment a link out of this
+        // page can be seen without fetching the record again, which is why
+        // discovery belongs here rather than in a later pass.
+        if let Some(links) = pdf_links {
+            extract_pdf_links(&text, &cdx.original_url, links);
+        }
         let t = extract_title(&text);
         let b = strip_html(&text);
         (t, b)
     } else {
         // text/plain: use first line as title, rest as body
         let mut lines = text.splitn(2, '\n');
-        let first = lines.next().unwrap_or("").trim().chars().take(256).collect();
-        let rest  = lines.next().unwrap_or("").to_owned();
+        let first = lines
+            .next()
+            .unwrap_or("")
+            .trim()
+            .chars()
+            .take(256)
+            .collect();
+        let rest = lines.next().unwrap_or("").to_owned();
         (first, rest)
     };
     let body_text = truncate_on_char_boundary(body_text, max_bytes);
 
     Some(IndexDoc {
-        url:       cdx.original_url.clone(),
+        url: cdx.original_url.clone(),
         timestamp: ts,
         title,
-        body:      body_text,
-        mime:      cdx.mime.clone(),
-        s3_key:    cdx.s3_key.clone(),
-        offset:    cdx.offset,
-        length:    cdx.length,
+        body: body_text,
+        mime: cdx.mime.clone(),
+        s3_key: cdx.s3_key.clone(),
+        offset: cdx.offset,
+        length: cdx.length,
         collection: cdx.collection.clone(),
     })
 }
@@ -1101,12 +1282,21 @@ fn build_index_doc(
 /// The document title from `<title>…</title>`, entity-decoded and collapsed.
 pub(crate) fn extract_title(html: &str) -> String {
     let lower = html.as_bytes();
-    let Some(open_tag_start) = memmem(lower, b"<title") else { return String::new(); };
-    let Some(rel_gt) = lower[open_tag_start..].iter().position(|&b| b == b'>') else { return String::new(); };
+    let Some(open_tag_start) = memmem(lower, b"<title") else {
+        return String::new();
+    };
+    let Some(rel_gt) = lower[open_tag_start..].iter().position(|&b| b == b'>') else {
+        return String::new();
+    };
     let content_start = open_tag_start + rel_gt + 1;
-    let Some(close_start) = memmem(&lower[content_start..], b"</title") else { return String::new(); };
+    let Some(close_start) = memmem(&lower[content_start..], b"</title") else {
+        return String::new();
+    };
     let raw = &html[content_start..content_start + close_start];
-    collapse_ws(&decode_entities(raw)).chars().take(512).collect()
+    collapse_ws(&decode_entities(raw))
+        .chars()
+        .take(512)
+        .collect()
 }
 
 /// Elements whose content is code, not prose — dropped wholesale.
@@ -1137,7 +1327,7 @@ pub(crate) fn strip_html(html: &str) -> String {
             // Skip past the whole element, content and closing tag included.
             match find_at(b, lt + 1, format!("</{elem}").as_bytes()) {
                 Some(close) => find_at(b, close, b">").map(|p| p + 1).unwrap_or(b.len()),
-                None        => b.len(),
+                None => b.len(),
             }
         } else {
             find_at(b, lt + 1, b">").map(|p| p + 1).unwrap_or(b.len())
@@ -1149,6 +1339,157 @@ pub(crate) fn strip_html(html: &str) -> String {
     out.push_str(&html[text_start..]);
 
     collapse_ws(&decode_entities(&out))
+}
+
+// ── PDF link discovery ─────────────────────────────────────────────────────────
+
+/// The absolute `http(s)` URLs of the PDFs `html` links to, resolved against
+/// `base` — the URL of the record being parsed — and appended to `out`.
+///
+/// This is what makes an index run a source of PDFs the crawler never fetched:
+/// a page linking to a document is evidence the document exists, whether or not
+/// the crawl got it. The list is handed to an external archiver, so the bar is
+/// "would a person call this a link to a PDF".
+///
+/// A scanner, not a DOM parser, for the same reason [`strip_html`] is one: it
+/// runs over every HTML record of a multi-GB archive and must not allocate a
+/// tree per document.
+///
+/// * Only `href` attributes inside a tag count. An occurrence in prose is not a
+///   link, and comment, `<script>` and `<style>` bodies are skipped exactly as
+///   [`strip_html`] skips them — a URL inside a JS string literal is source
+///   code, not a link the page offered.
+/// * `href` must begin at an attribute boundary, so `data-href` does not match.
+/// * The value is entity-decoded before use: `?a=1&amp;b=2` is how a query
+///   string arrives in HTML, and a literal `&amp;` would corrupt the URL.
+/// * Relative hrefs are resolved by the `url` crate, not by string surgery —
+///   `../x.pdf`, `/x.pdf` and `//host/x.pdf` each mean something different, and
+///   dot segments are where a hand-rolled join quietly goes wrong.
+/// * The PDF test is the path's extension, because that is the only signal a
+///   link carries without fetching it: `/bericht.pdf?v=2#page=3` counts,
+///   `/download?id=7` does not and cannot be recognised here.
+/// * Fragments are dropped from what is exported: `#page=3` is a view of the
+///   same document, and keeping it would hand the archiver near-duplicates.
+///
+/// A `base` that is not an absolute http(s) URL yields nothing, so the `dns:`
+/// and `urn:` records that reach this function contribute no links.
+pub(crate) fn extract_pdf_links(html: &str, base: &str, out: &mut Vec<String>) {
+    let Ok(base) = url::Url::parse(base) else {
+        return;
+    };
+    if !matches!(base.scheme(), "http" | "https") {
+        return;
+    }
+
+    let b = html.as_bytes();
+    let mut i = 0usize;
+    while let Some(lt) = find_at(b, i, b"<") {
+        // Comments and raw-text elements hold no markup. Skipping them whole —
+        // the same two rules strip_html uses — keeps their text from being read
+        // as tags.
+        if b[lt..].starts_with(b"<!--") {
+            i = find_at(b, lt + 4, b"-->").map(|p| p + 3).unwrap_or(b.len());
+            continue;
+        }
+        if let Some(elem) = raw_text_element(&html[lt..]) {
+            i = match find_at(b, lt + 1, format!("</{elem}").as_bytes()) {
+                Some(close) => find_at(b, close, b">").map(|p| p + 1).unwrap_or(b.len()),
+                None => b.len(),
+            };
+            continue;
+        }
+        let Some(gt) = find_at(b, lt + 1, b">") else {
+            break;
+        };
+        collect_href_links(&html[lt..=gt], &base, out);
+        i = gt + 1;
+    }
+}
+
+/// The `href` values of one tag (`<…>`), each resolved and filtered into `out`.
+fn collect_href_links(tag: &str, base: &url::Url, out: &mut Vec<String>) {
+    let b = tag.as_bytes();
+    // Past the `<`, so `p - 1` below is always in range.
+    let mut i = 1usize;
+    while let Some(p) = find_at(b, i, b"href") {
+        // An attribute name starts at a boundary. Without this, `data-href`
+        // would be read as `href`.
+        if !b[p - 1].is_ascii_whitespace() {
+            i = p + 4;
+            continue;
+        }
+        // `href` WS* `=` WS* value
+        let mut j = p + 4;
+        while j < b.len() && b[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        if b.get(j) != Some(&b'=') {
+            i = p + 4;
+            continue;
+        }
+        j += 1;
+        while j < b.len() && b[j].is_ascii_whitespace() {
+            j += 1;
+        }
+
+        let (value, next) = match b.get(j) {
+            // Quoted: everything up to the matching quote. An unterminated
+            // value runs to the end of the tag, which is all there is.
+            Some(&q) if q == b'"' || q == b'\'' => {
+                let quote = [q];
+                match find_at(b, j + 1, &quote) {
+                    Some(end) => (&tag[j + 1..end], end + 1),
+                    None => (&tag[j + 1..], b.len()),
+                }
+            }
+            // Unquoted: up to whitespace or the tag's end.
+            Some(_) => {
+                let end = (j..b.len())
+                    .find(|&k| b[k].is_ascii_whitespace() || b[k] == b'>')
+                    .unwrap_or(b.len());
+                (&tag[j..end], end)
+            }
+            None => break,
+        };
+        i = next;
+        push_pdf_link(value, base, out);
+    }
+}
+
+/// Resolve one `href` value against `base` and keep it if it points at a PDF.
+fn push_pdf_link(raw: &str, base: &url::Url, out: &mut Vec<String>) {
+    let raw = decode_entities(raw);
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return;
+    }
+    let mut resolved = match url::Url::parse(raw) {
+        Ok(abs) => abs,
+        // The common case: a relative href. Everything else unparseable
+        // (`javascript:`, a stray control character) is not a URL to hand on.
+        Err(url::ParseError::RelativeUrlWithoutBase) => match base.join(raw) {
+            Ok(joined) => joined,
+            Err(_) => return,
+        },
+        Err(_) => return,
+    };
+    // `mailto:` and `javascript:` parse fine and are not fetchable documents.
+    if !matches!(resolved.scheme(), "http" | "https") {
+        return;
+    }
+    if !path_is_pdf(resolved.path()) {
+        return;
+    }
+    resolved.set_fragment(None);
+    out.push(resolved.to_string());
+}
+
+/// True when the last path segment ends in `.pdf`, compared on bytes: a
+/// mis-decoded URL is full of U+FFFD, and slicing a `&str` at `len() - 4` could
+/// land inside one of those three-byte characters.
+fn path_is_pdf(path: &str) -> bool {
+    let last = path.rsplit('/').next().unwrap_or("").as_bytes();
+    last.len() >= 4 && last[last.len() - 4..].eq_ignore_ascii_case(b".pdf")
 }
 
 /// If the tag at the start of `s` opens a [raw-text element], its lowercase
@@ -1184,8 +1525,14 @@ fn decode_entities(s: &str) -> String {
         // A reference is short; scanning further means it was never one.
         let end = tail[1..].find(';').map(|p| p + 2).filter(|&e| e <= 12);
         match end.and_then(|e| decode_one_entity(&tail[1..e - 1]).map(|c| (c, e))) {
-            Some((c, e)) => { out.push(c); rest = &tail[e..]; }
-            None         => { out.push('&'); rest = &tail[1..]; }
+            Some((c, e)) => {
+                out.push(c);
+                rest = &tail[e..];
+            }
+            None => {
+                out.push('&');
+                rest = &tail[1..];
+            }
         }
     }
     out.push_str(rest);
@@ -1195,18 +1542,18 @@ fn decode_entities(s: &str) -> String {
 /// Decode the body of one character reference (`amp`, `#233`, `#xE9`).
 fn decode_one_entity(body: &str) -> Option<char> {
     match body {
-        "amp"                  => return Some('&'),
-        "lt"                   => return Some('<'),
-        "gt"                   => return Some('>'),
-        "quot"                 => return Some('"'),
-        "apos" | "#39"         => return Some('\''),
-        "nbsp"                 => return Some('\u{a0}'),
+        "amp" => return Some('&'),
+        "lt" => return Some('<'),
+        "gt" => return Some('>'),
+        "quot" => return Some('"'),
+        "apos" | "#39" => return Some('\''),
+        "nbsp" => return Some('\u{a0}'),
         _ => {}
     }
     let num = body.strip_prefix('#')?;
     let code = match num.strip_prefix(['x', 'X']) {
         Some(hex) => u32::from_str_radix(hex, 16).ok()?,
-        None      => num.parse::<u32>().ok()?,
+        None => num.parse::<u32>().ok()?,
     };
     char::from_u32(code)
 }
@@ -1217,7 +1564,9 @@ fn collapse_ws(s: &str) -> String {
     let mut prev_space = true;
     for ch in s.chars() {
         if ch.is_whitespace() {
-            if !prev_space { out.push(' '); }
+            if !prev_space {
+                out.push(' ');
+            }
             prev_space = true;
         } else {
             out.push(ch);
@@ -1229,15 +1578,21 @@ fn collapse_ws(s: &str) -> String {
 }
 
 fn memmem(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() { return Some(0); }
+    if needle.is_empty() {
+        return Some(0);
+    }
     haystack.windows(needle.len()).position(|w| {
-        w.iter().zip(needle).all(|(&h, &n)| h.to_ascii_lowercase() == n)
+        w.iter()
+            .zip(needle)
+            .all(|(&h, &n)| h.to_ascii_lowercase() == n)
     })
 }
 
 /// `memmem` from byte offset `start`, returning an absolute position.
 fn find_at(haystack: &[u8], start: usize, needle: &[u8]) -> Option<usize> {
-    if start >= haystack.len() { return None; }
+    if start >= haystack.len() {
+        return None;
+    }
     memmem(&haystack[start..], needle).map(|p| p + start)
 }
 
@@ -1257,8 +1612,11 @@ fn install_status_handler(progress: Arc<SharedProgress>) {
 
         tokio::spawn(async move {
             let mut stream = match signal(kind) {
-                Ok(s)  => s,
-                Err(e) => { warn!(err = %e, "could not install status signal handler"); return; }
+                Ok(s) => s,
+                Err(e) => {
+                    warn!(err = %e, "could not install status signal handler");
+                    return;
+                }
             };
             loop {
                 stream.recv().await;
@@ -1284,22 +1642,29 @@ fn utc_now_iso() -> String {
 }
 
 fn epoch_to_ymd_hms(mut s: u64) -> (u32, u32, u32, u32, u32, u32) {
-    let sec  = (s % 60) as u32; s /= 60;
-    let min  = (s % 60) as u32; s /= 60;
-    let hour = (s % 24) as u32; s /= 24;
+    let sec = (s % 60) as u32;
+    s /= 60;
+    let min = (s % 60) as u32;
+    s /= 60;
+    let hour = (s % 24) as u32;
+    s /= 24;
     // Days since 1970-01-01
     let mut days = s as u32;
     let mut year = 1970u32;
     loop {
         let dy = days_in_year(year);
-        if days < dy { break; }
+        if days < dy {
+            break;
+        }
         days -= dy;
         year += 1;
     }
     let mut month = 1u32;
     loop {
         let dm = days_in_month(year, month);
-        if days < dm { break; }
+        if days < dm {
+            break;
+        }
         days -= dm;
         month += 1;
     }
@@ -1307,14 +1672,24 @@ fn epoch_to_ymd_hms(mut s: u64) -> (u32, u32, u32, u32, u32, u32) {
 }
 
 fn days_in_year(y: u32) -> u32 {
-    if y % 400 == 0 || (y % 4 == 0 && y % 100 != 0) { 366 } else { 365 }
+    if y % 400 == 0 || (y % 4 == 0 && y % 100 != 0) {
+        366
+    } else {
+        365
+    }
 }
 
 fn days_in_month(y: u32, m: u32) -> u32 {
     match m {
-        1|3|5|7|8|10|12 => 31,
-        4|6|9|11        => 30,
-        2 => if days_in_year(y) == 366 { 29 } else { 28 },
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            if days_in_year(y) == 366 {
+                29
+            } else {
+                28
+            }
+        }
         _ => 30,
     }
 }
@@ -1338,8 +1713,8 @@ fn days_in_month(y: u32, m: u32) -> u32 {
 ///
 /// Errors are logged as warnings; they never abort the indexing run.
 async fn write_cdx_sidecar(
-    s3:      &aws_sdk_s3::Client,
-    bucket:  &str,
+    s3: &aws_sdk_s3::Client,
+    bucket: &str,
     warc_key: &str,
     records: &[CdxRecord],
 ) {
@@ -1364,15 +1739,18 @@ async fn write_cdx_sidecar(
     }
 
     let basename = warc_key.rsplit('/').next().unwrap_or(warc_key);
-    let is_gz    = warc_key.to_ascii_lowercase().ends_with(".gz");
+    let is_gz = warc_key.to_ascii_lowercase().ends_with(".gz");
 
     // Build CDX-11 content.
     let mut body = String::with_capacity(records.len() * 200);
     body.push_str(" CDX N b a m s k r M S V g\n");
 
     for r in records {
-        let mime   = r.mime.as_deref().unwrap_or("-");
-        let status = r.status.map(|s| s.to_string()).unwrap_or_else(|| "-".to_owned());
+        let mime = r.mime.as_deref().unwrap_or("-");
+        let status = r
+            .status
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "-".to_owned());
         let digest = r.digest.as_deref().unwrap_or("-");
         let length = r.length;
         let offset = if is_gz {
@@ -1421,13 +1799,16 @@ async fn write_cdx_sidecar(
 // ── Async → sync I/O bridge ───────────────────────────────────────────────────
 
 struct ChannelReader {
-    rx:  Receiver<Bytes>,
+    rx: Receiver<Bytes>,
     buf: Bytes,
 }
 
 impl ChannelReader {
     fn new(rx: Receiver<Bytes>) -> Self {
-        Self { rx, buf: Bytes::new() }
+        Self {
+            rx,
+            buf: Bytes::new(),
+        }
     }
 }
 
@@ -1436,7 +1817,7 @@ impl Read for ChannelReader {
         while self.buf.is_empty() {
             match self.rx.recv() {
                 Ok(chunk) => self.buf = chunk,
-                Err(_)    => return Ok(0),
+                Err(_) => return Ok(0),
             }
         }
         let n = out.len().min(self.buf.len());
@@ -1449,7 +1830,7 @@ impl Read for ChannelReader {
 /// Wraps any `Read` and counts bytes through an atomic so the async
 /// SIGINFO handler can read the running total without locking.
 struct CountingReader<R: Read> {
-    inner:    R,
+    inner: R,
     progress: Arc<SharedProgress>,
 }
 
@@ -1463,7 +1844,9 @@ impl<R: Read> Read for CountingReader<R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         let n = self.inner.read(buf)?;
         if n > 0 {
-            self.progress.bytes_read.fetch_add(n as u64, Ordering::Relaxed);
+            self.progress
+                .bytes_read
+                .fetch_add(n as u64, Ordering::Relaxed);
         }
         Ok(n)
     }
@@ -1490,8 +1873,9 @@ mod tests {
         assert!(!is_bookkeeping_url("urn:nbn:de:bvb:12-bsb10229044-8"));
     }
 
-    use super::{build_index_doc, decode_entities, extract_title, strip_html,
-                truncate_on_char_boundary};
+    use super::{
+        build_index_doc, decode_entities, extract_title, strip_html, truncate_on_char_boundary,
+    };
     use std::io::Write as _;
 
     /// A `response` record holding `block`, parsed back the way ingest sees it.
@@ -1506,7 +1890,10 @@ mod tests {
             ],
             block,
         );
-        warc::WarcReader::new(raw.as_slice()).next_record().unwrap().unwrap()
+        warc::WarcReader::new(raw.as_slice())
+            .next_record()
+            .unwrap()
+            .unwrap()
     }
 
     /// The wire format that made it into the archive: chunk framing wrapped
@@ -1520,7 +1907,8 @@ mod tests {
         let gz = gz.finish().unwrap();
 
         let mut block = b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\
-                          Content-Encoding: gzip\r\n\r\n".to_vec();
+                          Content-Encoding: gzip\r\n\r\n"
+            .to_vec();
         block.extend_from_slice(format!("{:x}\r\n", gz.len()).as_bytes());
         block.extend_from_slice(&gz);
         block.extend_from_slice(b"\r\n0\r\n\r\n");
@@ -1530,7 +1918,7 @@ mod tests {
             .unwrap()
             .expect("a response record yields a CDX entry");
 
-        let doc = build_index_doc(&record, &cdx, 524288, None, None, "", &mut 0, &mut 0)
+        let doc = build_index_doc(&record, &cdx, 524288, None, None, "", &mut 0, &mut 0, None)
             .expect("an HTML capture is indexable");
 
         // Before the fix this was a string of U+FFFD from the deflate bytes.
@@ -1546,9 +1934,12 @@ mod tests {
         let block = b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n\
                       <html><head><title>Boskoop</title></head><body>Apfel</body></html>";
         let record = response_record("https://example.com/plain", block);
-        let cdx = warc_search_cdx::from_warc_record(&record, "crawl.warc.gz").unwrap().unwrap();
+        let cdx = warc_search_cdx::from_warc_record(&record, "crawl.warc.gz")
+            .unwrap()
+            .unwrap();
 
-        let doc = build_index_doc(&record, &cdx, 524288, None, None, "", &mut 0, &mut 0).unwrap();
+        let doc =
+            build_index_doc(&record, &cdx, 524288, None, None, "", &mut 0, &mut 0, None).unwrap();
         assert_eq!(doc.title, "Boskoop");
         assert_eq!(doc.body, "Boskoop Apfel");
     }
@@ -1605,7 +1996,10 @@ mod tests {
     #[test]
     fn decode_entities_leaves_bare_ampersands_alone() {
         assert_eq!(decode_entities("Tom & Jerry"), "Tom & Jerry");
-        assert_eq!(decode_entities("a&nolongerareference;b"), "a&nolongerareference;b");
+        assert_eq!(
+            decode_entities("a&nolongerareference;b"),
+            "a&nolongerareference;b"
+        );
         assert_eq!(decode_entities("&lt;b&gt;"), "<b>");
     }
 
@@ -1632,7 +2026,7 @@ mod tests {
         // The real crash: U+FFFD (3 bytes) straddling a 524288-style cap.
         let mut s = "x".repeat(10);
         s.push('\u{FFFD}'); // 3 bytes, bytes 10..13
-        // cap 11 and 12 land inside the replacement char -> back up to 10.
+                            // cap 11 and 12 land inside the replacement char -> back up to 10.
         assert_eq!(truncate_on_char_boundary(s.clone(), 11).len(), 10);
         assert_eq!(truncate_on_char_boundary(s.clone(), 12).len(), 10);
         assert_eq!(truncate_on_char_boundary(s, 13).len(), 13); // whole thing fits
@@ -1646,7 +2040,9 @@ mod tests {
     /// everything the cache paths look at. The payload itself is never decoded
     /// on those paths, so its bytes are arbitrary here.
     fn pdf_record(url: &str, digest: &str) -> (warc::WarcRecord, warc_search_cdx::CdxRecord) {
-        let block = b"HTTP/1.1 200 OK\r\nContent-Type: application/pdf\r\n\r\n%PDF-1.4 notarealfile".to_vec();
+        let block =
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/pdf\r\n\r\n%PDF-1.4 notarealfile"
+                .to_vec();
         let raw = warc::reader::build_warc_record(
             "WARC/1.0",
             &[
@@ -1658,7 +2054,10 @@ mod tests {
             ],
             &block,
         );
-        let record = warc::WarcReader::new(raw.as_slice()).next_record().unwrap().unwrap();
+        let record = warc::WarcReader::new(raw.as_slice())
+            .next_record()
+            .unwrap()
+            .unwrap();
         let mut cdx = warc_search_cdx::from_warc_record(&record, "crawls/x.warc.gz")
             .unwrap()
             .unwrap();
@@ -1676,18 +2075,40 @@ mod tests {
 
         let (record, cdx) = pdf_record("https://example.com/gartenwelt16.pdf", "sha1:GARTEN");
         // Sanity-check what the record's digest and mime look like.
-        assert_eq!(cdx.digest.as_deref(), Some("sha1:GARTEN"),
-            "the CDX carries the digest from WARC-Block-Digest");
-        assert_eq!(cdx.mime.as_deref(), Some("application/pdf"),
-            "the CDX carries the HTTP Content-Type");
+        assert_eq!(
+            cdx.digest.as_deref(),
+            Some("sha1:GARTEN"),
+            "the CDX carries the digest from WARC-Block-Digest"
+        );
+        assert_eq!(
+            cdx.mime.as_deref(),
+            Some("application/pdf"),
+            "the CDX carries the HTTP Content-Type"
+        );
         // Verify the cache is readable.
-        assert_eq!(cache.get("sha1:GARTEN").as_ref().map(|(t, _)| t.as_str()), Some("Die Gartenwelt 16"),
-            "the cache entry is readable before the index call");
+        assert_eq!(
+            cache.get("sha1:GARTEN").as_ref().map(|(t, _)| t.as_str()),
+            Some("Die Gartenwelt 16"),
+            "the cache entry is readable before the index call"
+        );
         let (mut hits, mut queued) = (0, 0);
-        let doc = build_index_doc(&record, &cdx, 524288, None, Some(&cache), "warc", &mut hits, &mut queued)
-            .expect("the cached text indexes the document");
+        let doc = build_index_doc(
+            &record,
+            &cdx,
+            524288,
+            None,
+            Some(&cache),
+            "warc",
+            &mut hits,
+            &mut queued,
+            None,
+        )
+        .expect("the cached text indexes the document");
         assert_eq!(doc.title, "Die Gartenwelt 16");
-        assert!(doc.body.contains("Berlepsch"), "the cached text is indexable");
+        assert!(
+            doc.body.contains("Berlepsch"),
+            "the cached text is indexable"
+        );
         assert_eq!(doc.s3_key, "crawls/x.warc.gz");
         assert_eq!(doc.offset, cdx.offset);
         assert_eq!((hits, queued), (1, 0));
@@ -1703,7 +2124,18 @@ mod tests {
         let (record, cdx) = pdf_record("https://example.com/monatshefte-band30.pdf", "sha1:BAND30");
         let (mut hits, mut queued) = (0, 0);
         assert!(
-            build_index_doc(&record, &cdx, 524288, None, Some(&cache), "warc", &mut hits, &mut queued).is_none(),
+            build_index_doc(
+                &record,
+                &cdx,
+                524288,
+                None,
+                Some(&cache),
+                "warc",
+                &mut hits,
+                &mut queued,
+                None
+            )
+            .is_none(),
             "no fulltext this run — the CDX entry is written by the caller regardless",
         );
         assert_eq!((hits, queued), (0, 1));
@@ -1724,7 +2156,18 @@ mod tests {
         // dedupes, in the queue exactly as it will in the cache.
         let (record2, cdx2) = pdf_record("https://mirror.example/band30.pdf", "sha1:BAND30");
         assert!(
-            build_index_doc(&record2, &cdx2, 524288, None, Some(&cache), "warc", &mut hits, &mut queued).is_none(),
+            build_index_doc(
+                &record2,
+                &cdx2,
+                524288,
+                None,
+                Some(&cache),
+                "warc",
+                &mut hits,
+                &mut queued,
+                None
+            )
+            .is_none(),
             "the second crawl also misses the cache — no fulltext either",
         );
         assert_eq!(cache.queued_jobs().len(), 1);
@@ -1736,7 +2179,13 @@ mod tests {
         let cache = OcrCache::open(dir.path()).unwrap();
         // OCR noise the worker stored anyway — the gate is deterministic, so
         // re-queueing would bill the same answer every run.
-        cache.put("sha1:SALAT", "t", r"l1 ﬁ 3 rn |\| . ,, '' ° ~ \ / ] [ ; : rn1 l|l ¢").unwrap();
+        cache
+            .put(
+                "sha1:SALAT",
+                "t",
+                r"l1 ﬁ 3 rn |\| . ,, '' ° ~ \ / ] [ ; : rn1 l|l ¢",
+            )
+            .unwrap();
         // A negative entry: the file has no text to give.
         cache.put("sha1:LEER", "", "").unwrap();
 
@@ -1744,11 +2193,25 @@ mod tests {
         for digest in ["sha1:SALAT", "sha1:LEER"] {
             let (record, cdx) = pdf_record("https://example.com/x.pdf", digest);
             assert!(
-                build_index_doc(&record, &cdx, 524288, None, Some(&cache), "warc", &mut hits, &mut queued).is_none(),
+                build_index_doc(
+                    &record,
+                    &cdx,
+                    524288,
+                    None,
+                    Some(&cache),
+                    "warc",
+                    &mut hits,
+                    &mut queued,
+                    None
+                )
+                .is_none(),
                 "{digest} yields no fulltext — and no job either",
             );
         }
-        assert_eq!(queued, 0, "a cached answer, even a negative one, is not re-queued");
+        assert_eq!(
+            queued, 0,
+            "a cached answer, even a negative one, is not re-queued"
+        );
         assert_eq!(hits, 2);
         assert!(cache.queued_jobs().is_empty());
     }
@@ -1758,7 +2221,347 @@ mod tests {
         // No cache configured, no extractor: PDFs stay unsearchable, exactly
         // as before the cache existed.
         let (record, cdx) = pdf_record("https://example.com/alt.pdf", "sha1:ALT");
-        assert!(build_index_doc(&record, &cdx, 524288, None, None, "warc", &mut 0, &mut 0).is_none());
+        assert!(
+            build_index_doc(&record, &cdx, 524288, None, None, "warc", &mut 0, &mut 0, None)
+                .is_none()
+        );
+    }
+
+    // ── The links inside a PDF, from the retained markup ─────────────────
+    //
+    // The cached text is flattened and has no markup left in it, so a volume's
+    // own links — its bibliography, "download the next chapter" — are only
+    // recoverable from the XHTML the cache retained. Which is the difference
+    // between reading them off disk and paying for another OCR run.
+
+    /// Text long enough to pass the quality gate.
+    const GATE_PASSING_TEXT: &str =
+        "Seite eins\u{000c}Seite zwei\u{000c}Seite drei\u{000c}Seite vier\u{000c}Der Rote Berlepsch\u{000c}Boskoop";
+
+    #[test]
+    fn a_cached_pdf_contributes_its_own_links() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = OcrCache::open(dir.path()).unwrap();
+        cache
+            .put("sha1:BAND30", "Band 30", GATE_PASSING_TEXT)
+            .unwrap();
+        cache
+            .put_xhtml(
+                "sha1:BAND30",
+                "<html><body><a href=\"band31.pdf\">nächster Band</a></body></html>",
+            )
+            .unwrap();
+
+        let (record, cdx) = pdf_record("https://example.com/band30.pdf", "sha1:BAND30");
+        let (mut hits, mut queued) = (0, 0);
+        let mut links = Vec::new();
+        let doc = build_index_doc(
+            &record,
+            &cdx,
+            524288,
+            None,
+            Some(&cache),
+            "warc",
+            &mut hits,
+            &mut queued,
+            Some(&mut links),
+        )
+        .expect("the cached text indexes the document");
+
+        assert_eq!(doc.title, "Band 30");
+        assert_eq!(
+            links,
+            ["https://example.com/band31.pdf"],
+            "resolved against the PDF's own URL, not left relative",
+        );
+        assert_eq!((hits, queued), (1, 0), "and still no extraction");
+    }
+
+    #[test]
+    fn a_rejected_or_empty_text_still_contributes_its_links() {
+        // Both returns below are about the *text*: the quality gate judges OCR
+        // noise, and a negative entry says the file gave no text. Neither says
+        // the document links to nothing — so discovery happens before them, and
+        // these tests are what keeps that ordering.
+        let dir = tempfile::tempdir().unwrap();
+        let cache = OcrCache::open(dir.path()).unwrap();
+        cache
+            .put(
+                "sha1:SALAT",
+                "t",
+                r"l1 ﬁ 3 rn |\| . ,, '' ° ~ \ / ] [ ; : rn1 l|l ¢",
+            )
+            .unwrap();
+        cache
+            .put_xhtml("sha1:SALAT", "<a href=\"/quelle.pdf\">Quelle</a>")
+            .unwrap();
+        cache.put("sha1:LEER", "", "").unwrap();
+        cache
+            .put_xhtml("sha1:LEER", "<a href=\"/anhang.pdf\">Anhang</a>")
+            .unwrap();
+
+        for (digest, url, expected) in [
+            (
+                "sha1:SALAT",
+                "https://example.com/scan.pdf",
+                "https://example.com/quelle.pdf",
+            ),
+            (
+                "sha1:LEER",
+                "https://example.com/leer.pdf",
+                "https://example.com/anhang.pdf",
+            ),
+        ] {
+            let (record, cdx) = pdf_record(url, digest);
+            let mut links = Vec::new();
+            let doc = build_index_doc(
+                &record,
+                &cdx,
+                524288,
+                None,
+                Some(&cache),
+                "warc",
+                &mut 0,
+                &mut 0,
+                Some(&mut links),
+            );
+            assert!(doc.is_none(), "{digest} yields no fulltext");
+            assert_eq!(links, [expected], "{digest} still yields its links");
+        }
+    }
+
+    #[test]
+    fn an_entry_cached_before_retention_contributes_no_links() {
+        // The graceful case: text hit, no markup, so nothing to find. It must
+        // not turn into a miss — that would re-queue a document the cache
+        // already has, which is the whole cost this design avoids.
+        let dir = tempfile::tempdir().unwrap();
+        let cache = OcrCache::open(dir.path()).unwrap();
+        cache
+            .put("sha1:OHNE", "Band 12", GATE_PASSING_TEXT)
+            .unwrap();
+
+        let (record, cdx) = pdf_record("https://example.com/band12.pdf", "sha1:OHNE");
+        let (mut hits, mut queued) = (0, 0);
+        let mut links = Vec::new();
+        let doc = build_index_doc(
+            &record,
+            &cdx,
+            524288,
+            None,
+            Some(&cache),
+            "warc",
+            &mut hits,
+            &mut queued,
+            Some(&mut links),
+        );
+        assert!(doc.is_some(), "still indexed from the cached text");
+        assert!(links.is_empty(), "but no markup, so no links");
+        assert_eq!((hits, queued), (1, 0), "and no job queued");
+    }
+
+    // ── PDF link discovery ───────────────────────────────────────────────
+
+    use super::{extract_pdf_links, path_is_pdf};
+
+    /// The links found in `html`, relative to a page at `base`.
+    fn links(html: &str, base: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        extract_pdf_links(html, base, &mut out);
+        out
+    }
+
+    #[test]
+    fn absolute_and_relative_hrefs_both_resolve() {
+        let found = links(
+            r#"<a href="https://other.example/a.pdf">A</a>
+               <a href="/berichte/b.pdf">B</a>
+               <a href="c.pdf">C</a>
+               <a href="../d.pdf">D</a>"#,
+            "https://example.com/obst/seite.html",
+        );
+        assert_eq!(
+            found,
+            [
+                "https://other.example/a.pdf",
+                "https://example.com/berichte/b.pdf",
+                "https://example.com/obst/c.pdf",
+                "https://example.com/d.pdf",
+            ],
+            "dot segments and root-relative paths are the url crate's job, not string surgery",
+        );
+    }
+
+    #[test]
+    fn a_protocol_relative_href_keeps_the_pages_scheme() {
+        assert_eq!(
+            links(
+                r#"<a href="//cdn.example/x.pdf">x</a>"#,
+                "http://example.com/p"
+            ),
+            ["http://cdn.example/x.pdf"],
+        );
+    }
+
+    #[test]
+    fn an_entity_encoded_query_survives() {
+        // How a query string actually arrives in HTML. Left encoded, the URL
+        // would carry a literal `&amp;` and fetch something else.
+        assert_eq!(
+            links(
+                r#"<a href="/d.pdf?id=1&amp;lang=de">d</a>"#,
+                "https://example.com/",
+            ),
+            ["https://example.com/d.pdf?id=1&lang=de"],
+        );
+    }
+
+    #[test]
+    fn case_query_and_fragment_do_not_hide_a_pdf() {
+        let found = links(
+            r#"<a href="/A.PDF">a</a><a href="/b.pdf#page=3">b</a>"#,
+            "https://example.com/",
+        );
+        assert_eq!(
+            found,
+            ["https://example.com/A.PDF", "https://example.com/b.pdf"],
+            "the extension is matched case-insensitively and the fragment is dropped: \
+             #page=3 is a view of the same document",
+        );
+    }
+
+    #[test]
+    fn links_that_are_not_pdfs_are_left_alone() {
+        let found = links(
+            r#"<a href="/seite.html">h</a>
+               <a href="/download?id=7">d</a>
+               <a href="/">root</a>
+               <a href="/x.pdfx">x</a>
+               <a href="">empty</a>"#,
+            "https://example.com/p",
+        );
+        assert!(
+            found.is_empty(),
+            "nothing here is recognisably a PDF: {found:?}"
+        );
+        // `/download?id=7` may well serve a PDF, and nothing about the link
+        // says so — the extension is the only signal a href carries.
+        assert!(!path_is_pdf("/download"));
+        assert!(path_is_pdf("/bericht.PDF"));
+    }
+
+    #[test]
+    fn only_href_attributes_inside_tags_are_links() {
+        let found = links(
+            r#"<p>set the href="/x.pdf" attribute</p>
+               <div data-href="/y.pdf">z</div>
+               <a href="/keep.pdf">k</a>"#,
+            "https://example.com/",
+        );
+        assert_eq!(
+            found,
+            ["https://example.com/keep.pdf"],
+            "prose is not markup, and data-href is another attribute",
+        );
+    }
+
+    #[test]
+    fn script_style_and_comment_bodies_are_not_markup() {
+        // strip_html drops these bodies, and so does discovery: a URL in a JS
+        // string literal is source code, not a link the page offered.
+        let found = links(
+            r#"<script>document.write('<a href="/js.pdf">');</script>
+               <style>a { background: url(/css.pdf) }</style>
+               <!-- <a href="/comment.pdf"> -->
+               <a href="/real.pdf">r</a>"#,
+            "https://example.com/",
+        );
+        assert_eq!(found, ["https://example.com/real.pdf"]);
+    }
+
+    #[test]
+    fn quoted_unquoted_and_uppercase_forms_all_work() {
+        let found = links(
+            r#"<a href='/single.pdf'>1</a>
+               <a href=/unquoted.pdf class=x>2</a>
+               <A HREF="/upper.pdf">3</A>
+               <a
+                 href = "/spaced.pdf" >4</a>"#,
+            "https://example.com/",
+        );
+        assert_eq!(
+            found,
+            [
+                "https://example.com/single.pdf",
+                "https://example.com/unquoted.pdf",
+                "https://example.com/upper.pdf",
+                "https://example.com/spaced.pdf",
+            ],
+        );
+    }
+
+    #[test]
+    fn schemes_nothing_can_fetch_are_dropped() {
+        let found = links(
+            r##"<a href="javascript:open('/js.pdf')">j</a>
+               <a href="mailto:a@example.com">m</a>
+               <a href="#fragment.pdf">f</a>"##,
+            "https://example.com/seite.html",
+        );
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[test]
+    fn a_page_that_is_not_http_contributes_no_links() {
+        // The `dns:` and `urn:` records ingest drops anyway must not turn into
+        // unresolvable hrefs.
+        assert!(links(r#"<a href="/x.pdf">x</a>"#, "dns:example.org?type=a").is_empty());
+        assert!(links(r#"<a href="/x.pdf">x</a>"#, "not a url").is_empty());
+    }
+
+    #[test]
+    fn a_mis_decoded_page_yields_no_panic() {
+        // Pages that are not valid UTF-8 arrive full of U+FFFD; the extension
+        // test compares bytes precisely so a slice can never land inside one.
+        let mangled =
+            String::from_utf8_lossy(b"<a href=\"/\xff\xfe.pdf\">x</a><a href='/ok.pdf'>y</a>");
+        let found = links(&mangled, "https://example.com/");
+        assert!(found.iter().any(|u| u.ends_with("/ok.pdf")), "{found:?}");
+    }
+
+    #[test]
+    fn links_are_collected_only_when_somebody_wants_them() {
+        // The off switch: discovery is a second scan of every HTML body, and a
+        // run that exports no list must not pay for it.
+        let block = b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n\
+                      <html><body><a href=\"/bericht.pdf\">Bericht</a></body></html>";
+        let record = response_record("https://example.com/seite.html", block);
+        let cdx = warc_search_cdx::from_warc_record(&record, "crawl.warc.gz")
+            .unwrap()
+            .unwrap();
+
+        let mut found = Vec::new();
+        build_index_doc(
+            &record,
+            &cdx,
+            524288,
+            None,
+            None,
+            "warc",
+            &mut 0,
+            &mut 0,
+            Some(&mut found),
+        )
+        .expect("an HTML capture is indexable");
+        assert_eq!(found, ["https://example.com/bericht.pdf"]);
+
+        // Same record, nothing collecting: the document still indexes.
+        let doc = build_index_doc(
+            &record, &cdx, 524288, None, None, "warc", &mut 0, &mut 0, None,
+        )
+        .expect("indexing does not depend on the export");
+        assert_eq!(doc.title, "");
+        assert!(doc.body.contains("Bericht"));
     }
 
     // ── The shipped URL skip list ─────────────────────────────────────────────
@@ -1772,14 +2575,18 @@ mod tests {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../skip-urls.txt");
         let mut cfg = warc_search_config::IndexerConfig::default();
         cfg.blacklisted_url_patterns_path = Some(path.to_owned());
-        cfg.load_url_patterns_file().expect("skip-urls.txt is readable");
+        cfg.load_url_patterns_file()
+            .expect("skip-urls.txt is readable");
         let report = cfg.compile_url_patterns();
         assert!(
             report.rejected.is_empty(),
             "shipped skip-urls.txt has unusable patterns: {:?}",
             report.rejected,
         );
-        assert!(report.compiled > 0, "shipped skip-urls.txt compiled to nothing");
+        assert!(
+            report.compiled > 0,
+            "shipped skip-urls.txt compiled to nothing"
+        );
         cfg
     }
 
@@ -1826,7 +2633,10 @@ mod tests {
             "https://wiki.example.org/doku.php?id=obst:apfel&do=edit",
             "https://wiki.example.org/doku.php?id=obst:apfel&rev=1699999999",
         ] {
-            assert!(cfg.is_url_blacklisted(url), "should have been skipped: {url}");
+            assert!(
+                cfg.is_url_blacklisted(url),
+                "should have been skipped: {url}"
+            );
         }
     }
 
@@ -1860,7 +2670,10 @@ mod tests {
             "https://twitter.com/intent/tweet?url=https://example.org/",
             "https://web.archive.org/save/https://example.org/",
         ] {
-            assert!(cfg.is_url_blacklisted(url), "should have been skipped: {url}");
+            assert!(
+                cfg.is_url_blacklisted(url),
+                "should have been skipped: {url}"
+            );
         }
     }
 

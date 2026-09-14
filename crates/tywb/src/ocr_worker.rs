@@ -39,7 +39,7 @@ use warc_search_cdx::{CdxStore, DEFAULT_COLLECTION};
 use warc_search_config::Config;
 use warc_search_s3::build_client;
 
-use crate::http_payload::{MAX_DECODED_BYTES, parse_http_block};
+use crate::http_payload::{parse_http_block, MAX_DECODED_BYTES};
 use crate::ocr_cache::{JobRetry, OcrCache, OcrJob};
 use crate::pdf::{ExtractError, PdfExtractor};
 use crate::record_fetch::fetch_warc_record;
@@ -66,12 +66,12 @@ enum Outcome {
 /// Summary counters.
 #[derive(Debug, Default)]
 struct Counters {
-    done:        usize,
-    from_cache:  usize,
-    extracted:   usize,
-    no_text:     usize,
+    done: usize,
+    from_cache: usize,
+    extracted: usize,
+    no_text: usize,
     rescheduled: usize,
-    parked:      usize,
+    parked: usize,
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -99,6 +99,10 @@ pub async fn run(cfg: Config, args: WorkerArgs) -> Result<()> {
     let s3 = Arc::new(build_client(&cfg.s3).await);
     let workers = args.jobs.unwrap_or(ocr_cfg.workers).max(1);
     let max_attempts = ocr_cfg.max_attempts;
+    let keep_xhtml = ocr_cfg.keep_xhtml;
+    if keep_xhtml {
+        info!("retaining Tika's XHTML beside the extracted text (ocr_cache.keep_xhtml)");
+    }
 
     // ── Prefill ───────────────────────────────────────────────────────────────
 
@@ -111,7 +115,9 @@ pub async fn run(cfg: Config, args: WorkerArgs) -> Result<()> {
         let mut unfetchable = 0usize;
         let seen = store
             .for_each_warc_pdf(|rec| {
-                let Some(digest) = rec.digest.as_deref() else { return };
+                let Some(digest) = rec.digest.as_deref() else {
+                    return;
+                };
                 if cache.has(digest) {
                     cached += 1;
                     return;
@@ -119,20 +125,18 @@ pub async fn run(cfg: Config, args: WorkerArgs) -> Result<()> {
                 // A `.warc.gz` record without a compressed offset cannot be
                 // fetched record-by-record until `tywb index --force` writes
                 // the offsets into the CDX. Skip it for now.
-                if rec.s3_key.to_ascii_lowercase().ends_with(".gz")
-                    && rec.c_offset.is_none()
-                {
+                if rec.s3_key.to_ascii_lowercase().ends_with(".gz") && rec.c_offset.is_none() {
                     unfetchable += 1;
                     return;
                 }
                 let job = OcrJob {
-                    digest:   digest.to_owned(),
-                    bucket:   cfg.s3.bucket.clone(),
-                    s3_key:   rec.s3_key.clone(),
-                    offset:   rec.offset,
+                    digest: digest.to_owned(),
+                    bucket: cfg.s3.bucket.clone(),
+                    s3_key: rec.s3_key.clone(),
+                    offset: rec.offset,
                     c_offset: rec.c_offset,
-                    length:   rec.length,
-                    url:      rec.original_url.clone(),
+                    length: rec.length,
+                    url: rec.original_url.clone(),
                     attempts: 0,
                 };
                 match cache.enqueue(&job) {
@@ -177,7 +181,16 @@ pub async fn run(cfg: Config, args: WorkerArgs) -> Result<()> {
                 return;
             }
 
-            let outcome = run_job(&s3, &cache, &extractor, max_attempts, &path, &job).await;
+            let outcome = run_job(
+                &s3,
+                &cache,
+                &extractor,
+                max_attempts,
+                keep_xhtml,
+                &path,
+                &job,
+            )
+            .await;
             match outcome {
                 Outcome::Extracted(chars, secs) => {
                     info!(url = %job.url, digest = %job.digest, chars, secs,
@@ -206,11 +219,11 @@ pub async fn run(cfg: Config, args: WorkerArgs) -> Result<()> {
 
     let cnt = counters.lock().unwrap();
     info!(
-        done        = cnt.done,
-        extracted   = cnt.extracted,
-        no_text     = cnt.no_text,
-        from_cache  = cnt.from_cache,
-        parked      = cnt.parked,
+        done = cnt.done,
+        extracted = cnt.extracted,
+        no_text = cnt.no_text,
+        from_cache = cnt.from_cache,
+        parked = cnt.parked,
         "OCR worker finished",
     );
     Ok(())
@@ -225,10 +238,11 @@ async fn run_job(
     cache: &OcrCache,
     extractor: &PdfExtractor,
     max_attempts: u32,
+    keep_xhtml: bool,
     path: &Path,
     job: &OcrJob,
 ) -> Outcome {
-    match fetch_and_extract(s3, extractor, job).await {
+    match fetch_and_extract(s3, extractor, job, keep_xhtml).await {
         Ok(Ok(doc)) => {
             // Extraction succeeded. Store the text (even if the quality gate
             // rejected it — the gate is a judgement about the text, and
@@ -237,6 +251,16 @@ async fn run_job(
                 error!(digest = %job.digest, err = %e,
                        "could not store the extracted text — job stays queued");
                 return Outcome::Failed;
+            }
+            // The markup, beside the text. Written second and best effort: the
+            // text is what makes the entry a hit, and a document whose XHTML
+            // failed to store is a document with no recoverable links — worth a
+            // warning, never worth re-OCR-ing or losing the job over.
+            if let Some(xhtml) = &doc.xhtml {
+                if let Err(e) = cache.put_xhtml(&job.digest, xhtml) {
+                    warn!(digest = %job.digest, err = %e,
+                           "could not retain the XHTML — its links stay unrecoverable");
+                }
             }
             cache.remove_job(path);
             Outcome::Extracted(doc.body.len(), 0)
@@ -267,19 +291,20 @@ async fn fetch_and_extract(
     s3: &aws_sdk_s3::Client,
     extractor: &PdfExtractor,
     job: &OcrJob,
+    keep_xhtml: bool,
 ) -> Result<Result<crate::pdf::PdfDoc, String>, String> {
     let rec = warc_search_cdx::CdxRecord {
-        surt_url:     String::new(),
-        timestamp:    String::new(),
+        surt_url: String::new(),
+        timestamp: String::new(),
         original_url: job.url.clone(),
-        mime:         Some("application/pdf".to_owned()),
-        status:       None,
-        digest:       Some(job.digest.clone()),
-        s3_key:       job.s3_key.clone(),
-        offset:       job.offset,
-        length:       job.length,
-        c_offset:     job.c_offset,
-        collection:   DEFAULT_COLLECTION.to_owned(),
+        mime: Some("application/pdf".to_owned()),
+        status: None,
+        digest: Some(job.digest.clone()),
+        s3_key: job.s3_key.clone(),
+        offset: job.offset,
+        length: job.length,
+        c_offset: job.c_offset,
+        collection: DEFAULT_COLLECTION.to_owned(),
     };
 
     let raw = fetch_warc_record(s3, &job.bucket, &rec)
@@ -305,13 +330,23 @@ async fn fetch_and_extract(
 
     let url = job.url.clone();
     let extractor = extractor.clone();
-    let extracted = tokio::task::spawn_blocking(move || extractor.try_extract(&url, &payload, false)).await;
+    let extracted = tokio::task::spawn_blocking(move || {
+        extractor.try_extract(
+            &url,
+            &payload,
+            crate::pdf::ExtractOpts {
+                allow_truncated: false,
+                keep_xhtml,
+            },
+        )
+    })
+    .await;
 
     match extracted {
         Ok(Ok(doc)) => Ok(Ok(doc)),
-        Ok(Err(e @ (ExtractError::TooLarge { .. } | ExtractError::Truncated | ExtractError::Empty))) => {
-            Ok(Err(e.to_string()))
-        }
+        Ok(Err(
+            e @ (ExtractError::TooLarge { .. } | ExtractError::Truncated | ExtractError::Empty),
+        )) => Ok(Err(e.to_string())),
         Ok(Err(e)) => Err(e.to_string()),
         Err(e) => Err(format!("extraction task panicked: {e}")),
     }
@@ -336,17 +371,17 @@ mod tests {
         // Seed the CDX with a few records.
         let store = CdxStore::open(db_path.to_str().unwrap()).unwrap();
         let mut pdf = warc_search_cdx::CdxRecord {
-            surt_url:     "com,example)/band30.pdf".to_owned(),
-            timestamp:    "20260101000000".to_owned(),
+            surt_url: "com,example)/band30.pdf".to_owned(),
+            timestamp: "20260101000000".to_owned(),
             original_url: "https://example.com/band30.pdf".to_owned(),
-            mime:         Some("application/pdf".to_owned()),
-            status:       Some(200),
-            digest:       Some("sha1:BAND30".to_owned()),
-            s3_key:       "warc/crawl.warc.gz".to_owned(),
-            offset:       1000,
-            length:       33000000,
-            c_offset:     Some(512),
-            collection:   "warc".to_owned(),
+            mime: Some("application/pdf".to_owned()),
+            status: Some(200),
+            digest: Some("sha1:BAND30".to_owned()),
+            s3_key: "warc/crawl.warc.gz".to_owned(),
+            offset: 1000,
+            length: 33000000,
+            c_offset: Some(512),
+            collection: "warc".to_owned(),
         };
         store.upsert(&pdf).unwrap();
 
@@ -358,7 +393,9 @@ mod tests {
         store.upsert(&pdf).unwrap();
 
         let cache = OcrCache::open(&cache_dir).unwrap();
-        cache.put("sha1:GARTEN", "Gartenwelt", "Rote Berlepsch").unwrap();
+        cache
+            .put("sha1:GARTEN", "Gartenwelt", "Rote Berlepsch")
+            .unwrap();
 
         // Run prefill via a synthetic Config.
         let yaml = format!(
@@ -367,31 +404,35 @@ mod tests {
         );
         let mut cfg = Config::from_yaml(&yaml).unwrap();
         cfg.indexer.ocr_cache = Some(warc_search_config::OcrCacheConfig {
-            path:          cache_dir.to_str().unwrap().to_owned(),
-            workers:       2,
-            max_attempts:  3,
-            tika:          None,
+            path: cache_dir.to_str().unwrap().to_owned(),
+            workers: 2,
+            max_attempts: 3,
+            tika: None,
+            keep_xhtml: false,
         });
 
         let ro_store = CdxStore::open_readonly(db_path.to_str().unwrap()).unwrap();
         let mut enqueued = 0usize;
-        ro_store.for_each_warc_pdf(|rec| {
-            let d = rec.digest.as_deref().unwrap();
-            if cache.has(d) { return; }
-            let job = OcrJob {
-                digest:   d.to_owned(),
-                bucket:   "test".to_owned(),
-                s3_key:   rec.s3_key.clone(),
-                offset:   rec.offset,
-                c_offset: rec.c_offset,
-                length:   rec.length,
-                url:      rec.original_url.clone(),
-                attempts: 0,
-            };
-            cache.enqueue(&job).unwrap();
-            enqueued += 1;
-        })
-        .unwrap();
+        ro_store
+            .for_each_warc_pdf(|rec| {
+                let d = rec.digest.as_deref().unwrap();
+                if cache.has(d) {
+                    return;
+                }
+                let job = OcrJob {
+                    digest: d.to_owned(),
+                    bucket: "test".to_owned(),
+                    s3_key: rec.s3_key.clone(),
+                    offset: rec.offset,
+                    c_offset: rec.c_offset,
+                    length: rec.length,
+                    url: rec.original_url.clone(),
+                    attempts: 0,
+                };
+                cache.enqueue(&job).unwrap();
+                enqueued += 1;
+            })
+            .unwrap();
 
         assert_eq!(enqueued, 1, "sha1:GARTEN is cached, sha1:BAND30 is not");
         let jobs = cache.queued_jobs();

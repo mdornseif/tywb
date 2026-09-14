@@ -8,8 +8,8 @@
 //! [`GzSplitter`] reads one member at a time and reports the compressed offset
 //! of each, enabling precise S3 Range-GET replay.
 
-use std::io::{self, Read};
 use flate2::{Decompress, FlushDecompress, Status};
+use std::io::{self, Read};
 
 /// Reads a concatenated gzip stream one member at a time.
 ///
@@ -20,10 +20,10 @@ use flate2::{Decompress, FlushDecompress, Status};
 /// *compressed* source stream.  Store this in the CDX `c_offset` column so
 /// the replay handler can issue a minimal S3 Range GET.
 pub struct GzSplitter<R: Read> {
-    source:    R,
-    buf:       Vec<u8>, // compressed bytes buffered from source
-    buf_start: usize,   // index of first unconsumed byte in buf
-    raw_pos:   u64,     // total bytes ever read from source into buf
+    source: R,
+    buf: Vec<u8>,     // compressed bytes buffered from source
+    buf_start: usize, // index of first unconsumed byte in buf
+    raw_pos: u64,     // total bytes ever read from source into buf
 }
 
 impl<R: Read> GzSplitter<R> {
@@ -193,11 +193,7 @@ impl<R: Read> GzSplitter<R> {
 
             let before_in = decompress.total_in();
             let status = decompress
-                .decompress_vec(
-                    &self.buf[self.buf_start..],
-                    &mut out,
-                    FlushDecompress::None,
-                )
+                .decompress_vec(&self.buf[self.buf_start..], &mut out, FlushDecompress::None)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
 
             let consumed = (decompress.total_in() - before_in) as usize;

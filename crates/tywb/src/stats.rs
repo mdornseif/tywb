@@ -4,7 +4,7 @@ use anyhow::Context;
 
 use warc_search_cdx::CdxStore;
 use warc_search_config::Config;
-use warc_search_s3::{ListState, default_state_path};
+use warc_search_s3::{default_state_path, ListState};
 use warc_search_search::SearchReader;
 
 pub fn run(cfg: Config) -> anyhow::Result<()> {
@@ -32,7 +32,8 @@ pub fn run(cfg: Config) -> anyhow::Result<()> {
     println!("  Records:      {}", fmt_count(cs.total_records));
     println!("  Unique URLs:  {}", fmt_count(cs.unique_urls));
     println!("  WARC files:   {}", fmt_count(cs.warc_files));
-    println!("  Date range:   {}",
+    println!(
+        "  Date range:   {}",
         match (&cs.oldest_timestamp, &cs.newest_timestamp) {
             (Some(a), Some(b)) => format!("{} → {}", fmt_ts(a), fmt_ts(b)),
             _ => "(empty)".to_owned(),
@@ -53,7 +54,7 @@ pub fn run(cfg: Config) -> anyhow::Result<()> {
         for (status, n) in &cs.status_counts {
             let label = match status {
                 Some(s) => s.to_string(),
-                None    => "(none)".to_owned(),
+                None => "(none)".to_owned(),
             };
             println!("    {:6} {:>10}", label, fmt_count(*n));
         }
@@ -77,7 +78,9 @@ fn fmt_count(n: u64) -> String {
     let s = n.to_string();
     let mut out = String::with_capacity(s.len() + s.len() / 3);
     for (i, ch) in s.chars().rev().enumerate() {
-        if i > 0 && i % 3 == 0 { out.push(','); }
+        if i > 0 && i % 3 == 0 {
+            out.push(',');
+        }
         out.push(ch);
     }
     out.chars().rev().collect()
@@ -85,11 +88,17 @@ fn fmt_count(n: u64) -> String {
 
 /// Format a 14-digit CDX timestamp as `YYYY-MM-DD HH:MM:SS`.
 fn fmt_ts(ts: &str) -> String {
-    if ts.len() != 14 { return ts.to_owned(); }
+    if ts.len() != 14 {
+        return ts.to_owned();
+    }
     format!(
         "{}-{}-{} {}:{}:{}",
-        &ts[0..4], &ts[4..6], &ts[6..8],
-        &ts[8..10], &ts[10..12], &ts[12..14]
+        &ts[0..4],
+        &ts[4..6],
+        &ts[6..8],
+        &ts[8..10],
+        &ts[10..12],
+        &ts[12..14]
     )
 }
 

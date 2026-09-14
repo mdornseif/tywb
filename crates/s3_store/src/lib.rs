@@ -18,10 +18,9 @@ pub mod fetch;
 pub mod list;
 
 pub use client::build_client;
-pub use error::{S3Error, Result};
+pub use error::{Result, S3Error};
 pub use fetch::{
-    copy_object, delete_object, get_bytes, get_range, get_range_stream, get_stream,
-    head_object, put_object, put_object_from_path, parse_content_range, range_header,
-    ObjectHead,
+    copy_object, delete_object, get_bytes, get_range, get_range_stream, get_stream, head_object,
+    parse_content_range, put_object, put_object_from_path, range_header, ObjectHead,
 };
 pub use list::{default_state_path, ListState, Lister, ObjectMeta};

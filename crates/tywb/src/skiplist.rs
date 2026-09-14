@@ -36,8 +36,11 @@ pub fn domain_to_regex(domain: &str) -> String {
 /// nobody dares to edit. Patterns that failed to compile are dropped from that
 /// stream: they are inert in tywb and must be inert in the crawler too.
 pub fn to_zeno_exclusions(indexer: &IndexerConfig) -> String {
-    let active: std::collections::HashSet<&str> =
-        indexer.active_url_patterns().iter().map(String::as_str).collect();
+    let active: std::collections::HashSet<&str> = indexer
+        .active_url_patterns()
+        .iter()
+        .map(String::as_str)
+        .collect();
 
     let mut out = String::new();
     out.push_str(
@@ -79,9 +82,7 @@ pub fn to_zeno_exclusions(indexer: &IndexerConfig) -> String {
         .filter(|p| !emitted.contains(p.as_str()))
         .collect();
     if !inline.is_empty() {
-        out.push_str(
-            "\n# ── URL patterns from config.yaml ─────────────────────────────────\n",
-        );
+        out.push_str("\n# ── URL patterns from config.yaml ─────────────────────────────────\n");
         for pattern in inline {
             out.push_str(pattern);
             out.push('\n');
@@ -95,7 +96,10 @@ pub fn to_zeno_exclusions(indexer: &IndexerConfig) -> String {
         );
         let mut seen = std::collections::HashSet::new();
         for domain in &indexer.blacklisted_domains {
-            let d = domain.trim().trim_start_matches('*').trim_start_matches('.');
+            let d = domain
+                .trim()
+                .trim_start_matches('*')
+                .trim_start_matches('.');
             if d.is_empty() || !seen.insert(d.to_ascii_lowercase()) {
                 continue;
             }
@@ -153,11 +157,20 @@ mod tests {
     #[test]
     fn export_keeps_comments_and_order() {
         let cfg = config(
-            &["# ── wiki ──", r"(?i)[?&]action=edit", "", "# session junk", r"(?i)[?&]sid="],
+            &[
+                "# ── wiki ──",
+                r"(?i)[?&]action=edit",
+                "",
+                "# session junk",
+                r"(?i)[?&]sid=",
+            ],
             &[],
         );
         let out = to_zeno_exclusions(&cfg);
-        let body: Vec<&str> = out.lines().skip_while(|l| !l.starts_with("# ── URL")).collect();
+        let body: Vec<&str> = out
+            .lines()
+            .skip_while(|l| !l.starts_with("# ── URL"))
+            .collect();
         assert_eq!(
             body,
             vec![
@@ -178,7 +191,10 @@ mod tests {
         let cfg = config(&[r"(?i)/wiki/Diskussion:", "[unclosed", ".*"], &[]);
         let out = to_zeno_exclusions(&cfg);
         assert!(out.contains(r"(?i)/wiki/Diskussion:"));
-        assert!(!out.contains("[unclosed"), "a broken pattern must not be exported");
+        assert!(
+            !out.contains("[unclosed"),
+            "a broken pattern must not be exported"
+        );
         assert!(!out.contains(".*"), "a catch-all must not be exported");
     }
 

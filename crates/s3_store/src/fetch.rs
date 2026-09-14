@@ -18,13 +18,12 @@
 //! All streams use Tokio's async I/O so the download rate is governed by how
 //! fast the consumer processes bytes — no unbounded buffering.
 
-use aws_sdk_s3::Client;
 use aws_sdk_s3::primitives::ByteStream;
+use aws_sdk_s3::Client;
 use bytes::Bytes;
 use tracing::debug;
 
-use crate::error::{S3Error, Result};
-
+use crate::error::{Result, S3Error};
 
 /// Render an error together with its whole `source()` chain.
 ///
@@ -47,11 +46,7 @@ fn chain(e: &dyn std::error::Error) -> String {
 ///
 /// Returns a raw [`ByteStream`].  The caller is responsible for
 /// decompression if the object is gzip-compressed.
-pub async fn get_stream(
-    client: &Client,
-    bucket: &str,
-    key: &str,
-) -> Result<ByteStream> {
+pub async fn get_stream(client: &Client, bucket: &str, key: &str) -> Result<ByteStream> {
     debug!(bucket, key, "S3 GET");
     let resp = client
         .get_object()
@@ -195,11 +190,7 @@ pub struct ObjectHead {
     pub content_type: Option<String>,
 }
 
-pub async fn head_object(
-    client: &Client,
-    bucket: &str,
-    key: &str,
-) -> Result<ObjectHead> {
+pub async fn head_object(client: &Client, bucket: &str, key: &str) -> Result<ObjectHead> {
     let resp = client
         .head_object()
         .bucket(bucket)
@@ -250,8 +241,12 @@ pub async fn put_object(
         .await
         .map_err(|e| S3Error::Put {
             bucket: bucket.to_owned(),
-            key:    key.to_owned(),
-            reason: e.to_string(),
+            key: key.to_owned(),
+            // The SDK's own Display is famously terse — "service error". The
+            // part that says what to do about it (a 413 from a front-end that
+            // caps request bodies, a 403 from a missing permission) is down the
+            // source chain, and this is the most-used write in the codebase.
+            reason: chain(&e),
         })?;
     Ok(())
 }
@@ -272,7 +267,7 @@ pub async fn put_object_from_path(
         .await
         .map_err(|e| S3Error::Put {
             bucket: bucket.to_owned(),
-            key:    key.to_owned(),
+            key: key.to_owned(),
             reason: format!("reading {}: {e}", path.display()),
         })?;
     client
@@ -285,7 +280,7 @@ pub async fn put_object_from_path(
         .await
         .map_err(|e| S3Error::Put {
             bucket: bucket.to_owned(),
-            key:    key.to_owned(),
+            key: key.to_owned(),
             reason: chain(&e),
         })?;
     Ok(())
@@ -297,12 +292,7 @@ pub async fn put_object_from_path(
 ///
 /// No bytes travel through this process.  Note that plain `CopyObject` is a
 /// single request; S3 implementations cap it at 5 GiB per object.
-pub async fn copy_object(
-    client: &Client,
-    bucket: &str,
-    src: &str,
-    dst: &str,
-) -> Result<()> {
+pub async fn copy_object(client: &Client, bucket: &str, src: &str, dst: &str) -> Result<()> {
     debug!(bucket, src, dst, "S3 COPY");
     client
         .copy_object()
@@ -313,8 +303,8 @@ pub async fn copy_object(
         .await
         .map_err(|e| S3Error::Copy {
             bucket: bucket.to_owned(),
-            src:    src.to_owned(),
-            dst:    dst.to_owned(),
+            src: src.to_owned(),
+            dst: dst.to_owned(),
             reason: chain(&e),
         })?;
     Ok(())
@@ -331,7 +321,7 @@ pub async fn delete_object(client: &Client, bucket: &str, key: &str) -> Result<(
         .await
         .map_err(|e| S3Error::Delete {
             bucket: bucket.to_owned(),
-            key:    key.to_owned(),
+            key: key.to_owned(),
             reason: chain(&e),
         })?;
     Ok(())
@@ -346,8 +336,9 @@ fn encode_copy_source(key: &str) -> String {
     let mut out = String::with_capacity(key.len());
     for b in key.as_bytes() {
         match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9'
-            | b'-' | b'_' | b'.' | b'~' | b'/' => out.push(*b as char),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
+                out.push(*b as char)
+            }
             _ => out.push_str(&format!("%{b:02X}")),
         }
     }
@@ -407,11 +398,7 @@ mod tests {
     fn range_header_end_is_inclusive() {
         // offset=0 length=1 → bytes=0-0 (just one byte)
         let h = range_header(0, 1);
-        let (start, end) = h
-            .strip_prefix("bytes=")
-            .unwrap()
-            .split_once('-')
-            .unwrap();
+        let (start, end) = h.strip_prefix("bytes=").unwrap().split_once('-').unwrap();
         let start: u64 = start.parse().unwrap();
         let end: u64 = end.parse().unwrap();
         assert_eq!(end - start + 1, 1);
@@ -437,8 +424,7 @@ mod tests {
 
     #[test]
     fn parse_content_range_large_numbers() {
-        let (s, e, t) =
-            parse_content_range("bytes 10000000-10065535/5368709120").unwrap();
+        let (s, e, t) = parse_content_range("bytes 10000000-10065535/5368709120").unwrap();
         assert_eq!(s, 10_000_000);
         assert_eq!(e, 10_065_535);
         assert_eq!(t, 5_368_709_120);

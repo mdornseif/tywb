@@ -24,7 +24,7 @@ use aws_sdk_s3::Client;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info};
 
-use crate::error::{S3Error, Result};
+use crate::error::{Result, S3Error};
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -100,8 +100,7 @@ impl ListState {
 
     /// Record that we processed this key successfully.
     pub fn mark_seen(&mut self, key: &str, etag: Option<String>) {
-        self.seen
-            .insert(key.to_owned(), etag.unwrap_or_default());
+        self.seen.insert(key.to_owned(), etag.unwrap_or_default());
     }
 }
 
@@ -138,10 +137,7 @@ impl<'a> Lister<'a> {
         let mut continuation: Option<String> = None;
 
         loop {
-            let mut req = self
-                .client
-                .list_objects_v2()
-                .bucket(&self.bucket);
+            let mut req = self.client.list_objects_v2().bucket(&self.bucket);
 
             if let Some(pfx) = &self.prefix {
                 req = req.prefix(pfx);
@@ -164,9 +160,7 @@ impl<'a> Lister<'a> {
                     key,
                     size: obj.size().unwrap_or(0) as u64,
                     etag: obj.e_tag().map(|s| s.to_owned()),
-                    last_modified: obj
-                        .last_modified()
-                        .map(|t| t.to_string()),
+                    last_modified: obj.last_modified().map(|t| t.to_string()),
                 });
             }
 
@@ -194,10 +188,7 @@ impl<'a> Lister<'a> {
 
     /// List all objects, returning only those that are new or changed
     /// according to `state`.
-    pub async fn list_new_or_changed(
-        &self,
-        state: &ListState,
-    ) -> Result<Vec<ObjectMeta>> {
+    pub async fn list_new_or_changed(&self, state: &ListState) -> Result<Vec<ObjectMeta>> {
         let all = self.list_all().await?;
         let new_or_changed: Vec<_> = all
             .into_iter()
@@ -384,10 +375,7 @@ mod tests {
             state.mark_seen(&format!("key-{i}.warc.gz"), Some(format!("\"etag-{i}\"")));
         }
         for i in 0..100 {
-            assert!(state.is_unchanged(
-                &format!("key-{i}.warc.gz"),
-                &Some(format!("\"etag-{i}\""))
-            ));
+            assert!(state.is_unchanged(&format!("key-{i}.warc.gz"), &Some(format!("\"etag-{i}\""))));
         }
     }
 

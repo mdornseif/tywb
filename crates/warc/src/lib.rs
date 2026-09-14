@@ -29,9 +29,9 @@
 //! ```
 
 pub mod error;
-pub mod record;
 pub mod reader;
+pub mod record;
 
-pub use error::{WarcError, Result};
-pub use record::{RecordType, WarcHeader, WarcRecord, WarcVersion};
+pub use error::{Result, WarcError};
 pub use reader::{WarcIter, WarcReader};
+pub use record::{RecordType, WarcHeader, WarcRecord, WarcVersion};

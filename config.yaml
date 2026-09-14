@@ -164,6 +164,16 @@ indexer:
   #   workers: 2
   #   # attempts before a job is parked in <path>/failed/ (visible, not lost)
   #   max_attempts: 3
+  #   # Keep Tika's XHTML beside the text, as <digest>.tywb.xhtml. The flattened
+  #   # text has no markup left in it, so the links *inside* a PDF are gone from
+  #   # it — as is any structure a later improvement to text handling might use.
+  #   # Retaining it makes both recoverable from disk instead of from another OCR
+  #   # run. Off by default because it is a disk decision, not a free one: Tika
+  #   # emits a span per word for OCR'd pages, so a scanned volume's markup runs
+  #   # to tens of megabytes where its text runs to two. A sibling file, not a
+  #   # format bump — entries cached before it was switched on stay valid hits
+  #   # and are *not* re-extracted; they simply have no markup to give.
+  #   keep_xhtml: true
   #   # The worker's own Tika backend — a full `tika` block, URL included, so it
   #   # can run against its own server with a generous timeout. Unset: the
   #   # global indexer.tika above.
@@ -233,6 +243,36 @@ indexer:
   #
   # `tywb index --collections-only` indexes just these and leaves the WARC
   # bucket alone — the way to add a collection without re-walking the archive.
+
+  # ── PDF URL export ─────────────────────────────────────────────────────────
+  # Every PDF URL the index run sees is written to a text file in S3 — one URL
+  # per line, sorted and deduplicated — for an external consumer such as an
+  # ArchiveBox watcher on the target bucket. Same endpoint and credentials as
+  # the `s3` block above (Garage at https://s3.foxel.org).
+  #
+  # Two kinds of URL go into the list, and the second is the point of it:
+  #   1. records that *are* PDFs — `application/pdf` responses and the objects
+  #      of the `pdf_bucket` collections below; the archive already holds them;
+  #   2. the PDFs the indexed HTML *links to*, which the crawl may never have
+  #      fetched. Found while the decoded markup is in hand, so no extra fetch.
+  # Records the skip list drops are not exported, and neither are links into a
+  # blacklisted site.
+  #
+  # The list holds what the run *processed*: an incremental run exports the
+  # newly seen PDFs, `tywb index --force` the whole archive. For the whole
+  # archive without a re-index, use `tywb export-pdf-urls` (add `--scan-links`
+  # for half 2).
+  #
+  # `{timestamp}` in the key becomes the export's UTC time (YYYYmmdd-HHMMSS), so
+  # every export is an object of its own. Two producers write this list, and one
+  # shared key meant an incremental run — which sees only its own objects —
+  # replaced the complete list with a fragment of it. Lexical order is
+  # chronological order, so the last key in a bucket listing is the newest
+  # export. Nothing prunes old ones. A key without the placeholder is used
+  # verbatim, if you would rather overwrite.
+  pdf_url_export:
+    bucket: "archivebox-in"
+    key: "pdf-urls-{timestamp}.txt"
 
 # ── Server ────────────────────────────────────────────────────────────────────
 server:

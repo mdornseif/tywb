@@ -32,9 +32,9 @@
 //! | `WARC_SERVER_BIND`          | `server.bind`                 |
 //! | `RUST_LOG`                  | `log.level`                   |
 
-use std::path::Path;
 use regex::{Regex, RegexSet};
 use serde::{Deserialize, Serialize};
+use std::path::Path;
 use thiserror::Error;
 
 // ── Error ─────────────────────────────────────────────────────────────────────
@@ -174,6 +174,37 @@ pub struct IndexerConfig {
     /// standalone PDFs. See [`CollectionConfig`].
     #[serde(default)]
     pub collections: Vec<CollectionConfig>,
+    /// Export every PDF URL the index run sees to a text file in S3, for an
+    /// external consumer such as an ArchiveBox watcher on the target bucket.
+    /// One URL per line, deduplicated and sorted. See [`PdfUrlExportConfig`].
+    #[serde(default)]
+    pub pdf_url_export: Option<PdfUrlExportConfig>,
+}
+
+/// Configuration for the PDF URL export (`indexer.pdf_url_export`).
+///
+/// The index run collects every PDF URL it sees — WARC response records with
+/// an `application/pdf` content type, and the objects of `pdf_bucket`
+/// collections — and uploads them as one text file to S3. The list holds what
+/// the run *processed*: an incremental run exports the newly seen PDFs,
+/// `tywb index --force` the whole archive, and a run that saw no PDFs writes
+/// nothing at all, so a quiet night never wipes the previous list.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PdfUrlExportConfig {
+    /// S3 bucket the list is uploaded to. Same endpoint and credentials as
+    /// the primary `s3` block — e.g. `archivebox-in`, a bucket an ArchiveBox
+    /// watcher consumes.
+    pub bucket: String,
+    /// Object key of the list, one URL per line. `{timestamp}` is replaced by
+    /// the export's UTC time as `YYYYmmdd-HHMMSS`, so each export writes an
+    /// object of its own instead of overwriting the last one — an incremental
+    /// index run sees only its own objects, and a shared key meant it replaced
+    /// the complete list with a fragment. The format sorts lexically in
+    /// chronological order. Default `pdf-urls-{timestamp}.txt`; a key without
+    /// the placeholder is used verbatim.
+    #[serde(default = "default_pdf_url_export_key")]
+    pub key: String,
 }
 
 /// Configuration of the digest-keyed OCR text cache (`indexer.ocr_cache`).
@@ -211,6 +242,23 @@ pub struct OcrCacheConfig {
     /// Unset: the global `indexer.tika`.
     #[serde(default)]
     pub tika: Option<TikaConfig>,
+    /// Retain Tika's XHTML beside the extracted text, as
+    /// `text/<xy>/<digest>.tywb.xhtml`.
+    ///
+    /// The flattened text the cache stores has no markup, so the links *inside*
+    /// a PDF — a volume's bibliography, "download the next chapter" — are gone
+    /// from it, and the only way to get them back is to parse the document
+    /// again. Retaining the XHTML keeps them, and would equally let a later
+    /// improvement to text handling be replayed from the cache instead of
+    /// re-OCR'd: the same argument the cache exists for, one level down.
+    ///
+    /// Off by default because it is a disk decision, not a free one: Tika emits
+    /// a span per word for OCR'd pages, so the markup of a scanned volume runs
+    /// to tens of megabytes where its text runs to two. Entries cached before
+    /// it was switched on simply have no XHTML — they stay valid text hits and
+    /// are *not* re-extracted.
+    #[serde(default)]
+    pub keep_xhtml: bool,
 }
 
 /// An additional indexed source beyond the primary WARC archive.
@@ -322,11 +370,17 @@ impl TikaConfig {
     /// special about it.
     pub fn with_override(&self, o: &TikaOverride) -> TikaConfig {
         TikaConfig {
-            url:           self.url.clone(),
-            ocr_strategy:  o.ocr_strategy.clone().unwrap_or_else(|| self.ocr_strategy.clone()),
-            ocr_languages: o.ocr_languages.clone().unwrap_or_else(|| self.ocr_languages.clone()),
+            url: self.url.clone(),
+            ocr_strategy: o
+                .ocr_strategy
+                .clone()
+                .unwrap_or_else(|| self.ocr_strategy.clone()),
+            ocr_languages: o
+                .ocr_languages
+                .clone()
+                .unwrap_or_else(|| self.ocr_languages.clone()),
             max_pdf_bytes: o.max_pdf_bytes.unwrap_or(self.max_pdf_bytes),
-            timeout_secs:  o.timeout_secs.unwrap_or(self.timeout_secs),
+            timeout_secs: o.timeout_secs.unwrap_or(self.timeout_secs),
         }
     }
 }
@@ -359,10 +413,10 @@ impl Default for TikaConfig {
     fn default() -> Self {
         Self {
             url: String::new(),
-            ocr_strategy:  default_tika_ocr_strategy(),
+            ocr_strategy: default_tika_ocr_strategy(),
             ocr_languages: default_tika_ocr_languages(),
             max_pdf_bytes: default_max_pdf_bytes(),
-            timeout_secs:  default_tika_timeout_secs(),
+            timeout_secs: default_tika_timeout_secs(),
         }
     }
 }
@@ -392,7 +446,12 @@ impl IndexerConfig {
         let mut added = 0;
         let mut seen = existing;
         for line in text.lines() {
-            let entry = line.split('#').next().unwrap_or("").trim().to_ascii_lowercase();
+            let entry = line
+                .split('#')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase();
             if entry.is_empty() {
                 continue;
             }
@@ -423,8 +482,11 @@ impl IndexerConfig {
             return Ok(0);
         };
         let text = std::fs::read_to_string(&path)?;
-        let mut seen: std::collections::HashSet<String> =
-            self.blacklisted_url_patterns.iter().map(|p| p.trim().to_owned()).collect();
+        let mut seen: std::collections::HashSet<String> = self
+            .blacklisted_url_patterns
+            .iter()
+            .map(|p| p.trim().to_owned())
+            .collect();
         let mut added = 0;
         // The file's header — the leading comment block, ending at the first
         // blank line — explains this file to whoever edits it and is not worth
@@ -501,7 +563,9 @@ impl IndexerConfig {
                 // Every pattern compiled on its own above, so this is the set's
                 // own size limit. Report it against the list as a whole.
                 Err(e) => {
-                    report.rejected.push(("<pattern set>".to_owned(), e.to_string()));
+                    report
+                        .rejected
+                        .push(("<pattern set>".to_owned(), e.to_string()));
                     None
                 }
             }
@@ -514,7 +578,9 @@ impl IndexerConfig {
     ///
     /// [`compile_url_patterns`]: Self::compile_url_patterns
     pub fn matches_url_pattern(&self, url: &str) -> bool {
-        self.url_patterns.as_ref().is_some_and(|set| set.is_match(url))
+        self.url_patterns
+            .as_ref()
+            .is_some_and(|set| set.is_match(url))
     }
 
     /// The patterns actually in force — those that compiled. This is what to
@@ -694,19 +760,20 @@ impl Config {
     /// Returns `None` to let the AWS SDK use its own credential chain.
     pub fn explicit_credentials(&self) -> Option<(&str, &str)> {
         match (&self.s3.access_key_id, &self.s3.secret_access_key) {
-            (Some(k), Some(s)) if !k.is_empty() && !s.is_empty() => {
-                Some((k.as_str(), s.as_str()))
-            }
+            (Some(k), Some(s)) if !k.is_empty() && !s.is_empty() => Some((k.as_str(), s.as_str())),
             _ => None,
         }
     }
 }
 
 fn parse_env_usize(var: &'static str, value: &str) -> Result<usize> {
-    value.trim().parse::<usize>().map_err(|_| ConfigError::InvalidEnvInt {
-        var,
-        value: value.to_owned(),
-    })
+    value
+        .trim()
+        .parse::<usize>()
+        .map_err(|_| ConfigError::InvalidEnvInt {
+            var,
+            value: value.to_owned(),
+        })
 }
 
 // ── Default impls ─────────────────────────────────────────────────────────────
@@ -736,6 +803,7 @@ impl Default for IndexerConfig {
             tika: None,
             ocr_cache: None,
             collections: vec![],
+            pdf_url_export: None,
         }
     }
 }
@@ -751,30 +819,71 @@ impl Default for ServerConfig {
 }
 impl Default for LogConfig {
     fn default() -> Self {
-        Self { level: default_log_level() }
+        Self {
+            level: default_log_level(),
+        }
     }
 }
 
 // ── Default value fns (required by serde) ────────────────────────────────────
 
-fn default_region()         -> String  { "us-east-1".into() }
-fn default_concurrency()    -> usize   { 4 }
-fn default_index_path()     -> String  { "/var/lib/warc-search/index".into() }
-fn default_cdx_db_path()    -> String  { "/var/lib/warc-search/cdx.db".into() }
-fn default_sqlite_cache_kib() -> u32  { 8192 }
-fn default_batch_size()     -> usize   { 5000 }
-fn default_max_text_bytes() -> usize   { 524_288 }
-fn default_bind()           -> String  { "0.0.0.0:8080".into() }
-fn default_max_results()    -> usize   { 50 }
-fn default_log_level()      -> String  { "info".into() }
-fn default_true()           -> bool    { true }
-fn default_tika_ocr_strategy()  -> String { "auto".to_owned() }
-fn default_tika_ocr_languages() -> String { "deu+frk+eng".to_owned() }
-fn default_max_pdf_bytes()      -> usize  { 100 * 1024 * 1024 }
-fn default_tika_timeout_secs()  -> u64    { 300 }
-fn default_collection_type()    -> String { "pdf_bucket".to_owned() }
-fn default_ocr_workers()        -> usize  { 2 }
-fn default_ocr_max_attempts()   -> u32    { 3 }
+fn default_region() -> String {
+    "us-east-1".into()
+}
+fn default_concurrency() -> usize {
+    4
+}
+fn default_index_path() -> String {
+    "/var/lib/warc-search/index".into()
+}
+fn default_cdx_db_path() -> String {
+    "/var/lib/warc-search/cdx.db".into()
+}
+fn default_sqlite_cache_kib() -> u32 {
+    8192
+}
+fn default_batch_size() -> usize {
+    5000
+}
+fn default_max_text_bytes() -> usize {
+    524_288
+}
+fn default_bind() -> String {
+    "0.0.0.0:8080".into()
+}
+fn default_max_results() -> usize {
+    50
+}
+fn default_log_level() -> String {
+    "info".into()
+}
+fn default_true() -> bool {
+    true
+}
+fn default_tika_ocr_strategy() -> String {
+    "auto".to_owned()
+}
+fn default_tika_ocr_languages() -> String {
+    "deu+frk+eng".to_owned()
+}
+fn default_max_pdf_bytes() -> usize {
+    100 * 1024 * 1024
+}
+fn default_tika_timeout_secs() -> u64 {
+    300
+}
+fn default_collection_type() -> String {
+    "pdf_bucket".to_owned()
+}
+fn default_ocr_workers() -> usize {
+    2
+}
+fn default_ocr_max_attempts() -> u32 {
+    3
+}
+fn default_pdf_url_export_key() -> String {
+    "pdf-urls-{timestamp}.txt".into()
+}
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
@@ -848,7 +957,10 @@ log:
         assert!(cfg.indexer.index_pdfs);
         assert!(cfg.indexer.index_warc_responses);
         assert!(cfg.indexer.blacklisted_url_patterns.is_empty());
-        assert!(cfg.indexer.tika.is_none(), "Tika is opt-in — absent by default");
+        assert!(
+            cfg.indexer.tika.is_none(),
+            "Tika is opt-in — absent by default"
+        );
         assert_eq!(cfg.server.bind, "0.0.0.0:8080");
         assert_eq!(cfg.server.max_results, 50);
         assert!(cfg.server.enable_replay);
@@ -861,9 +973,15 @@ log:
         let cfg = Config::from_yaml(FULL_YAML).unwrap();
         assert_eq!(cfg.s3.bucket, "my-bucket");
         assert_eq!(cfg.s3.region, "eu-west-1");
-        assert_eq!(cfg.s3.endpoint_url.as_deref(), Some("https://minio.example.com"));
+        assert_eq!(
+            cfg.s3.endpoint_url.as_deref(),
+            Some("https://minio.example.com")
+        );
         assert!(cfg.s3.force_path_style);
-        assert_eq!(cfg.s3.access_key_id.as_deref(), Some("AKIAIOSFODNN7EXAMPLE"));
+        assert_eq!(
+            cfg.s3.access_key_id.as_deref(),
+            Some("AKIAIOSFODNN7EXAMPLE")
+        );
         assert_eq!(cfg.s3.prefix.as_deref(), Some("crawls/2024/"));
         assert_eq!(cfg.s3.concurrency, 8);
         assert_eq!(cfg.storage.index_path, "/data/index");
@@ -949,7 +1067,10 @@ indexer:
         let cfg = Config::from_yaml(COLLECTION_YAML).unwrap();
         let tika = cfg.indexer.tika.as_ref().unwrap();
         let _ = tika.with_override(cfg.indexer.collections[0].tika.as_ref().unwrap());
-        assert_eq!(tika.ocr_strategy, "auto", "the WARC archive keeps its own setting");
+        assert_eq!(
+            tika.ocr_strategy, "auto",
+            "the WARC archive keeps its own setting"
+        );
         assert_eq!(tika.max_pdf_bytes, 104857600);
     }
 
@@ -980,7 +1101,10 @@ indexer:
 "#,
         )
         .unwrap();
-        let ocr = cfg.indexer.ocr_cache.expect("the block enables the feature");
+        let ocr = cfg
+            .indexer
+            .ocr_cache
+            .expect("the block enables the feature");
         assert_eq!(ocr.path, "/var/lib/warc-search/ocr-cache");
         // Unstated: the worker extracts two documents in parallel and parks
         // jobs after three attempts.
@@ -1010,7 +1134,77 @@ indexer:
         )
         .unwrap_err()
         .to_string();
-        assert!(err.contains("worker"), "error should name the stray key: {err}");
+        assert!(
+            err.contains("worker"),
+            "error should name the stray key: {err}"
+        );
+    }
+
+    #[test]
+    fn xhtml_retention_is_off_unless_asked_for() {
+        // A disk decision, not a free default: an OCR'd volume's markup runs to
+        // tens of megabytes where its text runs to two.
+        let cfg =
+            Config::from_yaml("s3:\n  bucket: warc\nindexer:\n  ocr_cache:\n    path: /tmp/c\n")
+                .unwrap();
+        assert!(!cfg.indexer.ocr_cache.unwrap().keep_xhtml);
+    }
+
+    #[test]
+    fn xhtml_retention_parses() {
+        let cfg = Config::from_yaml(
+            "s3:\n  bucket: warc\nindexer:\n  ocr_cache:\n    path: /tmp/c\n    keep_xhtml: true\n",
+        )
+        .unwrap();
+        assert!(cfg.indexer.ocr_cache.unwrap().keep_xhtml);
+    }
+
+    // ── PDF URL export ──────────────────────────────────────────────────────
+
+    #[test]
+    fn an_absent_pdf_url_export_block_leaves_the_feature_off() {
+        let cfg = Config::from_yaml(MINIMAL_YAML).unwrap();
+        assert!(cfg.indexer.pdf_url_export.is_none(), "the export is opt-in");
+        assert_eq!(IndexerConfig::default().pdf_url_export, None);
+    }
+
+    #[test]
+    fn a_pdf_url_export_block_parses() {
+        let cfg = Config::from_yaml(
+            "s3:\n  bucket: warc\nindexer:\n  pdf_url_export:\n    bucket: archivebox-in\n",
+        )
+        .unwrap();
+        let exp = cfg
+            .indexer
+            .pdf_url_export
+            .expect("the block enables the export");
+        assert_eq!(exp.bucket, "archivebox-in");
+        assert_eq!(
+            exp.key, "pdf-urls-{timestamp}.txt",
+            "an unstated key falls back to the default — timestamped, so exports accumulate rather than overwrite"
+        );
+    }
+
+    #[test]
+    fn an_explicit_export_key_is_kept() {
+        let cfg = Config::from_yaml(
+            "s3:\n  bucket: warc\nindexer:\n  pdf_url_export:\n    bucket: b\n    key: to-archive.txt\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.indexer.pdf_url_export.unwrap().key, "to-archive.txt");
+    }
+
+    #[test]
+    fn an_unknown_key_inside_pdf_url_export_is_an_error() {
+        let err = Config::from_yaml(
+            "s3:\n  bucket: warc\nindexer:\n  pdf_url_export:\n    bucket: b\n    keyy: x\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("keyy"),
+            "error should name the stray key: {err}"
+        );
     }
 
     #[test]
@@ -1024,10 +1218,10 @@ indexer:
         let cfg = Config::from_yaml(COLLECTION_YAML).unwrap();
         let tika = cfg.indexer.tika.as_ref().unwrap();
         let merged = tika.with_override(&TikaOverride::default());
-        assert_eq!(merged.ocr_strategy,  tika.ocr_strategy);
+        assert_eq!(merged.ocr_strategy, tika.ocr_strategy);
         assert_eq!(merged.ocr_languages, tika.ocr_languages);
         assert_eq!(merged.max_pdf_bytes, tika.max_pdf_bytes);
-        assert_eq!(merged.timeout_secs,  tika.timeout_secs);
+        assert_eq!(merged.timeout_secs, tika.timeout_secs);
     }
 
     #[test]
@@ -1040,7 +1234,10 @@ indexer:
         )
         .unwrap_err()
         .to_string();
-        assert!(err.contains("ocr"), "error should name the stray key: {err}");
+        assert!(
+            err.contains("ocr"),
+            "error should name the stray key: {err}"
+        );
     }
 
     // ── Collection key patterns ───────────────────────────────────────────────
@@ -1066,7 +1263,10 @@ indexer:
     #[test]
     fn a_key_pattern_narrows_a_prefix_the_two_collections_share() {
         let cfg = Config::from_yaml(KEY_PATTERN_YAML).unwrap();
-        let narrow = cfg.indexer.collections[0].compile_key_pattern().unwrap().unwrap();
+        let narrow = cfg.indexer.collections[0]
+            .compile_key_pattern()
+            .unwrap()
+            .unwrap();
 
         // The digitisations, each in a directory of its own — no prefix can
         // describe them, which is why the pattern exists.
@@ -1076,7 +1276,10 @@ indexer:
         assert!(!narrow.is_match("archive-org/dictionnairedepo01lero/dictionnairedepo01lero.pdf"));
         assert!(!narrow.is_match("archive-org/CAT31309742003/cat31309742003.pdf"));
         // And the wider collection has no pattern at all.
-        assert!(cfg.indexer.collections[1].compile_key_pattern().unwrap().is_none());
+        assert!(cfg.indexer.collections[1]
+            .compile_key_pattern()
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -1099,22 +1302,24 @@ indexer:
         // The real mistake: `tika:` and `collections:` belong under `indexer:`.
         // Written at the top level they used to be dropped without a word, and
         // the indexer then found nothing to do and called that success.
-        let err = Config::from_yaml(
-            "s3:\n  bucket: warc\ntika:\n  url: 'http://127.0.0.1:9998'\n",
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("tika"), "error should name the stray key: {err}");
+        let err = Config::from_yaml("s3:\n  bucket: warc\ntika:\n  url: 'http://127.0.0.1:9998'\n")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("tika"),
+            "error should name the stray key: {err}"
+        );
     }
 
     #[test]
     fn unknown_key_inside_a_block_is_an_error() {
-        let err = Config::from_yaml(
-            "s3:\n  bucket: warc\nindexer:\n  max_pdf_bytes: 100\n",
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("max_pdf_bytes"), "error should name the key: {err}");
+        let err = Config::from_yaml("s3:\n  bucket: warc\nindexer:\n  max_pdf_bytes: 100\n")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("max_pdf_bytes"),
+            "error should name the key: {err}"
+        );
     }
 
     #[test]
@@ -1202,10 +1407,16 @@ s3:
 
     #[test]
     fn env_aws_endpoint_url_overrides_yaml() {
-        with_env(&[("AWS_ENDPOINT_URL", "https://env-endpoint.example.com")], || {
-            let cfg = Config::from_yaml(MINIMAL_YAML).unwrap();
-            assert_eq!(cfg.s3.endpoint_url.as_deref(), Some("https://env-endpoint.example.com"));
-        });
+        with_env(
+            &[("AWS_ENDPOINT_URL", "https://env-endpoint.example.com")],
+            || {
+                let cfg = Config::from_yaml(MINIMAL_YAML).unwrap();
+                assert_eq!(
+                    cfg.s3.endpoint_url.as_deref(),
+                    Some("https://env-endpoint.example.com")
+                );
+            },
+        );
     }
 
     #[test]
@@ -1306,8 +1517,8 @@ s3:
         writeln!(f, "instagram.com").unwrap();
         writeln!(f, "  google.com   # search engine").unwrap();
         writeln!(f).unwrap();
-        writeln!(f, "PINTEREST.COM").unwrap();     // case-normalised
-        writeln!(f, "instagram.com").unwrap();     // duplicate within file
+        writeln!(f, "PINTEREST.COM").unwrap(); // case-normalised
+        writeln!(f, "instagram.com").unwrap(); // duplicate within file
         f.flush().unwrap();
 
         let mut cfg = IndexerConfig {
@@ -1316,7 +1527,10 @@ s3:
             ..IndexerConfig::default()
         };
         let added = cfg.load_blacklist_file().unwrap();
-        assert_eq!(added, 2, "instagram + pinterest are new; google is already present");
+        assert_eq!(
+            added, 2,
+            "instagram + pinterest are new; google is already present"
+        );
 
         // The merged set drives both index skip and display filter.
         assert!(cfg.is_url_blacklisted("https://www.instagram.com/foo"));
@@ -1324,7 +1538,13 @@ s3:
         assert!(cfg.is_url_blacklisted("http://pinterest.com/pin/1"));
         assert!(!cfg.is_url_blacklisted("https://pomologen-verein.de/"));
         // No duplicate google entry.
-        assert_eq!(cfg.blacklisted_domains.iter().filter(|d| *d == "google.com").count(), 1);
+        assert_eq!(
+            cfg.blacklisted_domains
+                .iter()
+                .filter(|d| *d == "google.com")
+                .count(),
+            1
+        );
 
         std::fs::remove_file(&path).ok();
     }
@@ -1365,9 +1585,12 @@ s3:
             r"(?i)[?&]action=(edit|history)",
             r"(?i)/wiki/(Diskussion|Spezial|Special):",
         ]);
-        assert!(cfg.is_url_blacklisted("https://wiki.example.org/w/index.php?title=Apfel&action=history"));
+        assert!(cfg
+            .is_url_blacklisted("https://wiki.example.org/w/index.php?title=Apfel&action=history"));
         assert!(cfg.is_url_blacklisted("https://wiki.example.org/wiki/Diskussion:Apfel"));
-        assert!(cfg.is_url_blacklisted("https://wiki.example.org/wiki/Spezial:Letzte_%C3%84nderungen"));
+        assert!(
+            cfg.is_url_blacklisted("https://wiki.example.org/wiki/Spezial:Letzte_%C3%84nderungen")
+        );
         // The article itself stays.
         assert!(!cfg.is_url_blacklisted("https://wiki.example.org/wiki/Apfel"));
         // …and so does a page that merely mentions the word.
@@ -1379,9 +1602,18 @@ s3:
         let mut cfg = with_patterns(&[r"(?i)[?&]action=edit"]);
         cfg.blacklisted_domains = vec!["instagram.com".to_owned()];
 
-        assert!(cfg.is_url_blacklisted("https://www.instagram.com/foo"), "domain hit");
-        assert!(cfg.is_url_blacklisted("https://wiki.example.org/w/?action=edit"), "pattern hit");
-        assert!(!cfg.is_url_blacklisted("https://wiki.example.org/wiki/Apfel"), "neither");
+        assert!(
+            cfg.is_url_blacklisted("https://www.instagram.com/foo"),
+            "domain hit"
+        );
+        assert!(
+            cfg.is_url_blacklisted("https://wiki.example.org/w/?action=edit"),
+            "pattern hit"
+        );
+        assert!(
+            !cfg.is_url_blacklisted("https://wiki.example.org/wiki/Apfel"),
+            "neither"
+        );
     }
 
     #[test]
@@ -1414,8 +1646,8 @@ s3:
         writeln!(f, "# whole-line comment").unwrap();
         writeln!(f).unwrap();
         writeln!(f, "  (?i)/wiki/Diskussion:  ").unwrap(); // trimmed
-        writeln!(f, r"[?&#]action=edit").unwrap();          // '#' inside the pattern survives
-        writeln!(f, "(?i)/wiki/Diskussion:").unwrap();      // duplicate within the file
+        writeln!(f, r"[?&#]action=edit").unwrap(); // '#' inside the pattern survives
+        writeln!(f, "(?i)/wiki/Diskussion:").unwrap(); // duplicate within the file
         f.flush().unwrap();
 
         let mut cfg = IndexerConfig {
@@ -1423,7 +1655,10 @@ s3:
             ..IndexerConfig::default()
         };
         let added = cfg.load_url_patterns_file().unwrap();
-        assert_eq!(added, 2, "two distinct patterns; the comment and the repeat drop out");
+        assert_eq!(
+            added, 2,
+            "two distinct patterns; the comment and the repeat drop out"
+        );
         assert_eq!(cfg.blacklisted_url_patterns[1], r"[?&#]action=edit");
 
         let report = cfg.compile_url_patterns();

@@ -47,7 +47,7 @@ use warc_search_cdx::CdxStore;
 use warc_search_config::Config;
 use warc_search_s3::build_client;
 
-use crate::http_payload::{MAX_DECODED_BYTES, parse_http_block};
+use crate::http_payload::{parse_http_block, MAX_DECODED_BYTES};
 use crate::record_fetch::{fetch_warc_record, warc_http_block};
 
 pub struct ScanArgs {
@@ -160,7 +160,7 @@ pub async fn run(cfg: Config, args: ScanArgs) -> anyhow::Result<()> {
                             match classify(&bytes, rec.mime.as_deref()) {
                                 Damage::Encoded => v.damaged += 1,
                                 Damage::Chunked => v.chunked_only += 1,
-                                Damage::None    => {}
+                                Damage::None => {}
                             }
                         }
                         Err(e) => {
@@ -233,20 +233,19 @@ fn report(
     total_indexable: u64,
     args: &ScanArgs,
 ) -> anyhow::Result<()> {
-    let mut damaged: Vec<&ObjectVerdict> =
-        verdicts.iter().filter(|v| v.needs_reindex()).collect();
+    let mut damaged: Vec<&ObjectVerdict> = verdicts.iter().filter(|v| v.needs_reindex()).collect();
     damaged.sort_by_key(|v| std::cmp::Reverse(v.estimated_bad_docs()));
     let cosmetic: Vec<&ObjectVerdict> = verdicts.iter().filter(|v| v.cosmetic_only()).collect();
 
     let scanned_objects = verdicts.len();
-    let sampled: usize      = verdicts.iter().map(|v| v.sampled).sum();
-    let enc_samples: usize  = verdicts.iter().map(|v| v.damaged).sum();
+    let sampled: usize = verdicts.iter().map(|v| v.sampled).sum();
+    let enc_samples: usize = verdicts.iter().map(|v| v.damaged).sum();
     let chunk_samples: usize = verdicts.iter().map(|v| v.chunked_only).sum();
-    let unreadable: usize   = verdicts.iter().map(|v| v.unreadable).sum();
+    let unreadable: usize = verdicts.iter().map(|v| v.unreadable).sum();
     let no_samples = verdicts.iter().filter(|v| v.sampled == 0).count();
 
     let reindex_records: u64 = damaged.iter().map(|v| v.indexable).sum();
-    let bad_docs: u64        = damaged.iter().map(|v| v.estimated_bad_docs()).sum();
+    let bad_docs: u64 = damaged.iter().map(|v| v.estimated_bad_docs()).sum();
     let cosmetic_records: u64 = cosmetic.iter().map(|v| v.indexable).sum();
 
     if args.verbose {
@@ -254,8 +253,12 @@ fn report(
         for v in &damaged {
             println!(
                 "  {:>3}/{:<3} noise  {:>3} chunked  {:>8} indexable  ~{:>8} bad  {}",
-                v.damaged, v.sampled, v.chunked_only, v.indexable,
-                v.estimated_bad_docs(), v.s3_key,
+                v.damaged,
+                v.sampled,
+                v.chunked_only,
+                v.indexable,
+                v.estimated_bad_docs(),
+                v.s3_key,
             );
         }
     }
@@ -264,20 +267,35 @@ fn report(
     println!("  WARC objects in CDX          {total_objects:>10}");
     println!("  objects scanned              {scanned_objects:>10}");
     println!("  records sampled              {sampled:>10}");
-    println!("    compressed (indexed noise) {enc_samples:>10}   ({:.0}%)", pct(enc_samples, sampled));
-    println!("    chunked only (text usable) {chunk_samples:>10}   ({:.0}%)", pct(chunk_samples, sampled));
+    println!(
+        "    compressed (indexed noise) {enc_samples:>10}   ({:.0}%)",
+        pct(enc_samples, sampled)
+    );
+    println!(
+        "    chunked only (text usable) {chunk_samples:>10}   ({:.0}%)",
+        pct(chunk_samples, sampled)
+    );
     if unreadable > 0 {
-        println!("    unreadable                 {unreadable:>10}   (missing offsets or S3 errors)");
+        println!(
+            "    unreadable                 {unreadable:>10}   (missing offsets or S3 errors)"
+        );
     }
     if no_samples > 0 {
-        println!("  objects with no sample       {no_samples:>10}   (verdict unknown — not counted)");
+        println!(
+            "  objects with no sample       {no_samples:>10}   (verdict unknown — not counted)"
+        );
     }
 
     println!("\nRe-index needed — documents are noise today");
-    println!("  objects                          {:>10}   ({:.0}% of scanned)",
-             damaged.len(), pct(damaged.len(), scanned_objects));
-    println!("  indexable records to rebuild     {reindex_records:>10}   ({:.0}% of {total_indexable})",
-             pct_u64(reindex_records, total_indexable));
+    println!(
+        "  objects                          {:>10}   ({:.0}% of scanned)",
+        damaged.len(),
+        pct(damaged.len(), scanned_objects)
+    );
+    println!(
+        "  indexable records to rebuild     {reindex_records:>10}   ({:.0}% of {total_indexable})",
+        pct_u64(reindex_records, total_indexable)
+    );
     println!("  estimated unsearchable documents ~{bad_docs:>9}   (extrapolated from the samples)");
 
     println!("\nOptional — chunked but already searchable");
@@ -294,28 +312,44 @@ fn report(
             }
             println!("\n  {} keys written to {}", damaged.len(), path.display());
             println!("  re-index with:");
-            println!("    while read -r k; do tywb index --force --file \"$k\"; done < {}",
-                     path.display());
+            println!(
+                "    while read -r k; do tywb index --force --file \"$k\"; done < {}",
+                path.display()
+            );
         }
         None => println!("\n  pass --out <path> to write the keys needing a re-index"),
     }
 
-    let by_ext = damaged.iter().fold(BTreeMap::new(), |mut m: BTreeMap<&str, usize>, v| {
-        let ext = if v.s3_key.ends_with(".warc.gz") { ".warc.gz" } else { "other" };
-        *m.entry(ext).or_default() += 1;
-        m
-    });
+    let by_ext = damaged
+        .iter()
+        .fold(BTreeMap::new(), |mut m: BTreeMap<&str, usize>, v| {
+            let ext = if v.s3_key.ends_with(".warc.gz") {
+                ".warc.gz"
+            } else {
+                "other"
+            };
+            *m.entry(ext).or_default() += 1;
+            m
+        });
     debug!(?by_ext, "damaged objects by extension");
 
     Ok(())
 }
 
 fn pct(n: usize, of: usize) -> f64 {
-    if of == 0 { 0.0 } else { n as f64 * 100.0 / of as f64 }
+    if of == 0 {
+        0.0
+    } else {
+        n as f64 * 100.0 / of as f64
+    }
 }
 
 fn pct_u64(n: u64, of: u64) -> f64 {
-    if of == 0 { 0.0 } else { n as f64 * 100.0 / of as f64 }
+    if of == 0 {
+        0.0
+    } else {
+        n as f64 * 100.0 / of as f64
+    }
 }
 
 #[cfg(test)]
@@ -332,7 +366,10 @@ mod tests {
     #[test]
     fn a_plain_capture_is_undamaged() {
         let block = b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n<html>Apfel</html>";
-        assert_eq!(classify(&warc_record(block), Some("text/html")), Damage::None);
+        assert_eq!(
+            classify(&warc_record(block), Some("text/html")),
+            Damage::None
+        );
     }
 
     #[test]
@@ -345,7 +382,10 @@ mod tests {
         chunked.extend_from_slice(format!("{:x}\r\n", plain.len()).as_bytes());
         chunked.extend_from_slice(plain);
         chunked.extend_from_slice(b"\r\n0\r\n\r\n");
-        assert_eq!(classify(&warc_record(&chunked), Some("text/html")), Damage::Chunked);
+        assert_eq!(
+            classify(&warc_record(&chunked), Some("text/html")),
+            Damage::Chunked
+        );
     }
 
     #[test]
@@ -356,7 +396,10 @@ mod tests {
         chunked.extend_from_slice(format!("{:x}\r\n", body.len()).as_bytes());
         chunked.extend_from_slice(body);
         chunked.extend_from_slice(b"\r\n0\r\n\r\n");
-        assert_eq!(classify(&warc_record(&chunked), Some("application/pdf")), Damage::Encoded);
+        assert_eq!(
+            classify(&warc_record(&chunked), Some("application/pdf")),
+            Damage::Encoded
+        );
     }
 
     #[test]
@@ -368,14 +411,20 @@ mod tests {
 
         let mut block = b"HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\n\r\n".to_vec();
         block.extend_from_slice(&gz);
-        assert_eq!(classify(&warc_record(&block), Some("text/html")), Damage::Encoded);
+        assert_eq!(
+            classify(&warc_record(&block), Some("text/html")),
+            Damage::Encoded
+        );
 
         // …and the real-world shape: chunk framing around the gzip stream.
         let mut both = b"HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\n\r\n".to_vec();
         both.extend_from_slice(format!("{:x}\r\n", gz.len()).as_bytes());
         both.extend_from_slice(&gz);
         both.extend_from_slice(b"\r\n0\r\n\r\n");
-        assert_eq!(classify(&warc_record(&both), Some("text/html")), Damage::Encoded);
+        assert_eq!(
+            classify(&warc_record(&both), Some("text/html")),
+            Damage::Encoded
+        );
     }
 
     #[test]
@@ -383,14 +432,21 @@ mod tests {
         // Content-Encoding on an already-decoded body: the old indexer read
         // this correctly, so re-indexing it would change nothing.
         let block = b"HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\n\r\n<html>Apfel</html>";
-        assert_eq!(classify(&warc_record(block), Some("text/html")), Damage::None);
+        assert_eq!(
+            classify(&warc_record(block), Some("text/html")),
+            Damage::None
+        );
     }
 
     #[test]
     fn extrapolation_counts_only_the_noise() {
         let v = ObjectVerdict {
-            s3_key: "a.warc.gz".into(), indexable: 1000,
-            sampled: 4, damaged: 1, chunked_only: 2, unreadable: 0,
+            s3_key: "a.warc.gz".into(),
+            indexable: 1000,
+            sampled: 4,
+            damaged: 1,
+            chunked_only: 2,
+            unreadable: 0,
         };
         assert_eq!(v.estimated_bad_docs(), 250);
         assert!(v.needs_reindex() && !v.cosmetic_only());

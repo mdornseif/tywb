@@ -12,6 +12,7 @@
 //!   index       Ingest WARC files from S3 into the fulltext and CDX indexes
 //!   server      Run the HTTP search and replay server
 //!   stats       Print statistics about the current index
+//!   export-pdf-urls  Write every PDF URL in the CDX to a text file, and upload it
 //!   recompress  Rewrite whole-file-gzip WARCs as record-per-member .warc.gz
 //!   scan-wire-format  Find WARC files needing a re-index after the wire-format fix
 //! ```
@@ -30,6 +31,7 @@ mod ocr_cache;
 mod ocr_worker;
 mod pdf;
 mod pdf_collection;
+mod pdf_url_export;
 mod recompress;
 mod record_fetch;
 mod server;
@@ -42,9 +44,9 @@ mod wire_scan;
 
 #[derive(Parser)]
 #[command(
-    name    = "tywb",
-    about   = "Tiny Wayback — WARC search and Wayback-compatible replay",
-    version,
+    name = "tywb",
+    about = "Tiny Wayback — WARC search and Wayback-compatible replay",
+    version
 )]
 struct Cli {
     /// Path to the configuration file.
@@ -80,6 +82,33 @@ enum Command {
     Server,
     /// Print statistics about the current index.
     Stats,
+    /// Write every PDF URL the index knows to a text file and upload it to
+    /// `indexer.pdf_url_export`'s bucket.
+    ///
+    /// Two halves: the records that *are* PDFs (a `SELECT DISTINCT` over the
+    /// CDX, under a second) and — with `--scan-links` — the PDFs the indexed
+    /// HTML points at, read back through one Range GET per record. That is the
+    /// complete list, every collection, without a re-index; `index --force`
+    /// would collect the same URLs at the cost of the whole rebuild (days on a
+    /// large archive) and re-queue OCR on the way.
+    ExportPdfUrls {
+        /// Also write the list to this local file.
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Read the CDX and report the counts, but do not upload.
+        #[arg(long)]
+        dry_run: bool,
+        /// Also read the indexed HTML back out of S3 and collect the PDFs it
+        /// links to — the documents the crawl may never have fetched.
+        #[arg(long)]
+        scan_links: bool,
+        /// Records fetched concurrently by `--scan-links`.
+        #[arg(long, default_value_t = 8)]
+        jobs: usize,
+        /// Stop `--scan-links` after this many HTML records.
+        #[arg(long)]
+        limit: Option<usize>,
+    },
     /// Find WARC files whose captures need re-indexing after the wire-format fix.
     ///
     /// Samples a few records per WARC object and Range-GETs just those, then
@@ -155,11 +184,10 @@ enum Command {
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
-    let cfg = Config::load(&cli.config)
-        .unwrap_or_else(|e| {
-            eprintln!("error loading config {}: {e}", cli.config.display());
-            std::process::exit(1);
-        });
+    let cfg = Config::load(&cli.config).unwrap_or_else(|e| {
+        eprintln!("error loading config {}: {e}", cli.config.display());
+        std::process::exit(1);
+    });
 
     // stats writes directly to stdout — skip tracing noise.
     if matches!(cli.command, Command::Stats) {
@@ -182,7 +210,9 @@ async fn main() -> anyhow::Result<()> {
     let mut cfg = cfg;
     match cfg.indexer.load_blacklist_file() {
         Ok(0) => {}
-        Ok(n) => info!(added = n, path = ?cfg.indexer.blacklisted_domains_path, "loaded domain skip list"),
+        Ok(n) => {
+            info!(added = n, path = ?cfg.indexer.blacklisted_domains_path, "loaded domain skip list")
+        }
         Err(e) => tracing::warn!(err = %e, path = ?cfg.indexer.blacklisted_domains_path,
                                  "could not read domain skip list — continuing without it"),
     }
@@ -205,19 +235,92 @@ async fn main() -> anyhow::Result<()> {
     }
 
     match cli.command {
-        Command::Index { file, max_files, max_urls, force, collections_only } =>
-            index::run(cfg, index::IndexArgs { file, max_files, max_urls, force, collections_only }).await,
+        Command::Index {
+            file,
+            max_files,
+            max_urls,
+            force,
+            collections_only,
+        } => {
+            index::run(
+                cfg,
+                index::IndexArgs {
+                    file,
+                    max_files,
+                    max_urls,
+                    force,
+                    collections_only,
+                },
+            )
+            .await
+        }
         Command::Server => server::run(cfg).await,
-        Command::Stats  => unreachable!(),
-        Command::ScanWireFormat { sample, limit, jobs, out, verbose } =>
-            wire_scan::run(cfg, wire_scan::ScanArgs { sample, limit, jobs, out, verbose }).await,
+        Command::Stats => unreachable!(),
+        Command::ExportPdfUrls {
+            out,
+            dry_run,
+            scan_links,
+            jobs,
+            limit,
+        } => {
+            pdf_url_export::run(
+                cfg,
+                pdf_url_export::ExportArgs {
+                    out,
+                    dry_run,
+                    scan_links,
+                    jobs,
+                    limit,
+                },
+            )
+            .await
+        }
+        Command::ScanWireFormat {
+            sample,
+            limit,
+            jobs,
+            out,
+            verbose,
+        } => {
+            wire_scan::run(
+                cfg,
+                wire_scan::ScanArgs {
+                    sample,
+                    limit,
+                    jobs,
+                    out,
+                    verbose,
+                },
+            )
+            .await
+        }
         Command::Recompress {
-            files, limit, jobs, workdir, dry_run, scan_only, backup_suffix, salvage_truncated,
-        } =>
-            recompress::run(cfg, recompress::RecompressArgs {
-                files, limit, jobs, workdir, dry_run, scan_only, backup_suffix, salvage_truncated,
-            }).await,
-        Command::OcrWorker { prefill, jobs } =>
-            ocr_worker::run(cfg, ocr_worker::WorkerArgs { prefill, jobs }).await,
+            files,
+            limit,
+            jobs,
+            workdir,
+            dry_run,
+            scan_only,
+            backup_suffix,
+            salvage_truncated,
+        } => {
+            recompress::run(
+                cfg,
+                recompress::RecompressArgs {
+                    files,
+                    limit,
+                    jobs,
+                    workdir,
+                    dry_run,
+                    scan_only,
+                    backup_suffix,
+                    salvage_truncated,
+                },
+            )
+            .await
+        }
+        Command::OcrWorker { prefill, jobs } => {
+            ocr_worker::run(cfg, ocr_worker::WorkerArgs { prefill, jobs }).await
+        }
     }
 }

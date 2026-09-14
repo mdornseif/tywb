@@ -14,8 +14,8 @@
 //! );
 //! ```
 
-use url::Url;
 use crate::error::{CdxError, Result};
+use url::Url;
 
 /// Convert a URL to its SURT key.
 ///
@@ -43,11 +43,7 @@ pub fn to_surt(raw_url: &str) -> Result<String> {
         .to_ascii_lowercase();
 
     // Reverse host labels: "www.example.com" → "com,example,www"
-    let surt_host: String = host
-        .split('.')
-        .rev()
-        .collect::<Vec<_>>()
-        .join(",");
+    let surt_host: String = host.split('.').rev().collect::<Vec<_>>().join(",");
 
     // Include non-default port
     let port_part = match url.port() {
@@ -83,7 +79,11 @@ pub fn canonicalize(raw_url: &str) -> Result<String> {
     // Lowercase scheme + host, and drop a trailing FQDN dot so "scholl.de."
     // canonicalises to "scholl.de".
     // (url crate already lowercases these on parse, but be explicit)
-    let host = url.host_str().unwrap_or("").trim_end_matches('.').to_ascii_lowercase();
+    let host = url
+        .host_str()
+        .unwrap_or("")
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
     let _ = url.set_host(Some(&host));
 
     // Remove fragment
@@ -119,10 +119,7 @@ mod tests {
 
     #[test]
     fn surt_simple_https() {
-        assert_eq!(
-            to_surt("https://example.com/").unwrap(),
-            "com,example)/"
-        );
+        assert_eq!(to_surt("https://example.com/").unwrap(), "com,example)/");
     }
 
     #[test]
@@ -136,7 +133,10 @@ mod tests {
     #[test]
     fn surt_trailing_fqdn_dot_stripped() {
         // "scholl.de." must produce the same SURT as "scholl.de".
-        assert_eq!(to_surt("https://scholl.de./").unwrap(), to_surt("https://scholl.de/").unwrap());
+        assert_eq!(
+            to_surt("https://scholl.de./").unwrap(),
+            to_surt("https://scholl.de/").unwrap()
+        );
         assert_eq!(to_surt("https://scholl.de./").unwrap(), "de,scholl)/");
         assert_eq!(
             to_surt("http://streuobstmosterei.de./obst").unwrap(),
@@ -178,10 +178,7 @@ mod tests {
 
     #[test]
     fn surt_http_scheme() {
-        assert_eq!(
-            to_surt("http://example.com/").unwrap(),
-            "com,example)/"
-        );
+        assert_eq!(to_surt("http://example.com/").unwrap(), "com,example)/");
     }
 
     #[test]
@@ -194,10 +191,7 @@ mod tests {
 
     #[test]
     fn surt_host_uppercased_input() {
-        assert_eq!(
-            to_surt("https://EXAMPLE.COM/").unwrap(),
-            "com,example)/"
-        );
+        assert_eq!(to_surt("https://EXAMPLE.COM/").unwrap(), "com,example)/");
     }
 
     #[test]

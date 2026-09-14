@@ -17,10 +17,10 @@
 //! }
 //! ```
 
-use std::io::{BufRead, BufReader, Read};
 use bytes::Bytes;
+use std::io::{BufRead, BufReader, Read};
 
-use crate::error::{WarcError, Result};
+use crate::error::{Result, WarcError};
 use crate::record::{WarcHeader, WarcRecord, WarcVersion};
 
 /// Maximum size of the WARC header block (64 KiB).
@@ -117,16 +117,14 @@ impl<R: Read> WarcReader<R> {
                 continue;
             }
 
-            let (name, value) = trimmed.split_once(':').ok_or_else(|| {
-                WarcError::MalformedHeader {
-                    line: fields.len() + 1,
-                    raw: trimmed.to_owned(),
-                }
-            })?;
-            fields.push((
-                name.trim().to_ascii_lowercase(),
-                value.trim().to_owned(),
-            ));
+            let (name, value) =
+                trimmed
+                    .split_once(':')
+                    .ok_or_else(|| WarcError::MalformedHeader {
+                        line: fields.len() + 1,
+                        raw: trimmed.to_owned(),
+                    })?;
+            fields.push((name.trim().to_ascii_lowercase(), value.trim().to_owned()));
         }
 
         let header = WarcHeader::from_fields(version, fields);
@@ -207,11 +205,7 @@ impl<R: Read> Iterator for WarcIter<R> {
 // ── Test helpers ──────────────────────────────────────────────────────────────
 
 /// Build a minimal valid WARC record as bytes for use in tests.
-pub fn build_warc_record(
-    version: &str,
-    fields: &[(&str, &str)],
-    block: &[u8],
-) -> Vec<u8> {
+pub fn build_warc_record(version: &str, fields: &[(&str, &str)], block: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(version.as_bytes());
     out.extend_from_slice(b"\r\n");
@@ -250,7 +244,10 @@ mod tests {
             &[
                 ("WARC-Type", "response"),
                 ("WARC-Date", "2024-01-15T10:00:00Z"),
-                ("WARC-Record-ID", "<urn:uuid:aaaaaaaa-0000-0000-0000-000000000001>"),
+                (
+                    "WARC-Record-ID",
+                    "<urn:uuid:aaaaaaaa-0000-0000-0000-000000000001>",
+                ),
                 ("WARC-Target-URI", url),
             ],
             &http,
@@ -280,7 +277,10 @@ mod tests {
             &[
                 ("WARC-Type", "warcinfo"),
                 ("WARC-Date", "2024-01-01T00:00:00Z"),
-                ("WARC-Record-ID", "<urn:uuid:aaaaaaaa-0000-0000-0000-000000000002>"),
+                (
+                    "WARC-Record-ID",
+                    "<urn:uuid:aaaaaaaa-0000-0000-0000-000000000002>",
+                ),
                 ("WARC-Filename", "archive.warc"),
             ],
             block,
@@ -297,7 +297,10 @@ mod tests {
             &[
                 ("WARC-Type", "request"),
                 ("WARC-Date", "2024-01-15T10:00:00Z"),
-                ("WARC-Record-ID", "<urn:uuid:aaaaaaaa-0000-0000-0000-000000000003>"),
+                (
+                    "WARC-Record-ID",
+                    "<urn:uuid:aaaaaaaa-0000-0000-0000-000000000003>",
+                ),
                 ("WARC-Target-URI", "https://example.com/"),
             ],
             block,
@@ -324,7 +327,10 @@ mod tests {
             &[
                 ("WARC-Type", "metadata"),
                 ("WARC-Date", "2024-01-15T10:00:00Z"),
-                ("WARC-Record-ID", "<urn:uuid:aaaaaaaa-0000-0000-0000-000000000004>"),
+                (
+                    "WARC-Record-ID",
+                    "<urn:uuid:aaaaaaaa-0000-0000-0000-000000000004>",
+                ),
             ],
             b"",
         );
@@ -340,7 +346,10 @@ mod tests {
             &[
                 ("WARC-Type", "resource"),
                 ("WARC-Date", "2024-01-15T10:00:00Z"),
-                ("WARC-Record-ID", "<urn:uuid:aaaaaaaa-0000-0000-0000-000000000005>"),
+                (
+                    "WARC-Record-ID",
+                    "<urn:uuid:aaaaaaaa-0000-0000-0000-000000000005>",
+                ),
             ],
             &body,
         );
@@ -424,7 +433,10 @@ mod tests {
             &[
                 ("WARC-Type", "response"),
                 ("WARC-Date", "2024-01-15T10:00:00Z"),
-                ("WARC-Record-ID", "<urn:uuid:aaaaaaaa-0000-0000-0000-000000000006>"),
+                (
+                    "WARC-Record-ID",
+                    "<urn:uuid:aaaaaaaa-0000-0000-0000-000000000006>",
+                ),
                 ("WARC-Target-URI", "https://example.com/path?a=1&b=2"),
                 // Value contains colons — must not split on them
                 ("Content-Type", "application/json; charset=utf-8"),
@@ -432,7 +444,10 @@ mod tests {
             b"{}",
         );
         let rec = parse_one(&data);
-        assert_eq!(rec.header.content_type().unwrap(), "application/json; charset=utf-8");
+        assert_eq!(
+            rec.header.content_type().unwrap(),
+            "application/json; charset=utf-8"
+        );
     }
 
     #[test]
@@ -442,7 +457,10 @@ mod tests {
             &[
                 ("WARC-Type", "  response  "),
                 ("WARC-Date", "2024-01-15T10:00:00Z"),
-                ("WARC-Record-ID", "<urn:uuid:aaaaaaaa-0000-0000-0000-000000000007>"),
+                (
+                    "WARC-Record-ID",
+                    "<urn:uuid:aaaaaaaa-0000-0000-0000-000000000007>",
+                ),
             ],
             b"x",
         );
@@ -458,13 +476,19 @@ mod tests {
             &[
                 ("WARC-Type", "response"),
                 ("WARC-Date", "2024-01-15T10:00:00Z"),
-                ("WARC-Record-ID", "<urn:uuid:aaaaaaaa-0000-0000-0000-000000000008>"),
+                (
+                    "WARC-Record-ID",
+                    "<urn:uuid:aaaaaaaa-0000-0000-0000-000000000008>",
+                ),
                 ("WARC-Block-Digest", "sha1:ABCDEFGHIJKLMNOPQRST123456"),
             ],
             b"body",
         );
         let rec = parse_one(&data);
-        assert_eq!(rec.header.block_digest().unwrap(), "sha1:ABCDEFGHIJKLMNOPQRST123456");
+        assert_eq!(
+            rec.header.block_digest().unwrap(),
+            "sha1:ABCDEFGHIJKLMNOPQRST123456"
+        );
     }
 
     #[test]
@@ -474,7 +498,10 @@ mod tests {
             &[
                 ("WARC-Type", "response"),
                 ("WARC-Date", "2024-01-15T10:00:00Z"),
-                ("WARC-Record-ID", "<urn:uuid:aaaaaaaa-0000-0000-0000-000000000009>"),
+                (
+                    "WARC-Record-ID",
+                    "<urn:uuid:aaaaaaaa-0000-0000-0000-000000000009>",
+                ),
                 ("WARC-IP-Address", "93.184.216.34"),
             ],
             b"body",
@@ -504,7 +531,8 @@ mod tests {
     #[test]
     fn error_on_truncated_stream() {
         // Build a valid header but truncate the block
-        let mut data = "WARC/1.0\r\nWARC-Type: response\r\nWARC-Date: 2024-01-01T00:00:00Z\r\n".to_string();
+        let mut data =
+            "WARC/1.0\r\nWARC-Type: response\r\nWARC-Date: 2024-01-01T00:00:00Z\r\n".to_string();
         data.push_str("WARC-Record-ID: <urn:uuid:test>\r\nContent-Length: 10000\r\n\r\n");
         data.push_str("only 20 bytes here  "); // << far less than 10000
         let mut reader = WarcReader::new(Cursor::new(data.as_bytes()));

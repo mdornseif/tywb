@@ -59,6 +59,9 @@ ureq = { workspace = true }
 # URL skip patterns (domain → regex for the Zeno export)
 regex = { workspace = true }
 
+# resolving the relative hrefs found in archived HTML
+url = { workspace = true }
+
 # misc
 bytes = { workspace = true }
 

@@ -1,6 +1,6 @@
-use std::collections::HashMap;
+use crate::error::{Result, WarcError};
 use chrono::{DateTime, Utc};
-use crate::error::{WarcError, Result};
+use std::collections::HashMap;
 
 // ── Record type ───────────────────────────────────────────────────────────────
 
@@ -22,29 +22,29 @@ pub enum RecordType {
 impl RecordType {
     pub fn parse(s: &str) -> Self {
         match s.to_ascii_lowercase().as_str() {
-            "warcinfo"     => Self::Warcinfo,
-            "response"     => Self::Response,
-            "resource"     => Self::Resource,
-            "request"      => Self::Request,
-            "metadata"     => Self::Metadata,
-            "revisit"      => Self::Revisit,
-            "conversion"   => Self::Conversion,
+            "warcinfo" => Self::Warcinfo,
+            "response" => Self::Response,
+            "resource" => Self::Resource,
+            "request" => Self::Request,
+            "metadata" => Self::Metadata,
+            "revisit" => Self::Revisit,
+            "conversion" => Self::Conversion,
             "continuation" => Self::Continuation,
-            other          => Self::Other(other.to_owned()),
+            other => Self::Other(other.to_owned()),
         }
     }
 
     pub fn as_str(&self) -> &str {
         match self {
-            Self::Warcinfo      => "warcinfo",
-            Self::Response      => "response",
-            Self::Resource      => "resource",
-            Self::Request       => "request",
-            Self::Metadata      => "metadata",
-            Self::Revisit       => "revisit",
-            Self::Conversion    => "conversion",
-            Self::Continuation  => "continuation",
-            Self::Other(s)      => s.as_str(),
+            Self::Warcinfo => "warcinfo",
+            Self::Response => "response",
+            Self::Resource => "resource",
+            Self::Request => "request",
+            Self::Metadata => "metadata",
+            Self::Revisit => "revisit",
+            Self::Conversion => "conversion",
+            Self::Continuation => "continuation",
+            Self::Other(s) => s.as_str(),
         }
     }
 }
@@ -119,7 +119,11 @@ impl WarcHeader {
             // last value wins for the fast-path index; iterate all for multi-value
             index.insert(name.clone(), i);
         }
-        Self { version, fields, index }
+        Self {
+            version,
+            fields,
+            index,
+        }
     }
 
     /// Return the last value for `name` (case-insensitive).
@@ -326,13 +330,13 @@ mod tests {
 
     #[test]
     fn record_type_parse_known() {
-        assert_eq!(RecordType::parse("response"),     RecordType::Response);
-        assert_eq!(RecordType::parse("request"),      RecordType::Request);
-        assert_eq!(RecordType::parse("warcinfo"),     RecordType::Warcinfo);
-        assert_eq!(RecordType::parse("metadata"),     RecordType::Metadata);
-        assert_eq!(RecordType::parse("resource"),     RecordType::Resource);
-        assert_eq!(RecordType::parse("revisit"),      RecordType::Revisit);
-        assert_eq!(RecordType::parse("conversion"),   RecordType::Conversion);
+        assert_eq!(RecordType::parse("response"), RecordType::Response);
+        assert_eq!(RecordType::parse("request"), RecordType::Request);
+        assert_eq!(RecordType::parse("warcinfo"), RecordType::Warcinfo);
+        assert_eq!(RecordType::parse("metadata"), RecordType::Metadata);
+        assert_eq!(RecordType::parse("resource"), RecordType::Resource);
+        assert_eq!(RecordType::parse("revisit"), RecordType::Revisit);
+        assert_eq!(RecordType::parse("conversion"), RecordType::Conversion);
         assert_eq!(RecordType::parse("continuation"), RecordType::Continuation);
     }
 

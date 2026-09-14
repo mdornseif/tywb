@@ -24,37 +24,38 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use axum::{
-    Router,
     extract::{Path, Query, State},
-    http::{HeaderMap, HeaderValue, StatusCode, Uri, header},
+    http::{header, HeaderMap, HeaderValue, StatusCode, Uri},
     response::{Html, IntoResponse, Response},
     routing::get,
-    Json,
+    Json, Router,
 };
 use serde::Deserialize;
 use tower_http::trace::TraceLayer;
 use tracing::{debug, error, info, warn};
 
-use warc_search_cdx::{CdxRecord, CdxStore, surt::to_surt, DEFAULT_COLLECTION};
+use warc_search_cdx::{surt::to_surt, CdxRecord, CdxStore, DEFAULT_COLLECTION};
 use warc_search_config::Config;
 use warc_search_s3::build_client;
 use warc_search_search::{SearchQuery, SearchReader};
 
-use crate::http_payload::{MAX_DECODED_BYTES, parse_http_block};
+use crate::http_payload::{parse_http_block, MAX_DECODED_BYTES};
 use crate::pdf::PdfExtractor;
-use crate::record_fetch::{FetchError, fetch_warc_record, warc_http_block as extract_warc_http_block};
+use crate::record_fetch::{
+    fetch_warc_record, warc_http_block as extract_warc_http_block, FetchError,
+};
 use crate::ui;
 
 // ── Application state ─────────────────────────────────────────────────────────
 
 pub struct AppState {
-    cdx:    Arc<Mutex<CdxStore>>,
+    cdx: Arc<Mutex<CdxStore>>,
     search: Arc<SearchReader>,
-    s3:     Arc<aws_sdk_s3::Client>,
+    s3: Arc<aws_sdk_s3::Client>,
     config: Config,
     /// Tika client for `/text` on PDFs. `None` when `indexer.tika` is unset —
     /// PDFs are then served for replay but their text cannot be extracted.
-    pdf:    Option<PdfExtractor>,
+    pdf: Option<PdfExtractor>,
     /// Extractors for collections that override the global Tika settings.
     /// `/text` must read a document the way the indexer read it, or the two
     /// disagree about the same bytes — see `extract_capture_text`.
@@ -76,20 +77,18 @@ impl AppState {
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 pub async fn run(cfg: Config) -> anyhow::Result<()> {
-    let cdx_store = CdxStore::open(&cfg.storage.cdx_db_path)
-        .unwrap_or_else(|e| {
-            error!(path = %cfg.storage.cdx_db_path, err = %e, "failed to open CDX store");
-            std::process::exit(1);
-        });
+    let cdx_store = CdxStore::open(&cfg.storage.cdx_db_path).unwrap_or_else(|e| {
+        error!(path = %cfg.storage.cdx_db_path, err = %e, "failed to open CDX store");
+        std::process::exit(1);
+    });
     cdx_store
         .set_cache_kib(cfg.storage.sqlite_cache_kib)
         .unwrap_or_else(|e| warn!(err = %e, "could not set SQLite cache size"));
 
-    let search_reader = SearchReader::open(&cfg.storage.index_path)
-        .unwrap_or_else(|e| {
-            error!(path = %cfg.storage.index_path, err = %e, "failed to open search index");
-            std::process::exit(1);
-        });
+    let search_reader = SearchReader::open(&cfg.storage.index_path).unwrap_or_else(|e| {
+        error!(path = %cfg.storage.index_path, err = %e, "failed to open search index");
+        std::process::exit(1);
+    });
 
     info!(docs = search_reader.num_docs(), "search index opened");
 
@@ -137,9 +136,9 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
     };
 
     let state = Arc::new(AppState {
-        cdx:    Arc::new(Mutex::new(cdx_store)),
+        cdx: Arc::new(Mutex::new(cdx_store)),
         search: Arc::new(search_reader),
-        s3:     Arc::new(s3),
+        s3: Arc::new(s3),
         config: cfg.clone(),
         pdf,
         pdf_by_collection,
@@ -148,31 +147,31 @@ pub async fn run(cfg: Config) -> anyhow::Result<()> {
 
     let app = Router::new()
         // ── Web UI ──────────────────────────────────────────────────────
-        .route("/",           get(home_handler))
-        .route("/ui/search",  get(ui_search_handler))
-        .route("/ui/browse",  get(browse_handler))
-        .route("/ui/url",     get(ui_url_handler))
-        .route("/ui/files",   get(ui_files_handler))
+        .route("/", get(home_handler))
+        .route("/ui/search", get(ui_search_handler))
+        .route("/ui/browse", get(browse_handler))
+        .route("/ui/url", get(ui_url_handler))
+        .route("/ui/files", get(ui_files_handler))
         .route("/ui/skiplist", get(ui_skiplist_handler))
-        .route("/ui/stats",   get(ui_stats_handler))
+        .route("/ui/stats", get(ui_stats_handler))
         // ── Skip list, in the crawler's format ───────────────────────────
         .route("/skiplist.zeno", get(skiplist_zeno_handler))
         // ── JSON API ─────────────────────────────────────────────────────
         .route("/api/stats", get(api_stats_handler))
-        .route("/search",    get(search_handler))
-        .route("/cdx",               get(cdx_handler))
+        .route("/search", get(search_handler))
+        .route("/cdx", get(cdx_handler))
         // ── Plain text of a capture ───────────────────────────────────────
-        .route("/text",              get(text_handler))
-        .route("/text/*rest",        get(text_path_handler))
+        .route("/text", get(text_handler))
+        .route("/text/*rest", get(text_path_handler))
         // ── CDX timemap (Zeno / gowarc deduplication) ─────────────────────
         // Must be registered before /web/*rest so the static path wins.
-        .route("/web/timemap/cdx",   get(cdx_timemap_handler))
+        .route("/web/timemap/cdx", get(cdx_timemap_handler))
         // ── Wayback replay ────────────────────────────────────────────────
-        .route("/web/*rest",         get(replay_handler))
+        .route("/web/*rest", get(replay_handler))
         // ── Static assets ─────────────────────────────────────────────────
-        .route("/_wb/wombat.js",     get(wombat_js_handler))
+        .route("/_wb/wombat.js", get(wombat_js_handler))
         // ── Health ────────────────────────────────────────────────────────
-        .route("/healthz",   get(health_handler))
+        .route("/healthz", get(health_handler))
         .layer(TraceLayer::new_for_http())
         .with_state(state);
 
@@ -204,9 +203,12 @@ async fn home_handler(State(state): State<Arc<AppState>>) -> Response {
             .map(|stats| (collection_cards(&store, &state.config, &stats), stats))
     };
     match result {
-        Ok((collections, stats)) => {
-            Html(ui::homepage_html(&stats, state.search.num_docs(), &collections)).into_response()
-        }
+        Ok((collections, stats)) => Html(ui::homepage_html(
+            &stats,
+            state.search.num_docs(),
+            &collections,
+        ))
+        .into_response(),
         Err(e) => {
             error!(err = %e, "stats query failed");
             (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
@@ -281,15 +283,15 @@ where
 /// itself failing, and the blocking task panicking.
 fn flatten<T>(r: Result<anyhow::Result<T>, tokio::task::JoinError>) -> Result<T, String> {
     match r {
-        Ok(Ok(v))  => Ok(v),
+        Ok(Ok(v)) => Ok(v),
         Ok(Err(e)) => Err(e.to_string()),
-        Err(e)     => Err(e.to_string()),
+        Err(e) => Err(e.to_string()),
     }
 }
 
 async fn ui_stats_handler(State(state): State<Arc<AppState>>) -> Response {
     let path = state.config.storage.cdx_db_path.clone();
-    let kib  = state.config.storage.sqlite_cache_kib;
+    let kib = state.config.storage.sqlite_cache_kib;
     let started = std::time::Instant::now();
 
     let (basic, mimes, statuses, colls) = tokio::join!(
@@ -299,7 +301,12 @@ async fn ui_stats_handler(State(state): State<Arc<AppState>>) -> Response {
         cdx_query(&path, kib, |s| s.collection_counts()),
     );
 
-    match (flatten(basic), flatten(mimes), flatten(statuses), flatten(colls)) {
+    match (
+        flatten(basic),
+        flatten(mimes),
+        flatten(statuses),
+        flatten(colls),
+    ) {
         (Ok(basic), Ok(mimes), Ok(statuses), Ok(colls)) => Html(ui::stats_html(
             &basic,
             state.search.num_docs(),
@@ -325,9 +332,9 @@ async fn ui_stats_handler(State(state): State<Arc<AppState>>) -> Response {
 
 #[derive(Deserialize)]
 struct UiSearchParams {
-    q:     Option<String>,
-    from:  Option<String>,
-    to:    Option<String>,
+    q: Option<String>,
+    from: Option<String>,
+    to: Option<String>,
     limit: Option<usize>,
     /// Restrict results to a single collection (e.g. "obst-pdfs").
     collection: Option<String>,
@@ -345,9 +352,15 @@ async fn ui_search_handler(
     // collection it is a different request — "browse this one" — and that is
     // exactly what the collection cards on the homepage link to.
     if q.is_empty() && collection.is_none() {
-        return Html(ui::search_html("", &[], params.from.as_deref(), params.to.as_deref(),
-                                   None, false))
-            .into_response();
+        return Html(ui::search_html(
+            "",
+            &[],
+            params.from.as_deref(),
+            params.to.as_deref(),
+            None,
+            false,
+        ))
+        .into_response();
     }
 
     // The UI collapses hits to one row per domain, so a plain `max_results`
@@ -362,11 +375,19 @@ async fn ui_search_handler(
         .min(HARD_CAP);
     let from_ts = params.from.as_deref().and_then(|s| {
         // Accept either 8-digit date (YYYYMMDD) or 14-digit timestamp.
-        let padded = if s.len() == 8 { format!("{s}000000") } else { s.to_owned() };
+        let padded = if s.len() == 8 {
+            format!("{s}000000")
+        } else {
+            s.to_owned()
+        };
         padded.parse::<u64>().ok()
     });
     let to_ts = params.to.as_deref().and_then(|s| {
-        let padded = if s.len() == 8 { format!("{s}235959") } else { s.to_owned() };
+        let padded = if s.len() == 8 {
+            format!("{s}235959")
+        } else {
+            s.to_owned()
+        };
         padded.parse::<u64>().ok()
     });
 
@@ -383,39 +404,51 @@ async fn ui_search_handler(
         Ok(mut hits) => {
             hits.retain(|h| !state.config.indexer.is_url_blacklisted(&h.url));
             Html(ui::search_html(
-                &q, &hits,
+                &q,
+                &hits,
                 params.from.as_deref(),
                 params.to.as_deref(),
                 params.collection.as_deref(),
                 false,
-            )).into_response()
+            ))
+            .into_response()
         }
         Err(e) => {
             error!(err = %e, "search failed");
-            Html(ui::search_html(&q, &[], params.from.as_deref(), params.to.as_deref(),
-                                 params.collection.as_deref(), true))
-                .into_response()
+            Html(ui::search_html(
+                &q,
+                &[],
+                params.from.as_deref(),
+                params.to.as_deref(),
+                params.collection.as_deref(),
+                true,
+            ))
+            .into_response()
         }
     }
 }
 
 /// Level 3 — the captures of one hostname.
-async fn browse_captures(
-    state: &Arc<AppState>,
-    host: &str,
-    tld: &str,
-    show_all: bool,
-) -> Response {
+async fn browse_captures(state: &Arc<AppState>, host: &str, tld: &str, show_all: bool) -> Response {
     const MAX_CAPTURES: usize = 5000;
     let surt_prefix = ui::domain_to_surt_prefix(host);
     let records = {
-        state.cdx.lock().unwrap().get_by_surt_prefix(&surt_prefix, MAX_CAPTURES + 1)
+        state
+            .cdx
+            .lock()
+            .unwrap()
+            .get_by_surt_prefix(&surt_prefix, MAX_CAPTURES + 1)
     };
     match records {
         Ok(mut recs) => {
             let truncated = recs.len() > MAX_CAPTURES;
-            if truncated { recs.truncate(MAX_CAPTURES); }
-            Html(ui::browse_captures_html(host, tld, &recs, truncated, show_all)).into_response()
+            if truncated {
+                recs.truncate(MAX_CAPTURES);
+            }
+            Html(ui::browse_captures_html(
+                host, tld, &recs, truncated, show_all,
+            ))
+            .into_response()
         }
         Err(e) => {
             error!(err = %e, "browse captures query failed");
@@ -428,9 +461,9 @@ async fn browse_captures(
 
 #[derive(Deserialize)]
 struct UiUrlParams {
-    url:  Option<String>,
+    url: Option<String>,
     from: Option<String>,
-    to:   Option<String>,
+    to: Option<String>,
 }
 
 async fn ui_url_handler(
@@ -443,21 +476,35 @@ async fn ui_url_handler(
         return Html(ui::url_html("", &[], false)).into_response();
     }
 
-    let normalised = if url.contains("://") { url.clone() } else { format!("https://{url}") };
+    let normalised = if url.contains("://") {
+        url.clone()
+    } else {
+        format!("https://{url}")
+    };
     let surt = match to_surt(&normalised) {
-        Ok(s)  => s,
+        Ok(s) => s,
         Err(e) => {
             warn!(url = %url, err = %e, "invalid URL in ui_url");
             return Html(ui::url_html(&url, &[], true)).into_response();
         }
     };
 
-    let from = params.from.as_deref().unwrap_or("00000000000000").to_owned();
-    let to   = params.to.as_deref().unwrap_or("99999999999999").to_owned();
+    let from = params
+        .from
+        .as_deref()
+        .unwrap_or("00000000000000")
+        .to_owned();
+    let to = params.to.as_deref().unwrap_or("99999999999999").to_owned();
 
     debug!(url = %url, surt = %surt, "ui url lookup");
 
-    let records = { state.cdx.lock().unwrap().get_by_surt_range(&surt, &from, &to) };
+    let records = {
+        state
+            .cdx
+            .lock()
+            .unwrap()
+            .get_by_surt_range(&surt, &from, &to)
+    };
     match records {
         Ok(recs) => Html(ui::url_html(&url, &recs, false)).into_response(),
         Err(e) => {
@@ -470,9 +517,7 @@ async fn ui_url_handler(
 // ── /ui/files — WARC file list ────────────────────────────────────────────────
 
 async fn ui_files_handler(State(state): State<Arc<AppState>>) -> Response {
-    let rows = {
-        state.cdx.lock().unwrap().recent_warc_files(200)
-    };
+    let rows = { state.cdx.lock().unwrap().recent_warc_files(200) };
     match rows {
         Ok(rows) => Html(ui::files_html(&rows, false)).into_response(),
         Err(e) => {
@@ -487,8 +532,11 @@ async fn ui_files_handler(State(state): State<Arc<AppState>>) -> Response {
 /// The patterns that were configured but are not in force. The difference
 /// between what was asked for and what compiled; empty in the normal case.
 fn rejected_patterns(indexer: &warc_search_config::IndexerConfig) -> Vec<String> {
-    let active: std::collections::HashSet<&str> =
-        indexer.active_url_patterns().iter().map(String::as_str).collect();
+    let active: std::collections::HashSet<&str> = indexer
+        .active_url_patterns()
+        .iter()
+        .map(String::as_str)
+        .collect();
     indexer
         .blacklisted_url_patterns
         .iter()
@@ -549,7 +597,7 @@ async fn skiplist_zeno_handler(
 
 #[derive(Deserialize)]
 struct BrowseParams {
-    tld:    Option<String>,
+    tld: Option<String>,
     /// A registered domain — lists the hostnames under it.
     domain: Option<String>,
     /// An exact hostname — lists its captures.
@@ -559,9 +607,9 @@ struct BrowseParams {
     /// domain" and "hostname" are the same string, and guessing by dot count
     /// sent every such domain back to the hostname list instead of its
     /// captures.
-    host:   Option<String>,
+    host: Option<String>,
     /// When present and non-zero, show non-2xx URLs too.
-    all:    Option<u8>,
+    all: Option<u8>,
 }
 
 async fn browse_handler(
@@ -590,13 +638,20 @@ async fn browse_handler(
             };
             const MAX_HOSTS: usize = 500;
             let hosts = {
-                state.cdx.lock().unwrap().browse_subdomains(&surt_prefix, MAX_HOSTS + 1)
+                state
+                    .cdx
+                    .lock()
+                    .unwrap()
+                    .browse_subdomains(&surt_prefix, MAX_HOSTS + 1)
             };
             match hosts {
                 Ok(mut rows) => {
                     let truncated = rows.len() > MAX_HOSTS;
-                    if truncated { rows.truncate(MAX_HOSTS); }
-                    Html(ui::browse_subdomains_html(&tld, &domain, &rows, truncated)).into_response()
+                    if truncated {
+                        rows.truncate(MAX_HOSTS);
+                    }
+                    Html(ui::browse_subdomains_html(&tld, &domain, &rows, truncated))
+                        .into_response()
                 }
                 Err(e) => {
                     error!(err = %e, "browse subdomains query failed");
@@ -612,12 +667,18 @@ async fn browse_handler(
         let tld = tld.trim().to_ascii_lowercase();
         const MAX_DOMAINS: usize = 2000;
         let domains = {
-            state.cdx.lock().unwrap().browse_domains(&tld, MAX_DOMAINS + 1)
+            state
+                .cdx
+                .lock()
+                .unwrap()
+                .browse_domains(&tld, MAX_DOMAINS + 1)
         };
         match domains {
             Ok(mut rows) => {
                 let truncated = rows.len() > MAX_DOMAINS;
-                if truncated { rows.truncate(MAX_DOMAINS); }
+                if truncated {
+                    rows.truncate(MAX_DOMAINS);
+                }
                 Html(ui::browse_domains_html(&tld, &rows, truncated)).into_response()
             }
             Err(e) => {
@@ -632,7 +693,9 @@ async fn browse_handler(
         match tlds {
             Ok(mut rows) => {
                 let truncated = rows.len() > MAX_TLDS;
-                if truncated { rows.truncate(MAX_TLDS); }
+                if truncated {
+                    rows.truncate(MAX_TLDS);
+                }
                 Html(ui::browse_tlds_html(&rows, truncated)).into_response()
             }
             Err(e) => {
@@ -650,16 +713,17 @@ async fn api_stats_handler(State(state): State<Arc<AppState>>) -> Response {
     match cdx_stats {
         Ok(s) => Json(ui::ApiStats {
             cdx: ui::ApiCdxStats {
-                total_records:    s.total_records,
-                unique_urls:      s.unique_urls,
-                warc_files:       s.warc_files,
+                total_records: s.total_records,
+                unique_urls: s.unique_urls,
+                warc_files: s.warc_files,
                 oldest_timestamp: s.oldest_timestamp,
                 newest_timestamp: s.newest_timestamp,
             },
             search: ui::ApiSearchStats {
                 num_docs: state.search.num_docs(),
             },
-        }).into_response(),
+        })
+        .into_response(),
         Err(e) => {
             error!(err = %e, "api/stats failed");
             (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
@@ -671,9 +735,9 @@ async fn api_stats_handler(State(state): State<Arc<AppState>>) -> Response {
 
 #[derive(Deserialize)]
 struct SearchParams {
-    q:     String,
-    from:  Option<String>,
-    to:    Option<String>,
+    q: String,
+    from: Option<String>,
+    to: Option<String>,
     limit: Option<usize>,
     collection: Option<String>,
 }
@@ -682,9 +746,12 @@ async fn search_handler(
     State(state): State<Arc<AppState>>,
     Query(params): Query<SearchParams>,
 ) -> Response {
-    let limit   = params.limit.unwrap_or(state.config.server.max_results).min(500);
+    let limit = params
+        .limit
+        .unwrap_or(state.config.server.max_results)
+        .min(500);
     let from_ts = params.from.as_deref().and_then(|s| s.parse::<u64>().ok());
-    let to_ts   = params.to.as_deref().and_then(|s| s.parse::<u64>().ok());
+    let to_ts = params.to.as_deref().and_then(|s| s.parse::<u64>().ok());
 
     debug!(q = %params.q, from = ?from_ts, to = ?to_ts, limit, "search");
 
@@ -743,9 +810,11 @@ async fn fetch_payload(state: &Arc<AppState>, rec: &CdxRecord) -> Result<Payload
 
         return match warc_search_s3::get_bytes(&state.s3, &coll.bucket, &rec.s3_key).await {
             Ok(bytes) => Ok(Payload::Object(bytes.to_vec())),
-            Err(warc_search_s3::S3Error::NotFound { .. }) => {
-                Err((StatusCode::NOT_FOUND, "object not found in collection bucket").into_response())
-            }
+            Err(warc_search_s3::S3Error::NotFound { .. }) => Err((
+                StatusCode::NOT_FOUND,
+                "object not found in collection bucket",
+            )
+                .into_response()),
             Err(e) => {
                 error!(err = %e, bucket = %coll.bucket, key = %rec.s3_key,
                        "collection object GET failed");
@@ -783,17 +852,17 @@ async fn replay_handler(
         return (StatusCode::BAD_REQUEST, "expected /web/<timestamp>/<url>").into_response();
     };
 
-    let timestamp    = &rest[..slash];
-    let url_path     = &rest[slash + 1..];
+    let timestamp = &rest[..slash];
+    let url_path = &rest[slash + 1..];
     let original_url = match uri.query() {
         Some(q) => format!("{url_path}?{q}"),
-        None    => url_path.to_owned(),
+        None => url_path.to_owned(),
     };
 
     debug!(timestamp, url = %original_url, "replay");
 
     let surt = match to_surt(&original_url) {
-        Ok(s)  => s,
+        Ok(s) => s,
         Err(e) => {
             warn!(url = %original_url, err = %e, "invalid URL in replay request");
             return (StatusCode::BAD_REQUEST, format!("invalid URL: {e}")).into_response();
@@ -804,7 +873,7 @@ async fn replay_handler(
         let store = state.cdx.lock().unwrap();
         match store.closest(&surt, timestamp) {
             Ok(Some(r)) => r,
-            Ok(None)    => return (StatusCode::NOT_FOUND, "not found in CDX index").into_response(),
+            Ok(None) => return (StatusCode::NOT_FOUND, "not found in CDX index").into_response(),
             Err(e) => {
                 error!(err = %e, "CDX closest lookup failed");
                 return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
@@ -821,10 +890,16 @@ async fn replay_handler(
             &cdx_rec.timestamp,
         ),
         Ok(Payload::Object(bytes)) => {
-            let ctype = cdx_rec.mime.as_deref().unwrap_or("application/octet-stream");
+            let ctype = cdx_rec
+                .mime
+                .as_deref()
+                .unwrap_or("application/octet-stream");
             (
-                [(header::CONTENT_TYPE, HeaderValue::from_str(ctype)
-                    .unwrap_or(HeaderValue::from_static("application/octet-stream")))],
+                [(
+                    header::CONTENT_TYPE,
+                    HeaderValue::from_str(ctype)
+                        .unwrap_or(HeaderValue::from_static("application/octet-stream")),
+                )],
                 bytes,
             )
                 .into_response()
@@ -853,11 +928,19 @@ fn serve_warc_response(block: &[u8], original_url: &str, timestamp: &str) -> Res
         .unwrap_or(StatusCode::OK);
 
     let mut headers = HeaderMap::new();
-    if let Some(hv) = parts.content_type.as_deref().and_then(|v| HeaderValue::from_str(v).ok()) {
+    if let Some(hv) = parts
+        .content_type
+        .as_deref()
+        .and_then(|v| HeaderValue::from_str(v).ok())
+    {
         headers.insert(header::CONTENT_TYPE, hv);
     }
     if status.is_redirection() {
-        if let Some(hv) = parts.location.as_deref().and_then(|v| HeaderValue::from_str(v).ok()) {
+        if let Some(hv) = parts
+            .location
+            .as_deref()
+            .and_then(|v| HeaderValue::from_str(v).ok())
+        {
             headers.insert(header::LOCATION, hv);
         }
     }
@@ -869,7 +952,7 @@ fn serve_warc_response(block: &[u8], original_url: &str, timestamp: &str) -> Res
     // handing back what was captured, and the browser may make more of it than
     // we can. `/text` is the endpoint that refuses.
     let body = match parts.payload(MAX_DECODED_BYTES) {
-        Ok(b)  => b.into_owned(),
+        Ok(b) => b.into_owned(),
         Err(e) => {
             debug!(url = original_url, err = %e, "serving replay body undecoded");
             parts.body.to_vec()
@@ -904,11 +987,11 @@ fn serve_warc_response(block: &[u8], original_url: &str, timestamp: &str) -> Res
 
 #[derive(Deserialize)]
 struct TextParams {
-    url:       Option<String>,
+    url: Option<String>,
     /// 14-digit capture timestamp, or any prefix of one. Omitted → newest.
     timestamp: Option<String>,
     /// `text` (default) or `json`.
-    output:    Option<String>,
+    output: Option<String>,
 }
 
 /// `GET /text?url=<url>[&timestamp=<ts>][&output=json]`
@@ -916,10 +999,18 @@ async fn text_handler(
     State(state): State<Arc<AppState>>,
     Query(params): Query<TextParams>,
 ) -> Response {
-    let Some(url) = params.url.as_deref().map(str::trim).filter(|u| !u.is_empty()) else {
+    let Some(url) = params
+        .url
+        .as_deref()
+        .map(str::trim)
+        .filter(|u| !u.is_empty())
+    else {
         return (StatusCode::BAD_REQUEST, "url parameter required").into_response();
     };
-    let as_json = params.output.as_deref().is_some_and(|o| o.eq_ignore_ascii_case("json"));
+    let as_json = params
+        .output
+        .as_deref()
+        .is_some_and(|o| o.eq_ignore_ascii_case("json"));
     text_response(&state, url, params.timestamp.as_deref(), as_json).await
 }
 
@@ -940,7 +1031,7 @@ async fn text_path_handler(
     let timestamp = rest[..slash].to_owned();
     let url = match uri.query() {
         Some(q) => format!("{}?{q}", &rest[slash + 1..]),
-        None    => rest[slash + 1..].to_owned(),
+        None => rest[slash + 1..].to_owned(),
     };
     text_response(&state, &url, Some(&timestamp), false).await
 }
@@ -951,7 +1042,11 @@ async fn text_response(
     timestamp: Option<&str>,
     as_json: bool,
 ) -> Response {
-    let normalised = if url.contains("://") { url.to_owned() } else { format!("https://{url}") };
+    let normalised = if url.contains("://") {
+        url.to_owned()
+    } else {
+        format!("https://{url}")
+    };
     let surt = match to_surt(&normalised) {
         Ok(s) => s,
         Err(e) => {
@@ -963,17 +1058,17 @@ async fn text_response(
     debug!(url, ?timestamp, "text");
 
     let rec = match lookup_capture(state, &surt, timestamp) {
-        Ok(r)              => r,
+        Ok(r) => r,
         Err((status, msg)) => return (status, msg).into_response(),
     };
 
     let payload = match fetch_payload(state, &rec).await {
-        Ok(p)     => p,
+        Ok(p) => p,
         Err(resp) => return resp,
     };
 
     let extracted = match extract_capture_text(state, &rec, payload).await {
-        Ok(t)     => t,
+        Ok(t) => t,
         Err(resp) => return resp,
     };
 
@@ -994,12 +1089,15 @@ async fn text_response(
 
     // Plain text: the body is only the text, everything else is a header.
     let mut headers = HeaderMap::new();
-    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("text/plain; charset=utf-8"));
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
     for (name, value) in [
         ("X-Archive-Orig-URL", rec.original_url.as_str()),
-        ("X-Tywb-Timestamp",   rec.timestamp.as_str()),
-        ("X-Tywb-Collection",  rec.collection.as_str()),
-        ("X-Tywb-Mime",        extracted.mime.as_str()),
+        ("X-Tywb-Timestamp", rec.timestamp.as_str()),
+        ("X-Tywb-Collection", rec.collection.as_str()),
+        ("X-Tywb-Mime", extracted.mime.as_str()),
     ] {
         if let Ok(hv) = HeaderValue::from_str(value) {
             headers.insert(name, hv);
@@ -1032,13 +1130,15 @@ fn lookup_capture(
                 store.closest(surt, &pad_timestamp(ts))
             }
             // get_by_surt is timestamp-ascending, so the last row is the newest.
-            None => store.get_by_surt(surt).map(|recs| recs.into_iter().next_back()),
+            None => store
+                .get_by_surt(surt)
+                .map(|recs| recs.into_iter().next_back()),
         }
     };
 
     match found {
         Ok(Some(r)) => Ok(r),
-        Ok(None)    => Err((StatusCode::NOT_FOUND, "not found in CDX index".to_owned())),
+        Ok(None) => Err((StatusCode::NOT_FOUND, "not found in CDX index".to_owned())),
         Err(e) => {
             error!(err = %e, "CDX lookup failed");
             Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))
@@ -1060,9 +1160,9 @@ fn pad_timestamp(ts: &str) -> String {
 /// The plain text of one capture and what it was derived from.
 struct CaptureText {
     title: String,
-    text:  String,
+    text: String,
     /// The content type the text was extracted from.
-    mime:  String,
+    mime: String,
     /// PDFs only: `false` when the text failed the OCR quality gate. Such text
     /// is still returned — a caller asking for one named document can judge
     /// OCR noise itself, whereas the index cannot.
@@ -1077,7 +1177,9 @@ async fn extract_capture_text(
     let (mime, body): (String, Vec<u8>) = match payload {
         // A collection object is the file itself — no HTTP envelope around it.
         Payload::Object(bytes) => (
-            rec.mime.clone().unwrap_or_else(|| "application/octet-stream".to_owned()),
+            rec.mime
+                .clone()
+                .unwrap_or_else(|| "application/octet-stream".to_owned()),
             bytes,
         ),
         Payload::Warc(warc_bytes) => {
@@ -1095,7 +1197,12 @@ async fn extract_capture_text(
         }
     };
 
-    let essence = mime.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+    let essence = mime
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
 
     let is_html = essence.starts_with("text/html")
         || essence.starts_with("application/xhtml")
@@ -1108,7 +1215,7 @@ async fn extract_capture_text(
         let raw = String::from_utf8_lossy(&body);
         return Ok(CaptureText {
             title: crate::index::extract_title(&raw),
-            text:  crate::index::strip_html(&raw),
+            text: crate::index::strip_html(&raw),
             mime,
             quality_ok: true,
         });
@@ -1116,8 +1223,20 @@ async fn extract_capture_text(
 
     if essence.starts_with("text/") {
         let raw = String::from_utf8_lossy(&body).into_owned();
-        let title = raw.lines().next().unwrap_or("").trim().chars().take(256).collect();
-        return Ok(CaptureText { title, text: raw, mime, quality_ok: true });
+        let title = raw
+            .lines()
+            .next()
+            .unwrap_or("")
+            .trim()
+            .chars()
+            .take(256)
+            .collect();
+        return Ok(CaptureText {
+            title,
+            text: raw,
+            mime,
+            quality_ok: true,
+        });
     }
 
     if essence == "application/pdf" {
@@ -1157,23 +1276,34 @@ async fn extract_capture_text(
         let result = tokio::task::spawn_blocking(move || {
             // allow_truncated: a single on-demand request can afford the OCR
             // attempt on a cut-off PDF that the bulk indexer skips.
-            extractor.try_extract(&url, &body, true)
+            // keep_xhtml off: `/text` returns readable text, and the markup of
+            // an OCR'd volume is tens of megabytes nobody here would read.
+            extractor.try_extract(
+                &url,
+                &body,
+                crate::pdf::ExtractOpts {
+                    allow_truncated: true,
+                    keep_xhtml: false,
+                },
+            )
         })
         .await;
 
         return match result {
             Ok(Ok(doc)) => Ok(CaptureText {
                 title: doc.title,
-                text:  doc.body,
+                text: doc.body,
                 mime,
                 quality_ok: doc.quality_ok,
             }),
             Ok(Err(e)) => {
                 use crate::pdf::ExtractError;
                 let status = match e {
-                    ExtractError::TooLarge { .. }               => StatusCode::PAYLOAD_TOO_LARGE,
-                    ExtractError::Tika(_)                       => StatusCode::BAD_GATEWAY,
-                    ExtractError::Empty | ExtractError::Truncated => StatusCode::UNPROCESSABLE_ENTITY,
+                    ExtractError::TooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
+                    ExtractError::Tika(_) => StatusCode::BAD_GATEWAY,
+                    ExtractError::Empty | ExtractError::Truncated => {
+                        StatusCode::UNPROCESSABLE_ENTITY
+                    }
                 };
                 warn!(url = %rec.original_url, err = %e, "PDF text extraction failed");
                 Err((status, e.to_string()).into_response())
@@ -1205,9 +1335,16 @@ fn inject_wayback_ui(mut html: Vec<u8>, original_url: &str, timestamp: &str) -> 
     // Build the wombat init block.
     // wombat_sec = Unix seconds for the timestamp (approximate; we parse YYYYMMDDHHMMSS).
     let wombat_sec = timestamp_to_unix(timestamp);
-    let scheme = if original_url.starts_with("https") { "https" } else { "http" };
+    let scheme = if original_url.starts_with("https") {
+        "https"
+    } else {
+        "http"
+    };
     let host = {
-        let after_scheme = original_url.find("://").map(|i| &original_url[i + 3..]).unwrap_or(original_url);
+        let after_scheme = original_url
+            .find("://")
+            .map(|i| &original_url[i + 3..])
+            .unwrap_or(original_url);
         after_scheme.split('/').next().unwrap_or("")
     };
 
@@ -1242,11 +1379,11 @@ fn inject_wayback_ui(mut html: Vec<u8>, original_url: &str, timestamp: &str) -> 
 }})();
 </script>
 "#,
-        url_json    = json_str(original_url),
-        ts_json     = json_str(timestamp),
-        wombat_sec  = wombat_sec,
+        url_json = json_str(original_url),
+        ts_json = json_str(timestamp),
+        wombat_sec = wombat_sec,
         scheme_json = json_str(scheme),
-        host_json   = json_str(host),
+        host_json = json_str(host),
     );
 
     let toolbar_html = format!(
@@ -1258,10 +1395,10 @@ fn inject_wayback_ui(mut html: Vec<u8>, original_url: &str, timestamp: &str) -> 
 </div>
 <div style="height:32px"></div>
 "#,
-        date             = html_escape(&display_date),
-        orig_url         = html_escape(original_url),
+        date = html_escape(&display_date),
+        orig_url = html_escape(original_url),
         orig_url_display = html_escape(truncate_url(original_url, 80)),
-        encoded_url      = encoded_url,
+        encoded_url = encoded_url,
     );
 
     // ── Inject before </head> ─────────────────────────────────────────────────
@@ -1282,9 +1419,13 @@ fn inject_wayback_ui(mut html: Vec<u8>, original_url: &str, timestamp: &str) -> 
 /// Case-insensitive forward search for `needle` in `haystack`.
 /// Returns the byte position of the first match, or `None`.
 fn find_case_insensitive(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() || haystack.len() < needle.len() { return None; }
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
     haystack.windows(needle.len()).position(|w| {
-        w.iter().zip(needle.iter()).all(|(a, b)| a.to_ascii_lowercase() == b.to_ascii_lowercase())
+        w.iter()
+            .zip(needle.iter())
+            .all(|(a, b)| a.to_ascii_lowercase() == b.to_ascii_lowercase())
     })
 }
 
@@ -1301,11 +1442,11 @@ fn html_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         match c {
-            '&'  => out.push_str("&amp;"),
-            '<'  => out.push_str("&lt;"),
-            '>'  => out.push_str("&gt;"),
-            '"'  => out.push_str("&quot;"),
-            _    => out.push(c),
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            _ => out.push(c),
         }
     }
     out
@@ -1317,11 +1458,11 @@ fn json_str(s: &str) -> String {
     out.push('"');
     for c in s.chars() {
         match c {
-            '"'  => out.push_str(r#"\""#),
+            '"' => out.push_str(r#"\""#),
             '\\' => out.push_str(r"\\"),
             '\n' => out.push_str(r"\n"),
             '\r' => out.push_str(r"\r"),
-            _    => out.push(c),
+            _ => out.push(c),
         }
     }
     out.push('"');
@@ -1330,19 +1471,25 @@ fn json_str(s: &str) -> String {
 
 /// Truncate a URL to at most `max` characters, appending `…` if truncated.
 fn truncate_url(url: &str, max: usize) -> &str {
-    if url.len() <= max { url } else { &url[..max] }
+    if url.len() <= max {
+        url
+    } else {
+        &url[..max]
+    }
 }
 
 /// Convert a 14-digit WARC timestamp (YYYYMMDDHHMMSS) to approximate Unix seconds.
 /// Returns 0 if the timestamp cannot be parsed.
 fn timestamp_to_unix(ts: &str) -> i64 {
-    if ts.len() < 14 { return 0; }
-    let year:  i64 = ts[0..4].parse().unwrap_or(1970);
+    if ts.len() < 14 {
+        return 0;
+    }
+    let year: i64 = ts[0..4].parse().unwrap_or(1970);
     let month: i64 = ts[4..6].parse().unwrap_or(1);
-    let day:   i64 = ts[6..8].parse().unwrap_or(1);
-    let hour:  i64 = ts[8..10].parse().unwrap_or(0);
-    let min:   i64 = ts[10..12].parse().unwrap_or(0);
-    let sec:   i64 = ts[12..14].parse().unwrap_or(0);
+    let day: i64 = ts[6..8].parse().unwrap_or(1);
+    let hour: i64 = ts[8..10].parse().unwrap_or(0);
+    let min: i64 = ts[10..12].parse().unwrap_or(0);
+    let sec: i64 = ts[12..14].parse().unwrap_or(0);
 
     // Days since Unix epoch (Jan 1 1970).  Approximate — ignores leap seconds.
     let days = days_from_civil(year, month, day);
@@ -1353,9 +1500,9 @@ fn timestamp_to_unix(ts: &str) -> i64 {
 fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     let y = if m <= 2 { y - 1 } else { y };
     let era = y.div_euclid(400);
-    let yoe = y - era * 400;                            // [0, 399]
+    let yoe = y - era * 400; // [0, 399]
     let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1; // [0, 365]
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;  // [0, 146096]
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
     era * 146097 + doe - 719468
 }
 
@@ -1366,8 +1513,12 @@ fn format_timestamp_display(ts: &str) -> String {
     }
     format!(
         "{}-{}-{} {}:{}:{}",
-        &ts[0..4], &ts[4..6], &ts[6..8],
-        &ts[8..10], &ts[10..12], &ts[12..14],
+        &ts[0..4],
+        &ts[4..6],
+        &ts[6..8],
+        &ts[8..10],
+        &ts[10..12],
+        &ts[12..14],
     )
 }
 
@@ -1378,7 +1529,10 @@ async fn wombat_js_handler() -> impl IntoResponse {
     (
         StatusCode::OK,
         [
-            (header::CONTENT_TYPE,  "application/javascript; charset=utf-8"),
+            (
+                header::CONTENT_TYPE,
+                "application/javascript; charset=utf-8",
+            ),
             (header::CACHE_CONTROL, "public, max-age=86400"),
         ],
         WOMBAT_JS,
@@ -1389,18 +1543,20 @@ async fn wombat_js_handler() -> impl IntoResponse {
 
 #[derive(Deserialize)]
 struct CdxParams {
-    url:        Option<String>,
-    from:       Option<String>,
-    to:         Option<String>,
+    url: Option<String>,
+    from: Option<String>,
+    to: Option<String>,
     #[serde(default = "default_cdx_limit")]
-    limit:      usize,
+    limit: usize,
     #[serde(rename = "matchType")]
     match_type: Option<String>,
     #[allow(dead_code)]
-    output:     Option<String>,
+    output: Option<String>,
 }
 
-fn default_cdx_limit() -> usize { 100 }
+fn default_cdx_limit() -> usize {
+    100
+}
 
 async fn cdx_handler(
     State(state): State<Arc<AppState>>,
@@ -1408,7 +1564,7 @@ async fn cdx_handler(
 ) -> Response {
     let raw_url = match &params.url {
         Some(u) => u.clone(),
-        None    => return (StatusCode::BAD_REQUEST, "url parameter required").into_response(),
+        None => return (StatusCode::BAD_REQUEST, "url parameter required").into_response(),
     };
 
     let limit = params.limit.min(10_000);
@@ -1416,7 +1572,9 @@ async fn cdx_handler(
     let (lookup_url, is_prefix) = if raw_url.ends_with('*') {
         (raw_url.trim_end_matches('*').to_owned(), true)
     } else {
-        let prefix = params.match_type.as_deref()
+        let prefix = params
+            .match_type
+            .as_deref()
             .map(|s| s.eq_ignore_ascii_case("prefix"))
             .unwrap_or(false);
         (raw_url.clone(), prefix)
@@ -1429,20 +1587,27 @@ async fn cdx_handler(
             format!("http://{lookup_url}")
         };
         match to_surt(&normalised) {
-            Ok(s)  => s,
-            Err(e) => return (StatusCode::BAD_REQUEST, format!("invalid url: {e}")).into_response(),
+            Ok(s) => s,
+            Err(e) => {
+                return (StatusCode::BAD_REQUEST, format!("invalid url: {e}")).into_response()
+            }
         }
     };
 
-    let from = params.from.as_deref().unwrap_or("00000000000000").to_owned();
-    let to   = params.to.as_deref().unwrap_or("99999999999999").to_owned();
+    let from = params
+        .from
+        .as_deref()
+        .unwrap_or("00000000000000")
+        .to_owned();
+    let to = params.to.as_deref().unwrap_or("99999999999999").to_owned();
 
     debug!(url = %raw_url, surt = %surt_lookup, prefix = is_prefix, "CDX lookup");
 
     let records = {
         let store = state.cdx.lock().unwrap();
         if is_prefix {
-            let domain_prefix = surt_lookup.find(')')
+            let domain_prefix = surt_lookup
+                .find(')')
                 .map(|pos| surt_lookup[..=pos].to_owned())
                 .unwrap_or_else(|| surt_lookup.clone());
             store.get_by_surt_prefix(&domain_prefix, limit)
@@ -1452,18 +1617,28 @@ async fn cdx_handler(
     };
 
     let records = match records {
-        Ok(r)  => r,
+        Ok(r) => r,
         Err(e) => {
             error!(err = %e, "CDX query failed");
             return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
         }
     };
 
-    let header = serde_json::json!(["urlkey","timestamp","original","mimetype","statuscode","digest","length"]);
+    let header = serde_json::json!([
+        "urlkey",
+        "timestamp",
+        "original",
+        "mimetype",
+        "statuscode",
+        "digest",
+        "length"
+    ]);
     let mut rows: Vec<serde_json::Value> = vec![header];
     for r in &records {
         rows.push(serde_json::json!([
-            r.surt_url, r.timestamp, r.original_url,
+            r.surt_url,
+            r.timestamp,
+            r.original_url,
             r.mime.as_deref().unwrap_or("-"),
             r.status.map(|s| s.to_string()).as_deref().unwrap_or("-"),
             r.digest.as_deref().unwrap_or("-"),
@@ -1492,7 +1667,7 @@ async fn cdx_handler(
 
 #[derive(Deserialize)]
 struct TimemapCdxParams {
-    url:   Option<String>,
+    url: Option<String>,
     limit: Option<i64>,
 }
 
@@ -1506,7 +1681,7 @@ async fn cdx_timemap_handler(
     };
 
     let surt = match to_surt(&raw_url) {
-        Ok(s)  => s,
+        Ok(s) => s,
         Err(e) => return (StatusCode::BAD_REQUEST, format!("invalid url: {e}")).into_response(),
     };
 
@@ -1518,7 +1693,7 @@ async fn cdx_timemap_handler(
         store.get_by_surt(&surt)
     };
     let all = match all {
-        Ok(r)  => r,
+        Ok(r) => r,
         Err(e) => {
             error!(err = %e, "CDX timemap query failed");
             return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
@@ -1540,18 +1715,21 @@ async fn cdx_timemap_handler(
     // directly to the raw digest it computed locally.
     let mut body = String::new();
     for r in &records {
-        let mime   = r.mime.as_deref().unwrap_or("-");
-        let status = r.status.map(|s| s.to_string()).unwrap_or_else(|| "-".to_owned());
+        let mime = r.mime.as_deref().unwrap_or("-");
+        let status = r
+            .status
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "-".to_owned());
         let raw_dig = r.digest.as_deref().unwrap_or("-");
-        let digest  = raw_dig.find(':')
+        let digest = raw_dig
+            .find(':')
             .map(|i| &raw_dig[i + 1..])
             .unwrap_or(raw_dig);
         let _ = std::fmt::write(
             &mut body,
             format_args!(
                 "{} {} {} {} {} {} {}\n",
-                r.surt_url, r.timestamp, r.original_url,
-                mime, status, digest, r.length,
+                r.surt_url, r.timestamp, r.original_url, mime, status, digest, r.length,
             ),
         );
     }
@@ -1596,9 +1774,9 @@ mod tests {
 
     #[test]
     fn pad_timestamp_fills_from_the_start_of_the_period() {
-        assert_eq!(pad_timestamp("2024"),           "20240101000000");
-        assert_eq!(pad_timestamp("202403"),         "20240301000000");
-        assert_eq!(pad_timestamp("20240315"),       "20240315000000");
+        assert_eq!(pad_timestamp("2024"), "20240101000000");
+        assert_eq!(pad_timestamp("202403"), "20240301000000");
+        assert_eq!(pad_timestamp("20240315"), "20240315000000");
         assert_eq!(pad_timestamp("20240315120000"), "20240315120000");
         // Over-long input is cut, not rejected — the CDX store validates it.
         assert_eq!(pad_timestamp("202403151200009"), "20240315120000");
@@ -1615,7 +1793,8 @@ mod tests {
         let gz = gz.finish().unwrap();
 
         let mut block = b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\
-                          Content-Encoding: gzip\r\n\r\n".to_vec();
+                          Content-Encoding: gzip\r\n\r\n"
+            .to_vec();
         block.extend_from_slice(format!("{:x}\r\n", gz.len()).as_bytes());
         block.extend_from_slice(&gz);
         block.extend_from_slice(b"\r\n0\r\n\r\n");
@@ -1629,8 +1808,15 @@ mod tests {
             .block_on(axum::body::to_bytes(resp.into_body(), usize::MAX))
             .unwrap();
         let body = String::from_utf8_lossy(&body);
-        assert!(body.contains("Example Domain"), "not decoded: {:?}", &body[..80.min(body.len())]);
-        assert!(!body.contains("\u{FFFD}"), "raw deflate bytes leaked into the page");
+        assert!(
+            body.contains("Example Domain"),
+            "not decoded: {:?}",
+            &body[..80.min(body.len())]
+        );
+        assert!(
+            !body.contains("\u{FFFD}"),
+            "raw deflate bytes leaked into the page"
+        );
         // ...and the toolbar still goes in, because it is recognised as HTML.
         assert!(body.contains("__tywb_bar"), "toolbar missing");
     }

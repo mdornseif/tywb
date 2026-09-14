@@ -101,7 +101,9 @@ impl OcrCache {
         for dir in [TEXT_DIR, QUEUE_DIR, FAILED_DIR] {
             fs::create_dir_all(root.join(dir))?;
         }
-        Ok(Self { root: root.to_owned() })
+        Ok(Self {
+            root: root.to_owned(),
+        })
     }
 
     pub fn root(&self) -> &Path {
@@ -154,6 +156,44 @@ impl OcrCache {
         atomic_write(&path, body.as_bytes())
     }
 
+    // ── the retained XHTML ────────────────────────────────────────────
+    //
+    // Tika's XHTML beside the flattened text, as `text/<xy>/<digest>.tywb.xhtml`.
+    // A sibling file rather than a new field in the text file, and deliberately
+    // *not* a format version bump: a bump would make every entry written so far
+    // a miss, and re-extracting a scanned corpus is the 17.5-hour bill this
+    // cache exists to avoid paying twice. An entry with text and no XHTML is
+    // simply an entry cached before retention was switched on — still a hit for
+    // text, and it yields no links until it is re-extracted for some other
+    // reason. Nothing is invalidated, nothing re-runs.
+
+    /// Store Tika's XHTML for `digest`. Off by default at the call site
+    /// (`ocr_cache.keep_xhtml`): an OCR'd volume's markup runs to tens of
+    /// megabytes, so retaining it is a disk decision, not a free default.
+    pub fn put_xhtml(&self, digest: &str, xhtml: &str) -> io::Result<()> {
+        let path = self
+            .xhtml_path(digest)
+            .ok_or_else(|| invalid_digest(digest))?;
+        atomic_write(&path, xhtml.as_bytes())
+    }
+
+    /// The retained XHTML for `digest`, if there is any.
+    ///
+    /// `None` is the normal answer for an entry cached before retention was
+    /// switched on, and for every failure — an unreadable file is a document
+    /// with no recoverable links, which costs nothing but the links.
+    pub fn get_xhtml(&self, digest: &str) -> Option<String> {
+        let path = self.xhtml_path(digest)?;
+        match fs::read(&path) {
+            Ok(bytes) => Some(String::from_utf8_lossy(&bytes).into_owned()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+            Err(e) => {
+                debug!(path = %path.display(), err = %e, "cached XHTML unreadable — treating as absent");
+                None
+            }
+        }
+    }
+
     // ── the queue ──────────────────────────────────────────────────────────
 
     /// Append a job. A job for the same digest already in the queue is
@@ -163,8 +203,8 @@ impl OcrCache {
         let path = self
             .queue_path(&job.digest)
             .ok_or_else(|| invalid_digest(&job.digest))?;
-        let body = serde_json::to_vec(job)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let body =
+            serde_json::to_vec(job).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         atomic_write(&path, &body)
     }
 
@@ -188,8 +228,9 @@ impl OcrCache {
             match fs::read_to_string(&path)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
                 .and_then(|raw| {
-                    serde_json::from_str(&raw)
-                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("bad job JSON: {e}")))
+                    serde_json::from_str(&raw).map_err(|e| {
+                        io::Error::new(io::ErrorKind::InvalidData, format!("bad job JSON: {e}"))
+                    })
                 }) {
                 Ok(job) => out.push((path, job)),
                 Err(e) => {
@@ -234,8 +275,8 @@ impl OcrCache {
                "extraction failed — job rescheduled");
         let mut job = job.clone();
         job.attempts = attempts;
-        let body = serde_json::to_vec(&job)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e));
+        let body =
+            serde_json::to_vec(&job).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e));
         if let Err(e) = body.and_then(|b| atomic_write(path, &b)) {
             warn!(path = %path.display(), err = %e, "could not reschedule the job");
         }
@@ -266,7 +307,24 @@ impl OcrCache {
     /// could carry a path separator is rejected outright).
     fn text_path(&self, digest: &str) -> Option<PathBuf> {
         let slug = file_slug(digest)?;
-        Some(self.root.join(TEXT_DIR).join(shard_dir(digest)).join(format!("{slug}.tywb.txt")))
+        Some(
+            self.root
+                .join(TEXT_DIR)
+                .join(shard_dir(digest))
+                .join(format!("{slug}.tywb.txt")),
+        )
+    }
+
+    /// `text/<xy>/<digest>.tywb.xhtml`, same sharding and same rejection rule
+    /// as [`text_path`](Self::text_path).
+    fn xhtml_path(&self, digest: &str) -> Option<PathBuf> {
+        let slug = file_slug(digest)?;
+        Some(
+            self.root
+                .join(TEXT_DIR)
+                .join(shard_dir(digest))
+                .join(format!("{slug}.tywb.xhtml")),
+        )
     }
 
     /// `queue/<digest>.job`, same rejection rule.
@@ -291,9 +349,9 @@ fn file_slug(digest: &str) -> Option<String> {
     if digest.is_empty() || digest.contains("..") {
         return None;
     }
-    let ok = digest.bytes().all(|b| {
-        b.is_ascii_alphanumeric() || matches!(b, b':' | b'-' | b'+' | b'_' | b'.')
-    });
+    let ok = digest
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b':' | b'-' | b'+' | b'_' | b'.'));
     if !ok {
         return None;
     }
@@ -412,10 +470,14 @@ mod tests {
     #[test]
     fn a_cached_text_round_trips() {
         let (_dir, c) = cache();
-        c.put("sha1:ABC", "Band 30", "Seite eins\u{000c}Seite zwei").unwrap();
+        c.put("sha1:ABC", "Band 30", "Seite eins\u{000c}Seite zwei")
+            .unwrap();
         let (title, text) = c.get("sha1:ABC").unwrap();
         assert_eq!(title, "Band 30");
-        assert_eq!(text, "Seite eins\u{000c}Seite zwei", "page markers must survive");
+        assert_eq!(
+            text, "Seite eins\u{000c}Seite zwei",
+            "page markers must survive"
+        );
     }
 
     #[test]
@@ -458,9 +520,64 @@ mod tests {
     #[test]
     fn junk_is_a_miss_not_a_crash() {
         let (_dir, c) = cache();
-        for body in ["", "no header at all", "\n", "tywb-text/2 nothing=here\ntext"] {
+        for body in [
+            "",
+            "no header at all",
+            "\n",
+            "tywb-text/2 nothing=here\ntext",
+        ] {
             assert!(parse_cached_text(body, "sha1:X").is_none());
         }
+    }
+
+    // ── the retained XHTML ───────────────────────────────────────────────
+
+    #[test]
+    fn retained_xhtml_round_trips_beside_the_text() {
+        let (_dir, c) = cache();
+        c.put("sha1:ABC", "Band 30", "Seite eins\u{000c}Seite zwei")
+            .unwrap();
+        c.put_xhtml(
+            "sha1:ABC",
+            "<html><body><a href=\"band31.pdf\">nächster Band</a></body></html>",
+        )
+        .unwrap();
+
+        // Retention leaves the text entry exactly as it was — same format, same
+        // hit, nothing re-extracted.
+        let (title, body) = c.get("sha1:ABC").unwrap();
+        assert_eq!(title, "Band 30");
+        assert!(body.contains("Seite zwei"));
+        assert_eq!(
+            c.get_xhtml("sha1:ABC").unwrap(),
+            "<html><body><a href=\"band31.pdf\">nächster Band</a></body></html>",
+        );
+    }
+
+    #[test]
+    fn an_entry_from_before_retention_is_still_a_hit_with_no_markup() {
+        // The case that must not invalidate anything. There is no version bump,
+        // so an entry written yesterday is still a hit today — it simply has no
+        // links to give. Re-extracting a scanned corpus to add markup is exactly
+        // the bill this cache exists to avoid paying twice.
+        let (_dir, c) = cache();
+        c.put("sha1:ALT", "Alter Text", "Seite eins").unwrap();
+        assert!(c.get("sha1:ALT").is_some(), "still a hit");
+        assert!(c.get_xhtml("sha1:ALT").is_none(), "…with no markup");
+    }
+
+    #[test]
+    fn xhtml_follows_the_text_stores_path_rules() {
+        // Same sharding, and the same rejection of a digest that could escape
+        // the cache directory — the WARC header is archive-controlled input.
+        let (_dir, c) = cache();
+        assert!(c.put_xhtml("../../etc/passwd", "x").is_err());
+        assert!(c.get_xhtml("../../etc/passwd").is_none());
+
+        c.put_xhtml("sha1:SHARD", "<html/>").unwrap();
+        let p = c.xhtml_path("sha1:SHARD").unwrap();
+        assert!(p.to_string_lossy().contains("/text/"), "{p:?}");
+        assert!(p.to_string_lossy().ends_with(".tywb.xhtml"), "{p:?}");
     }
 
     // ── file names from digests ─────────────────────────────────────────────
@@ -470,7 +587,11 @@ mod tests {
         assert_eq!(file_slug("sha1:ABC123"), Some("sha1_ABC123".to_owned()));
         assert_eq!(file_slug(""), None);
         assert_eq!(file_slug("../../etc/passwd"), None);
-        assert_eq!(file_slug("sha1:with space"), None, "a space cannot be a path");
+        assert_eq!(
+            file_slug("sha1:with space"),
+            None,
+            "a space cannot be a path"
+        );
         assert_eq!(file_slug("sha1:a/b"), None);
         assert_eq!(file_slug("sha256:XYZ"), Some("sha256_XYZ".to_owned()));
     }
@@ -480,7 +601,10 @@ mod tests {
         assert_eq!(shard_dir("sha1:ABC123"), "ab");
         assert_eq!(shard_dir("sha256:XYZ"), "xy");
         assert_eq!(shard_dir("lonely"), "lo");
-        assert!(!shard_dir("x").is_empty(), "a one-char value still gets a dir");
+        assert!(
+            !shard_dir("x").is_empty(),
+            "a one-char value still gets a dir"
+        );
     }
 
     #[test]
@@ -505,7 +629,11 @@ mod tests {
         c.enqueue(&again).unwrap();
 
         let jobs = c.queued_jobs();
-        assert_eq!(jobs.len(), 1, "one document, one job — whatever record it came from");
+        assert_eq!(
+            jobs.len(),
+            1,
+            "one document, one job — whatever record it came from"
+        );
         let parsed = &jobs[0].1;
         assert_eq!(parsed.digest, "sha1:DUP");
         assert_eq!(parsed.s3_key, again.s3_key, "the latest location wins");
@@ -531,7 +659,10 @@ mod tests {
         fs::write(&path, "{ not json").unwrap();
         assert!(c.queued_jobs().is_empty());
         let parked = c.root.join(FAILED_DIR).join("sha1_BROKEN.job");
-        assert!(parked.exists(), "the entry stays visible instead of vanishing");
+        assert!(
+            parked.exists(),
+            "the entry stays visible instead of vanishing"
+        );
     }
 
     #[test]
@@ -541,11 +672,17 @@ mod tests {
         let (path, parsed) = c.queued_jobs()[0].clone();
         assert_eq!(parsed.attempts, 0);
 
-        assert_eq!(c.retry(&path, &parsed, "tika down", 3), JobRetry::Rescheduled);
+        assert_eq!(
+            c.retry(&path, &parsed, "tika down", 3),
+            JobRetry::Rescheduled
+        );
         let (path, parsed) = c.queued_jobs()[0].clone();
         assert_eq!(parsed.attempts, 1, "the counter survives the round trip");
 
-        assert_eq!(c.retry(&path, &parsed, "tika down", 3), JobRetry::Rescheduled);
+        assert_eq!(
+            c.retry(&path, &parsed, "tika down", 3),
+            JobRetry::Rescheduled
+        );
         let (path, parsed) = c.queued_jobs()[0].clone();
         assert_eq!(parsed.attempts, 2);
 

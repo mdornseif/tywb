@@ -6,11 +6,11 @@
 
 use std::path::Path;
 use tantivy::{
-    Index, IndexWriter, IndexReader, ReloadPolicy, TantivyDocument, Term,
-    schema::{Schema, Field, IndexRecordOption, NumericOptions, STRING, TEXT, STORED},
+    collector::TopDocs,
     directory::MmapDirectory,
     query::{AllQuery, BooleanQuery, Occur, Query, QueryParser, TermQuery},
-    collector::TopDocs,
+    schema::{Field, IndexRecordOption, NumericOptions, Schema, STORED, STRING, TEXT},
+    Index, IndexReader, IndexWriter, ReloadPolicy, TantivyDocument, Term,
 };
 use thiserror::Error;
 use tracing::warn;
@@ -27,9 +27,11 @@ pub enum SearchError {
     Io(#[from] std::io::Error),
     #[error("schema field not found: {0}")]
     FieldNotFound(String),
-    #[error("the index at {path} was written with an incompatible schema: {reason}.\n\
+    #[error(
+        "the index at {path} was written with an incompatible schema: {reason}.\n\
              It cannot be written to by this build — move the directory aside and \
-             re-run `tywb index` to rebuild it from S3.")]
+             re-run `tywb index` to rebuild it from S3."
+    )]
     SchemaMismatch { path: String, reason: String },
 }
 
@@ -98,21 +100,30 @@ struct Fields {
 fn build_schema() -> (Schema, Fields) {
     let mut b = Schema::builder();
 
-    let url       = b.add_text_field("url",       STRING | STORED);
+    let url = b.add_text_field("url", STRING | STORED);
     // Timestamp is stored only; range filtering is done post-retrieval.
-    let timestamp = b.add_u64_field("timestamp",  NumericOptions::default().set_stored());
-    let title     = b.add_text_field("title",     TEXT | STORED);
+    let timestamp = b.add_u64_field("timestamp", NumericOptions::default().set_stored());
+    let title = b.add_text_field("title", TEXT | STORED);
     // Body is indexed but not stored to save space.
-    let body      = b.add_text_field("body",      TEXT);
-    let mime      = b.add_text_field("mime",      STRING | STORED);
-    let s3_key    = b.add_text_field("s3_key",    STRING | STORED);
-    let offset    = b.add_u64_field("offset",     NumericOptions::default().set_stored());
-    let length    = b.add_u64_field("length",     NumericOptions::default().set_stored());
+    let body = b.add_text_field("body", TEXT);
+    let mime = b.add_text_field("mime", STRING | STORED);
+    let s3_key = b.add_text_field("s3_key", STRING | STORED);
+    let offset = b.add_u64_field("offset", NumericOptions::default().set_stored());
+    let length = b.add_u64_field("length", NumericOptions::default().set_stored());
     let collection = b.add_text_field("collection", STRING | STORED);
 
     let schema = b.build();
-    let fields = Fields { url, timestamp, title, body, mime, s3_key, offset, length,
-                          collection: Some(collection) };
+    let fields = Fields {
+        url,
+        timestamp,
+        title,
+        body,
+        mime,
+        s3_key,
+        offset,
+        length,
+        collection: Some(collection),
+    };
     (schema, fields)
 }
 
@@ -124,14 +135,14 @@ fn fields_from_index_schema(schema: &Schema) -> Result<Fields> {
             .map_err(|_| SearchError::FieldNotFound(name.to_owned()))
     };
     Ok(Fields {
-        url:       f("url")?,
+        url: f("url")?,
         timestamp: f("timestamp")?,
-        title:     f("title")?,
-        body:      f("body")?,
-        mime:      f("mime")?,
-        s3_key:    f("s3_key")?,
-        offset:    f("offset")?,
-        length:    f("length")?,
+        title: f("title")?,
+        body: f("body")?,
+        mime: f("mime")?,
+        s3_key: f("s3_key")?,
+        offset: f("offset")?,
+        length: f("length")?,
         // Optional: indexes built before collections lack this field.
         collection: schema.get_field("collection").ok(),
     })
@@ -185,7 +196,11 @@ fn schema_fields(schema: &Schema) -> Result<Vec<serde_json::Value>> {
 }
 
 fn field_name(entry: &serde_json::Value) -> String {
-    entry.get("name").and_then(|n| n.as_str()).unwrap_or("?").to_owned()
+    entry
+        .get("name")
+        .and_then(|n| n.as_str())
+        .unwrap_or("?")
+        .to_owned()
 }
 
 fn schema_compat(stored: &Schema, target: &Schema) -> Result<SchemaCompat> {
@@ -212,7 +227,9 @@ fn schema_compat(stored: &Schema, target: &Schema) -> Result<SchemaCompat> {
             )));
         }
     }
-    Ok(SchemaCompat::Behind(new[old.len()..].iter().map(field_name).collect()))
+    Ok(SchemaCompat::Behind(
+        new[old.len()..].iter().map(field_name).collect(),
+    ))
 }
 
 // ── Shared search implementation ──────────────────────────────────────────────
@@ -244,7 +261,13 @@ fn search_impl(
     fields: &Fields,
     q: SearchQuery<'_>,
 ) -> Result<Vec<SearchHit>> {
-    let SearchQuery { terms, collection, limit, from_ts, to_ts } = q;
+    let SearchQuery {
+        terms,
+        collection,
+        limit,
+        from_ts,
+        to_ts,
+    } = q;
     let searcher = reader.searcher();
 
     let terms = terms.trim();
@@ -266,7 +289,10 @@ fn search_impl(
             let term = Term::from_field_text(fields.collection.expect("checked above"), name);
             Box::new(BooleanQuery::new(vec![
                 (Occur::Must, text_query),
-                (Occur::Must, Box::new(TermQuery::new(term, IndexRecordOption::Basic))),
+                (
+                    Occur::Must,
+                    Box::new(TermQuery::new(term, IndexRecordOption::Basic)),
+                ),
             ]))
         }
     };
@@ -300,13 +326,13 @@ fn search_impl(
         }
 
         hits.push(SearchHit {
-            url:       get_str(&doc, fields.url).unwrap_or_default(),
+            url: get_str(&doc, fields.url).unwrap_or_default(),
             timestamp: format!("{ts:014}"),
-            title:     get_str(&doc, fields.title).unwrap_or_default(),
-            mime:      get_str(&doc, fields.mime),
-            s3_key:    get_str(&doc, fields.s3_key).unwrap_or_default(),
-            offset:    get_u64(&doc, fields.offset).unwrap_or(0),
-            length:    get_u64(&doc, fields.length).unwrap_or(0),
+            title: get_str(&doc, fields.title).unwrap_or_default(),
+            mime: get_str(&doc, fields.mime),
+            s3_key: get_str(&doc, fields.s3_key).unwrap_or_default(),
+            offset: get_u64(&doc, fields.offset).unwrap_or(0),
+            length: get_u64(&doc, fields.length).unwrap_or(0),
             score,
             collection: fields.collection.and_then(|f| get_str(&doc, f)),
         });
@@ -349,8 +375,7 @@ impl SearchIndex {
         std::fs::create_dir_all(path)?;
 
         let (schema, _) = build_schema();
-        let dir = MmapDirectory::open(path)
-            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        let dir = MmapDirectory::open(path).map_err(|e| std::io::Error::other(e.to_string()))?;
 
         let exists = Index::exists(&dir).map_err(|e| std::io::Error::other(e.to_string()))?;
         let index = if exists {
@@ -383,7 +408,12 @@ impl SearchIndex {
             .reload_policy(ReloadPolicy::OnCommitWithDelay)
             .try_into()?;
 
-        Ok(Self { index, writer, reader, fields })
+        Ok(Self {
+            index,
+            writer,
+            reader,
+            fields,
+        })
     }
 
     // ── Writes ────────────────────────────────────────────────────────────────
@@ -391,16 +421,16 @@ impl SearchIndex {
     /// Queue a document for indexing.  Not visible until [`commit`] is called.
     pub fn add_document(&mut self, doc: &IndexDoc) -> Result<()> {
         let mut d = TantivyDocument::default();
-        d.add_text(self.fields.url,       &doc.url);
-        d.add_u64( self.fields.timestamp, doc.timestamp);
-        d.add_text(self.fields.title,     &doc.title);
-        d.add_text(self.fields.body,      &doc.body);
+        d.add_text(self.fields.url, &doc.url);
+        d.add_u64(self.fields.timestamp, doc.timestamp);
+        d.add_text(self.fields.title, &doc.title);
+        d.add_text(self.fields.body, &doc.body);
         if let Some(m) = &doc.mime {
             d.add_text(self.fields.mime, m);
         }
         d.add_text(self.fields.s3_key, &doc.s3_key);
-        d.add_u64( self.fields.offset, doc.offset);
-        d.add_u64( self.fields.length, doc.length);
+        d.add_u64(self.fields.offset, doc.offset);
+        d.add_u64(self.fields.length, doc.length);
         if let Some(f) = self.fields.collection {
             d.add_text(f, &doc.collection);
         }
@@ -475,15 +505,19 @@ pub struct SearchReader {
 impl SearchReader {
     /// Open an existing index at `path` for reading.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let dir = MmapDirectory::open(path.as_ref())
-            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        let dir =
+            MmapDirectory::open(path.as_ref()).map_err(|e| std::io::Error::other(e.to_string()))?;
         let index = Index::open(dir)?;
         let fields = fields_from_index_schema(&index.schema())?;
         let reader = index
             .reader_builder()
             .reload_policy(ReloadPolicy::OnCommitWithDelay)
             .try_into()?;
-        Ok(Self { index, reader, fields })
+        Ok(Self {
+            index,
+            reader,
+            fields,
+        })
     }
 
     /// Fulltext search (same semantics as [`SearchIndex::search`]).
@@ -528,14 +562,14 @@ mod tests {
 
     fn doc(url: &str, title: &str, body: &str, ts: u64) -> IndexDoc {
         IndexDoc {
-            url:       url.to_owned(),
+            url: url.to_owned(),
             timestamp: ts,
-            title:     title.to_owned(),
-            body:      body.to_owned(),
-            mime:      Some("text/html".to_owned()),
-            s3_key:    "test/archive.warc.gz".to_owned(),
-            offset:    1024,
-            length:    512,
+            title: title.to_owned(),
+            body: body.to_owned(),
+            mime: Some("text/html".to_owned()),
+            s3_key: "test/archive.warc.gz".to_owned(),
+            offset: 1024,
+            length: 512,
             collection: "warc".to_owned(),
         }
     }
@@ -544,14 +578,14 @@ mod tests {
     /// replace semantics ([`SearchIndex::delete_s3_key`]).
     fn doc_in(url: &str, s3_key: &str) -> IndexDoc {
         IndexDoc {
-            url:       url.to_owned(),
+            url: url.to_owned(),
             timestamp: 20240315120000,
-            title:     "t".to_owned(),
-            body:      "some indexable body text".to_owned(),
-            mime:      Some("text/html".to_owned()),
-            s3_key:    s3_key.to_owned(),
-            offset:    0,
-            length:    1,
+            title: "t".to_owned(),
+            body: "some indexable body text".to_owned(),
+            mime: Some("text/html".to_owned()),
+            s3_key: s3_key.to_owned(),
+            offset: 0,
+            length: 1,
             collection: "warc".to_owned(),
         }
     }
@@ -595,7 +629,15 @@ mod tests {
         .unwrap();
         idx.commit().unwrap();
 
-        let hits = idx.search(SearchQuery { terms: "illustrative", limit: 10, from_ts: None, to_ts: None, ..Default::default() }).unwrap();
+        let hits = idx
+            .search(SearchQuery {
+                terms: "illustrative",
+                limit: 10,
+                from_ts: None,
+                to_ts: None,
+                ..Default::default()
+            })
+            .unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].url, "https://example.com/");
     }
@@ -613,7 +655,15 @@ mod tests {
         .unwrap();
         idx.commit().unwrap();
 
-        let hits = idx.search(SearchQuery { terms: "UniqueXYZTitle", limit: 10, from_ts: None, to_ts: None, ..Default::default() }).unwrap();
+        let hits = idx
+            .search(SearchQuery {
+                terms: "UniqueXYZTitle",
+                limit: 10,
+                from_ts: None,
+                to_ts: None,
+                ..Default::default()
+            })
+            .unwrap();
         assert_eq!(hits.len(), 1);
     }
 
@@ -621,11 +671,24 @@ mod tests {
     fn search_empty_for_no_match() {
         let dir = tempdir().unwrap();
         let mut idx = SearchIndex::open_or_create(dir.path()).unwrap();
-        idx.add_document(&doc("https://a.com/", "Title", "content here", 20240101120000))
-            .unwrap();
+        idx.add_document(&doc(
+            "https://a.com/",
+            "Title",
+            "content here",
+            20240101120000,
+        ))
+        .unwrap();
         idx.commit().unwrap();
 
-        let hits = idx.search(SearchQuery { terms: "xyzzy_nonexistent_term", limit: 10, from_ts: None, to_ts: None, ..Default::default() }).unwrap();
+        let hits = idx
+            .search(SearchQuery {
+                terms: "xyzzy_nonexistent_term",
+                limit: 10,
+                from_ts: None,
+                to_ts: None,
+                ..Default::default()
+            })
+            .unwrap();
         assert!(hits.is_empty());
     }
 
@@ -644,7 +707,15 @@ mod tests {
         }
         idx.commit().unwrap();
 
-        let hits = idx.search(SearchQuery { terms: "rust", limit: 3, from_ts: None, to_ts: None, ..Default::default() }).unwrap();
+        let hits = idx
+            .search(SearchQuery {
+                terms: "rust",
+                limit: 3,
+                from_ts: None,
+                to_ts: None,
+                ..Default::default()
+            })
+            .unwrap();
         assert!(hits.len() <= 3);
     }
 
@@ -662,7 +733,15 @@ mod tests {
             .unwrap();
         idx.commit().unwrap();
 
-        let hits = idx.search(SearchQuery { terms: "rust", limit: 10, from_ts: Some(20240601000000), to_ts: None, ..Default::default() }).unwrap();
+        let hits = idx
+            .search(SearchQuery {
+                terms: "rust",
+                limit: 10,
+                from_ts: Some(20240601000000),
+                to_ts: None,
+                ..Default::default()
+            })
+            .unwrap();
         assert_eq!(hits.len(), 2);
         for h in &hits {
             let ts: u64 = h.timestamp.parse().unwrap();
@@ -682,7 +761,15 @@ mod tests {
             .unwrap();
         idx.commit().unwrap();
 
-        let hits = idx.search(SearchQuery { terms: "rust", limit: 10, from_ts: None, to_ts: Some(20240601235959), ..Default::default() }).unwrap();
+        let hits = idx
+            .search(SearchQuery {
+                terms: "rust",
+                limit: 10,
+                from_ts: None,
+                to_ts: Some(20240601235959),
+                ..Default::default()
+            })
+            .unwrap();
         assert_eq!(hits.len(), 2);
     }
 
@@ -699,7 +786,13 @@ mod tests {
         idx.commit().unwrap();
 
         let hits = idx
-            .search(SearchQuery { terms: "rust", limit: 10, from_ts: Some(20240601000000), to_ts: Some(20240701000000), ..Default::default() })
+            .search(SearchQuery {
+                terms: "rust",
+                limit: 10,
+                from_ts: Some(20240601000000),
+                to_ts: Some(20240701000000),
+                ..Default::default()
+            })
             .unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].url, "https://b.com/");
@@ -712,13 +805,26 @@ mod tests {
         let dir = tempdir().unwrap();
         {
             let mut idx = SearchIndex::open_or_create(dir.path()).unwrap();
-            idx.add_document(&doc("https://persist.com/", "Persisted", "content here", 20240101120000))
-                .unwrap();
+            idx.add_document(&doc(
+                "https://persist.com/",
+                "Persisted",
+                "content here",
+                20240101120000,
+            ))
+            .unwrap();
             idx.commit().unwrap();
         }
         let idx = SearchIndex::open_or_create(dir.path()).unwrap();
         assert_eq!(idx.num_docs(), 1);
-        let hits = idx.search(SearchQuery { terms: "content", limit: 10, from_ts: None, to_ts: None, ..Default::default() }).unwrap();
+        let hits = idx
+            .search(SearchQuery {
+                terms: "content",
+                limit: 10,
+                from_ts: None,
+                to_ts: None,
+                ..Default::default()
+            })
+            .unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].url, "https://persist.com/");
     }
@@ -728,13 +834,26 @@ mod tests {
         let dir = tempdir().unwrap();
         {
             let mut idx = SearchIndex::open_or_create(dir.path()).unwrap();
-            idx.add_document(&doc("https://reader-test.com/", "Reader Test", "content here", 20240101120000))
-                .unwrap();
+            idx.add_document(&doc(
+                "https://reader-test.com/",
+                "Reader Test",
+                "content here",
+                20240101120000,
+            ))
+            .unwrap();
             idx.commit().unwrap();
         }
         let reader = SearchReader::open(dir.path()).unwrap();
         assert_eq!(reader.num_docs(), 1);
-        let hits = reader.search(SearchQuery { terms: "content", limit: 10, from_ts: None, to_ts: None, ..Default::default() }).unwrap();
+        let hits = reader
+            .search(SearchQuery {
+                terms: "content",
+                limit: 10,
+                from_ts: None,
+                to_ts: None,
+                ..Default::default()
+            })
+            .unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].url, "https://reader-test.com/");
     }
@@ -746,20 +865,28 @@ mod tests {
         let dir = tempdir().unwrap();
         let mut idx = SearchIndex::open_or_create(dir.path()).unwrap();
         idx.add_document(&IndexDoc {
-            url:       "https://full.com/page".to_owned(),
+            url: "https://full.com/page".to_owned(),
             timestamp: 20240315120000,
-            title:     "Full Page".to_owned(),
-            body:      "complete body text".to_owned(),
-            mime:      Some("text/html".to_owned()),
-            s3_key:    "crawls/full.warc.gz".to_owned(),
-            offset:    2048,
-            length:    4096,
+            title: "Full Page".to_owned(),
+            body: "complete body text".to_owned(),
+            mime: Some("text/html".to_owned()),
+            s3_key: "crawls/full.warc.gz".to_owned(),
+            offset: 2048,
+            length: 4096,
             collection: "warc".to_owned(),
         })
         .unwrap();
         idx.commit().unwrap();
 
-        let hits = idx.search(SearchQuery { terms: "complete", limit: 1, from_ts: None, to_ts: None, ..Default::default() }).unwrap();
+        let hits = idx
+            .search(SearchQuery {
+                terms: "complete",
+                limit: 1,
+                from_ts: None,
+                to_ts: None,
+                ..Default::default()
+            })
+            .unwrap();
         assert_eq!(hits.len(), 1);
         let h = &hits[0];
         assert_eq!(h.url, "https://full.com/page");
@@ -780,7 +907,15 @@ mod tests {
             .unwrap();
         idx.commit().unwrap();
 
-        let hits = idx.search(SearchQuery { terms: "keyword", limit: 1, from_ts: None, to_ts: None, ..Default::default() }).unwrap();
+        let hits = idx
+            .search(SearchQuery {
+                terms: "keyword",
+                limit: 1,
+                from_ts: None,
+                to_ts: None,
+                ..Default::default()
+            })
+            .unwrap();
         assert_eq!(hits[0].timestamp, "20240101090501");
     }
 
@@ -818,20 +953,29 @@ mod tests {
         let dir = tempdir().unwrap();
         let idx = lopsided_index(dir.path());
 
-        let unfiltered = idx.search(SearchQuery { terms: "obstbau", limit: 10, ..Default::default() }).unwrap();
+        let unfiltered = idx
+            .search(SearchQuery {
+                terms: "obstbau",
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap();
         assert_eq!(unfiltered.len(), 10);
         assert!(
-            unfiltered.iter().all(|h| h.collection.as_deref() != Some("monatshefte")),
+            unfiltered
+                .iter()
+                .all(|h| h.collection.as_deref() != Some("monatshefte")),
             "the book does not make the first page — that is why filtering afterwards fails",
         );
 
-        let filtered = idx.search(SearchQuery {
-            terms: "obstbau",
-            collection: Some("monatshefte"),
-            limit: 10,
-            ..Default::default()
-        })
-        .unwrap();
+        let filtered = idx
+            .search(SearchQuery {
+                terms: "obstbau",
+                collection: Some("monatshefte"),
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap();
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].collection.as_deref(), Some("monatshefte"));
     }
@@ -844,18 +988,25 @@ mod tests {
         let dir = tempdir().unwrap();
         let idx = lopsided_index(dir.path());
 
-        let hits = idx.search(SearchQuery {
-            terms: "   ",
-            collection: Some("monatshefte"),
-            limit: 50,
-            ..Default::default()
-        })
-        .unwrap();
+        let hits = idx
+            .search(SearchQuery {
+                terms: "   ",
+                collection: Some("monatshefte"),
+                limit: 50,
+                ..Default::default()
+            })
+            .unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].title, "Pomologische Monatshefte Band 1");
 
         // Without a collection, an empty query is still "everything".
-        let all = idx.search(SearchQuery { terms: "", limit: 500, ..Default::default() }).unwrap();
+        let all = idx
+            .search(SearchQuery {
+                terms: "",
+                limit: 500,
+                ..Default::default()
+            })
+            .unwrap();
         assert_eq!(all.len(), 301);
     }
 
@@ -863,13 +1014,14 @@ mod tests {
     fn filtering_an_unknown_collection_finds_nothing() {
         let dir = tempdir().unwrap();
         let idx = lopsided_index(dir.path());
-        let hits = idx.search(SearchQuery {
-            terms: "obstbau",
-            collection: Some("does-not-exist"),
-            limit: 10,
-            ..Default::default()
-        })
-        .unwrap();
+        let hits = idx
+            .search(SearchQuery {
+                terms: "obstbau",
+                collection: Some("does-not-exist"),
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap();
         assert!(hits.is_empty());
     }
 
@@ -881,15 +1033,25 @@ mod tests {
         write_legacy_index(dir.path(), &["https://old.com/1"]);
         let idx = SearchIndex::open_or_create(dir.path()).unwrap();
 
-        assert_eq!(idx.search(SearchQuery { terms: "legacy", limit: 10, ..Default::default() }).unwrap().len(), 1);
-        assert!(idx.search(SearchQuery {
-            terms: "legacy",
-            collection: Some("warc"),
-            limit: 10,
-            ..Default::default()
-        })
-        .unwrap()
-        .is_empty());
+        assert_eq!(
+            idx.search(SearchQuery {
+                terms: "legacy",
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap()
+            .len(),
+            1
+        );
+        assert!(idx
+            .search(SearchQuery {
+                terms: "legacy",
+                collection: Some("warc"),
+                limit: 10,
+                ..Default::default()
+            })
+            .unwrap()
+            .is_empty());
     }
 
     // ── Schema compatibility ──────────────────────────────────────────────────
@@ -899,14 +1061,14 @@ mod tests {
     /// as one field behind, not as one with changed options.
     fn legacy_schema() -> Schema {
         let mut b = Schema::builder();
-        b.add_text_field("url",       STRING | STORED);
-        b.add_u64_field( "timestamp", NumericOptions::default().set_stored());
-        b.add_text_field("title",     TEXT | STORED);
-        b.add_text_field("body",      TEXT);
-        b.add_text_field("mime",      STRING | STORED);
-        b.add_text_field("s3_key",    STRING | STORED);
-        b.add_u64_field( "offset",    NumericOptions::default().set_stored());
-        b.add_u64_field( "length",    NumericOptions::default().set_stored());
+        b.add_text_field("url", STRING | STORED);
+        b.add_u64_field("timestamp", NumericOptions::default().set_stored());
+        b.add_text_field("title", TEXT | STORED);
+        b.add_text_field("body", TEXT);
+        b.add_text_field("mime", STRING | STORED);
+        b.add_text_field("s3_key", STRING | STORED);
+        b.add_u64_field("offset", NumericOptions::default().set_stored());
+        b.add_u64_field("length", NumericOptions::default().set_stored());
         b.build()
     }
 
@@ -921,13 +1083,13 @@ mod tests {
         for url in urls {
             let mut d = TantivyDocument::default();
             d.add_text(f("url"), url);
-            d.add_u64( f("timestamp"), 20240101120000);
+            d.add_u64(f("timestamp"), 20240101120000);
             d.add_text(f("title"), "Legacy");
             d.add_text(f("body"), "legacy body text");
             d.add_text(f("mime"), "text/html");
             d.add_text(f("s3_key"), "old.warc.gz");
-            d.add_u64( f("offset"), 0);
-            d.add_u64( f("length"), 1);
+            d.add_u64(f("offset"), 0);
+            d.add_u64(f("length"), 1);
             w.add_document(d).unwrap();
         }
         w.commit().unwrap();
@@ -936,7 +1098,10 @@ mod tests {
     #[test]
     fn schema_compat_identical_for_same_schema() {
         let (schema, _) = build_schema();
-        assert_eq!(schema_compat(&schema, &schema).unwrap(), SchemaCompat::Identical);
+        assert_eq!(
+            schema_compat(&schema, &schema).unwrap(),
+            SchemaCompat::Identical
+        );
     }
 
     #[test]
@@ -962,13 +1127,13 @@ mod tests {
         let mut b = Schema::builder();
         // `url` indexed differently — same names, different meaning.
         b.add_text_field("url", TEXT | STORED);
-        b.add_u64_field( "timestamp", NumericOptions::default().set_stored());
-        b.add_text_field("title",  TEXT | STORED);
-        b.add_text_field("body",   TEXT);
-        b.add_text_field("mime",   STRING | STORED);
+        b.add_u64_field("timestamp", NumericOptions::default().set_stored());
+        b.add_text_field("title", TEXT | STORED);
+        b.add_text_field("body", TEXT);
+        b.add_text_field("mime", STRING | STORED);
         b.add_text_field("s3_key", STRING | STORED);
-        b.add_u64_field( "offset", NumericOptions::default().set_stored());
-        b.add_u64_field( "length", NumericOptions::default().set_stored());
+        b.add_u64_field("offset", NumericOptions::default().set_stored());
+        b.add_u64_field("length", NumericOptions::default().set_stored());
         let diff = schema_compat(&b.build(), &current).unwrap();
         assert!(matches!(diff, SchemaCompat::Incompatible(r) if r.contains("field 0 differs")));
     }
@@ -983,7 +1148,15 @@ mod tests {
         let idx = SearchIndex::open_or_create(dir.path()).unwrap();
         assert_eq!(idx.num_docs(), 2, "existing documents are left alone");
 
-        let hits = idx.search(SearchQuery { terms: "legacy", limit: 10, from_ts: None, to_ts: None, ..Default::default() }).unwrap();
+        let hits = idx
+            .search(SearchQuery {
+                terms: "legacy",
+                limit: 10,
+                from_ts: None,
+                to_ts: None,
+                ..Default::default()
+            })
+            .unwrap();
         assert_eq!(hits.len(), 2);
         assert!(hits.iter().all(|h| h.collection.is_none()));
     }
@@ -994,7 +1167,12 @@ mod tests {
         write_legacy_index(dir.path(), &["https://old.com/1"]);
 
         let mut idx = SearchIndex::open_or_create(dir.path()).unwrap();
-        let mut pdf = doc("https://obst.example/1.pdf", "Pomologie", "Bigarreau Kernobst", 20260101000000);
+        let mut pdf = doc(
+            "https://obst.example/1.pdf",
+            "Pomologie",
+            "Bigarreau Kernobst",
+            20260101000000,
+        );
         pdf.collection = "obst-pdfs".to_owned();
         idx.add_document(&pdf).unwrap();
         idx.commit().unwrap();
@@ -1002,7 +1180,15 @@ mod tests {
 
         // The document is indexed and findable — only its collection is lost,
         // which is what the warning on open says.
-        let hits = idx.search(SearchQuery { terms: "Bigarreau", limit: 10, from_ts: None, to_ts: None, ..Default::default() }).unwrap();
+        let hits = idx
+            .search(SearchQuery {
+                terms: "Bigarreau",
+                limit: 10,
+                from_ts: None,
+                to_ts: None,
+                ..Default::default()
+            })
+            .unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].url, "https://obst.example/1.pdf");
         assert!(hits[0].collection.is_none());
@@ -1020,8 +1206,13 @@ mod tests {
         write_legacy_index(dir.path(), &["https://old.com/1", "https://old.com/2"]);
 
         let mut idx = SearchIndex::open_or_create(dir.path()).unwrap();
-        idx.add_document(&doc("https://obst.example/1.pdf", "Pomologie", "legacy body text", 20260101000000))
-            .unwrap();
+        idx.add_document(&doc(
+            "https://obst.example/1.pdf",
+            "Pomologie",
+            "legacy body text",
+            20260101000000,
+        ))
+        .unwrap();
         idx.commit().unwrap();
 
         let segments = idx.index.searchable_segment_ids().unwrap();
@@ -1031,7 +1222,18 @@ mod tests {
 
         assert_eq!(idx.index.searchable_segment_ids().unwrap().len(), 1);
         assert_eq!(idx.num_docs(), 3);
-        assert_eq!(idx.search(SearchQuery { terms: "legacy", limit: 10, from_ts: None, to_ts: None, ..Default::default() }).unwrap().len(), 3);
+        assert_eq!(
+            idx.search(SearchQuery {
+                terms: "legacy",
+                limit: 10,
+                from_ts: None,
+                to_ts: None,
+                ..Default::default()
+            })
+            .unwrap()
+            .len(),
+            3
+        );
     }
 
     // ── Per-file replace (delete_s3_key) ────────────────────────────────────────
@@ -1040,9 +1242,12 @@ mod tests {
     fn delete_s3_key_removes_only_that_files_docs() {
         let dir = tempdir().unwrap();
         let mut idx = SearchIndex::open_or_create(dir.path()).unwrap();
-        idx.add_document(&doc_in("https://a.com/1", "fileA.warc.gz")).unwrap();
-        idx.add_document(&doc_in("https://a.com/2", "fileA.warc.gz")).unwrap();
-        idx.add_document(&doc_in("https://b.com/1", "fileB.warc.gz")).unwrap();
+        idx.add_document(&doc_in("https://a.com/1", "fileA.warc.gz"))
+            .unwrap();
+        idx.add_document(&doc_in("https://a.com/2", "fileA.warc.gz"))
+            .unwrap();
+        idx.add_document(&doc_in("https://b.com/1", "fileB.warc.gz"))
+            .unwrap();
         idx.commit().unwrap();
         assert_eq!(idx.num_docs(), 3);
 
@@ -1050,7 +1255,15 @@ mod tests {
         idx.delete_s3_key("fileA.warc.gz").unwrap();
         idx.commit().unwrap();
         assert_eq!(idx.num_docs(), 1);
-        let hits = idx.search(SearchQuery { terms: "indexable", limit: 10, from_ts: None, to_ts: None, ..Default::default() }).unwrap();
+        let hits = idx
+            .search(SearchQuery {
+                terms: "indexable",
+                limit: 10,
+                from_ts: None,
+                to_ts: None,
+                ..Default::default()
+            })
+            .unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].s3_key, "fileB.warc.gz");
     }
@@ -1062,16 +1275,21 @@ mod tests {
         // (lower opstamp), so the re-adds survive and there is no duplication.
         let dir = tempdir().unwrap();
         let mut idx = SearchIndex::open_or_create(dir.path()).unwrap();
-        idx.add_document(&doc_in("https://a.com/1", "fileA.warc.gz")).unwrap();
-        idx.add_document(&doc_in("https://a.com/2", "fileA.warc.gz")).unwrap();
+        idx.add_document(&doc_in("https://a.com/1", "fileA.warc.gz"))
+            .unwrap();
+        idx.add_document(&doc_in("https://a.com/2", "fileA.warc.gz"))
+            .unwrap();
         idx.commit().unwrap();
         assert_eq!(idx.num_docs(), 2);
 
         // Re-index the same file: delete-then-add within one commit.
         idx.delete_s3_key("fileA.warc.gz").unwrap();
-        idx.add_document(&doc_in("https://a.com/1", "fileA.warc.gz")).unwrap();
-        idx.add_document(&doc_in("https://a.com/2", "fileA.warc.gz")).unwrap();
-        idx.add_document(&doc_in("https://a.com/3", "fileA.warc.gz")).unwrap();
+        idx.add_document(&doc_in("https://a.com/1", "fileA.warc.gz"))
+            .unwrap();
+        idx.add_document(&doc_in("https://a.com/2", "fileA.warc.gz"))
+            .unwrap();
+        idx.add_document(&doc_in("https://a.com/3", "fileA.warc.gz"))
+            .unwrap();
         idx.commit().unwrap();
 
         // 3 docs, not 5 — the old two were replaced, the new record added.

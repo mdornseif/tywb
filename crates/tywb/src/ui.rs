@@ -261,15 +261,17 @@ fn page_html(title: &str, active: &str, content: &str) -> String {
 
     // ── Sticky header ──────────────────────────────────────────────────────
     out.push_str("<header>\n");
-    out.push_str("  <a href=\"/\" class=\"logo\">tywb<span class=\"sub\">Tiny Wayback</span></a>\n");
+    out.push_str(
+        "  <a href=\"/\" class=\"logo\">tywb<span class=\"sub\">Tiny Wayback</span></a>\n",
+    );
     out.push_str("  <nav>\n");
-    nav_link(&mut out, "/",           "Home",       active == "home");
-    nav_link(&mut out, "/ui/search",  "Search",     active == "search");
-    nav_link(&mut out, "/ui/browse",  "Browse",     active == "browse");
-    nav_link(&mut out, "/ui/url",     "By URL",     active == "url");
-    nav_link(&mut out, "/ui/files",   "WARC Files", active == "files");
+    nav_link(&mut out, "/", "Home", active == "home");
+    nav_link(&mut out, "/ui/search", "Search", active == "search");
+    nav_link(&mut out, "/ui/browse", "Browse", active == "browse");
+    nav_link(&mut out, "/ui/url", "By URL", active == "url");
+    nav_link(&mut out, "/ui/files", "WARC Files", active == "files");
     nav_link(&mut out, "/ui/skiplist", "Skip List", active == "skiplist");
-    nav_link(&mut out, "/ui/stats",   "Statistics", active == "stats");
+    nav_link(&mut out, "/ui/stats", "Statistics", active == "stats");
     out.push_str("    <span class=\"nav-right\">");
     out.push_str("<a href=\"/api/stats\">API</a>");
     out.push_str("</span>\n");
@@ -284,7 +286,11 @@ fn page_html(title: &str, active: &str, content: &str) -> String {
 fn nav_link(out: &mut String, href: &str, label: &str, active: bool) {
     out.push_str("    <a href=\"");
     out.push_str(href);
-    out.push_str(if active { "\" class=\"active\">" } else { "\">" });
+    out.push_str(if active {
+        "\" class=\"active\">"
+    } else {
+        "\">"
+    });
     out.push_str(label);
     out.push_str("</a>\n");
 }
@@ -299,7 +305,7 @@ fn push_esc(out: &mut String, s: &str) {
             '>' => out.push_str("&gt;"),
             '"' => out.push_str("&quot;"),
             '\'' => out.push_str("&#39;"),
-            c   => out.push(c),
+            c => out.push(c),
         }
     }
 }
@@ -310,7 +316,9 @@ pub fn fmt_count(n: u64) -> String {
     let s = n.to_string();
     let mut out = String::with_capacity(s.len() + s.len() / 3);
     for (i, ch) in s.chars().rev().enumerate() {
-        if i > 0 && i % 3 == 0 { out.push(','); }
+        if i > 0 && i % 3 == 0 {
+            out.push(',');
+        }
         out.push(ch);
     }
     out.chars().rev().collect()
@@ -318,18 +326,28 @@ pub fn fmt_count(n: u64) -> String {
 
 fn fmt_ts(ts: &str) -> String {
     if ts.len() == 14 {
-        format!("{}-{}-{} {}:{}:{}",
-            &ts[0..4], &ts[4..6], &ts[6..8],
-            &ts[8..10], &ts[10..12], &ts[12..14])
+        format!(
+            "{}-{}-{} {}:{}:{}",
+            &ts[0..4],
+            &ts[4..6],
+            &ts[6..8],
+            &ts[8..10],
+            &ts[10..12],
+            &ts[12..14]
+        )
     } else {
         ts.to_owned()
     }
 }
 
 fn fmt_size(n: u64) -> String {
-    if n >= 1_048_576 { format!("{:.1} MB", n as f64 / 1_048_576.0) }
-    else if n >= 1024 { format!("{:.0} KB", n as f64 / 1024.0) }
-    else               { format!("{n} B") }
+    if n >= 1_048_576 {
+        format!("{:.1} MB", n as f64 / 1_048_576.0)
+    } else if n >= 1024 {
+        format!("{:.0} KB", n as f64 / 1024.0)
+    } else {
+        format!("{n} B")
+    }
 }
 
 fn status_class(status: Option<u16>) -> &'static str {
@@ -337,13 +355,15 @@ fn status_class(status: Option<u16>) -> &'static str {
         Some(s) if s < 300 => "s200",
         Some(s) if s < 400 => "s3xx",
         Some(s) if s < 500 => "s4xx",
-        Some(_)            => "s5xx",
-        None               => "s-none",
+        Some(_) => "s5xx",
+        None => "s-none",
     }
 }
 
 fn status_str(status: Option<u16>) -> String {
-    status.map(|s| s.to_string()).unwrap_or_else(|| "—".to_owned())
+    status
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "—".to_owned())
 }
 
 fn short_mime<'a>(mime: Option<&'a str>) -> &'a str {
@@ -366,9 +386,9 @@ pub fn homepage_html(stats: &BasicStats, num_docs: u64, collections: &[(String, 
     // ── Stat cards ────────────────────────────────────────────────────────
     c.push_str("<div class=\"stat-grid\">\n");
     stat_card(&mut c, &fmt_count(stats.total_records), "CDX records");
-    stat_card(&mut c, &fmt_count(stats.unique_urls),   "Unique URLs");
-    stat_card(&mut c, &fmt_count(stats.warc_files),    "WARC files");
-    stat_card(&mut c, &fmt_count(num_docs),            "Fulltext docs");
+    stat_card(&mut c, &fmt_count(stats.unique_urls), "Unique URLs");
+    stat_card(&mut c, &fmt_count(stats.warc_files), "WARC files");
+    stat_card(&mut c, &fmt_count(num_docs), "Fulltext docs");
     c.push_str("</div>\n");
 
     // ── Collections ───────────────────────────────────────────────────────
@@ -401,8 +421,12 @@ pub fn homepage_html(stats: &BasicStats, num_docs: u64, collections: &[(String, 
     c.push_str("    <button class=\"btn\" type=\"submit\">Search</button>\n");
     c.push_str("  </div>\n");
     c.push_str("  <div class=\"date-row\">\n");
-    c.push_str("    <input name=\"from\" type=\"text\" placeholder=\"From YYYYMMDD\" maxlength=\"8\">\n");
-    c.push_str("    <input name=\"to\"   type=\"text\" placeholder=\"To YYYYMMDD\"   maxlength=\"8\">\n");
+    c.push_str(
+        "    <input name=\"from\" type=\"text\" placeholder=\"From YYYYMMDD\" maxlength=\"8\">\n",
+    );
+    c.push_str(
+        "    <input name=\"to\"   type=\"text\" placeholder=\"To YYYYMMDD\"   maxlength=\"8\">\n",
+    );
     c.push_str("  </div>\n");
     c.push_str("</form>\n</div>\n");
 
@@ -437,9 +461,9 @@ pub fn stats_html(
 
     c.push_str("<div class=\"stat-grid\">\n");
     stat_card(&mut c, &fmt_count(stats.total_records), "CDX records");
-    stat_card(&mut c, &fmt_count(stats.unique_urls),   "Unique URLs");
-    stat_card(&mut c, &fmt_count(stats.warc_files),    "WARC files");
-    stat_card(&mut c, &fmt_count(num_docs),            "Fulltext docs");
+    stat_card(&mut c, &fmt_count(stats.unique_urls), "Unique URLs");
+    stat_card(&mut c, &fmt_count(stats.warc_files), "WARC files");
+    stat_card(&mut c, &fmt_count(num_docs), "Fulltext docs");
     c.push_str("</div>\n");
 
     // ── Collections ───────────────────────────────────────────────────────
@@ -451,9 +475,13 @@ pub fn stats_html(
         c.push_str("<div class=\"mime-section\">\n<h2>Content types</h2>\n");
         for (mime, count) in mime_counts.iter().take(12) {
             let pct = (*count as f64 / max_n as f64 * 100.0) as u32;
-            c.push_str("  <div class=\"mime-row\">\n    <div>\n      <div style=\"font-size:.8rem\">");
+            c.push_str(
+                "  <div class=\"mime-row\">\n    <div>\n      <div style=\"font-size:.8rem\">",
+            );
             push_esc(&mut c, mime);
-            c.push_str("</div>\n      <div class=\"mime-bar\"><div class=\"mime-fill\" style=\"width:");
+            c.push_str(
+                "</div>\n      <div class=\"mime-bar\"><div class=\"mime-fill\" style=\"width:",
+            );
             push_esc(&mut c, &pct.to_string());
             c.push_str("%\"></div></div>\n    </div>\n    <div class=\"mime-count\">");
             push_esc(&mut c, &fmt_count(*count));
@@ -467,8 +495,8 @@ pub fn stats_html(
         c.push_str("<div class=\"form-card\" style=\"margin-bottom:1.25rem\">\n<h2>HTTP status codes</h2>\n");
         c.push_str("<div style=\"display:flex;gap:1rem;flex-wrap:wrap;margin-top:.25rem\">\n");
         for (status, count) in status_counts {
-            let sc  = status_class(*status);
-            let ss  = status_str(*status);
+            let sc = status_class(*status);
+            let ss = status_str(*status);
             c.push_str("  <div style=\"display:flex;align-items:center;gap:.4rem\">\n");
             c.push_str("    <span class=\"");
             c.push_str(sc);
@@ -548,7 +576,9 @@ pub fn search_html(
     c.push_str("    <input name=\"from\" type=\"text\" placeholder=\"From YYYYMMDD\" maxlength=\"8\" value=\"");
     push_esc(&mut c, from.unwrap_or(""));
     c.push_str("\">\n");
-    c.push_str("    <input name=\"to\" type=\"text\" placeholder=\"To YYYYMMDD\" maxlength=\"8\" value=\"");
+    c.push_str(
+        "    <input name=\"to\" type=\"text\" placeholder=\"To YYYYMMDD\" maxlength=\"8\" value=\"",
+    );
     push_esc(&mut c, to.unwrap_or(""));
     c.push_str("\">\n");
     c.push_str("  </div>\n</form>\n</div>\n");
@@ -606,10 +636,18 @@ pub fn search_html(
         c.push('.');
     } else {
         push_esc(&mut c, &fmt_count(hits.len() as u64));
-        c.push_str(if hits.len() == 1 { " result" } else { " results" });
+        c.push_str(if hits.len() == 1 {
+            " result"
+        } else {
+            " results"
+        });
         c.push_str(" from ");
         push_esc(&mut c, &fmt_count(groups.len() as u64));
-        c.push_str(if groups.len() == 1 { " domain" } else { " domains" });
+        c.push_str(if groups.len() == 1 {
+            " domain"
+        } else {
+            " domains"
+        });
         if !q.is_empty() {
             c.push_str(" for <strong>");
             push_esc(&mut c, q);
@@ -647,7 +685,7 @@ pub fn search_html(
 struct DomainGroup<'a> {
     domain: String,
     newest: &'a SearchHit,
-    rest:   Vec<&'a SearchHit>,
+    rest: Vec<&'a SearchHit>,
 }
 
 /// Collapse hits to one row per domain.
@@ -664,10 +702,13 @@ fn group_by_domain(hits: &[SearchHit]) -> Vec<DomainGroup<'_>> {
 
     for hit in hits {
         let domain = url_domain(&hit.url);
-        buckets.entry(domain.clone()).or_insert_with(|| {
-            order.push(domain.clone());
-            Vec::new()
-        }).push(hit);
+        buckets
+            .entry(domain.clone())
+            .or_insert_with(|| {
+                order.push(domain.clone());
+                Vec::new()
+            })
+            .push(hit);
     }
 
     order
@@ -677,7 +718,11 @@ fn group_by_domain(hits: &[SearchHit]) -> Vec<DomainGroup<'_>> {
             // Newest capture first, then the rest by descending timestamp.
             items.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
             let newest = items.remove(0);
-            DomainGroup { domain, newest, rest: items }
+            DomainGroup {
+                domain,
+                newest,
+                rest: items,
+            }
         })
         .collect()
 }
@@ -694,7 +739,10 @@ pub fn url_domain(url: &str) -> String {
         .next()
         .unwrap_or("")
         .rsplit_once('@')
-        .map_or_else(|| rest.split(['/', '?', '#']).next().unwrap_or(""), |(_, h)| h);
+        .map_or_else(
+            || rest.split(['/', '?', '#']).next().unwrap_or(""),
+            |(_, h)| h,
+        );
     // Strip a :port suffix (but leave bracketed IPv6 literals alone).
     let host = match host.rsplit_once(':') {
         Some((h, port)) if !h.ends_with(']') && port.chars().all(|c| c.is_ascii_digit()) => h,
@@ -718,13 +766,21 @@ fn render_more(out: &mut String, group: &DomainGroup<'_>) {
 
     out.push_str("<details class=\"more\">\n  <summary>");
     push_esc(out, &fmt_count(group.rest.len() as u64));
-    out.push_str(if group.rest.len() == 1 { " more result from " } else { " more results from " });
+    out.push_str(if group.rest.len() == 1 {
+        " more result from "
+    } else {
+        " more results from "
+    });
     push_esc(out, &group.domain);
     out.push_str("</summary>\n  <div class=\"more-list\">\n");
 
     for hit in &group.rest {
         let replay = format!("/web/{}/{}", hit.timestamp, hit.url);
-        let title = if hit.title.is_empty() { hit.url.as_str() } else { hit.title.as_str() };
+        let title = if hit.title.is_empty() {
+            hit.url.as_str()
+        } else {
+            hit.title.as_str()
+        };
 
         out.push_str("    <a class=\"more-item\" href=\"");
         push_esc(out, &replay);
@@ -742,7 +798,11 @@ fn render_more(out: &mut String, group: &DomainGroup<'_>) {
 
 fn render_hit(out: &mut String, hit: &SearchHit) {
     let replay = format!("/web/{}/{}", hit.timestamp, hit.url);
-    let display_title = if hit.title.is_empty() { hit.url.as_str() } else { hit.title.as_str() };
+    let display_title = if hit.title.is_empty() {
+        hit.url.as_str()
+    } else {
+        hit.title.as_str()
+    };
     let mime = short_mime(hit.mime.as_deref());
 
     out.push_str("<div class=\"result\">\n  <div class=\"result-body\">\n");
@@ -814,7 +874,9 @@ pub fn url_html(url: &str, records: &[CdxRecord], error: bool) -> String {
     }
 
     if error {
-        c.push_str("<div class=\"error\">Lookup failed — please check the URL and try again.</div>\n");
+        c.push_str(
+            "<div class=\"error\">Lookup failed — please check the URL and try again.</div>\n",
+        );
         return page_html("Browse URL", "url", &c);
     }
 
@@ -831,7 +893,11 @@ pub fn url_html(url: &str, records: &[CdxRecord], error: bool) -> String {
     // ── Capture count ─────────────────────────────────────────────────────
     c.push_str("<p class=\"cap-count\">");
     push_esc(&mut c, &fmt_count(records.len() as u64));
-    c.push_str(if records.len() == 1 { " capture" } else { " captures" });
+    c.push_str(if records.len() == 1 {
+        " capture"
+    } else {
+        " captures"
+    });
     c.push_str("</p>\n");
 
     // ── Captures table (newest first) ─────────────────────────────────────
@@ -938,7 +1004,9 @@ pub fn files_html(files: &[WarcFileRow], error: bool) -> String {
 
         // Errors
         if f.errors > 0 {
-            c.push_str("      <span class=\"warc-stat\" style=\"color:var(--red)\">\u{26a0}\u{fe0f} ");
+            c.push_str(
+                "      <span class=\"warc-stat\" style=\"color:var(--red)\">\u{26a0}\u{fe0f} ",
+            );
             push_esc(&mut c, &fmt_count(f.errors as u64));
             c.push_str(" errors</span>\n");
         }
@@ -1022,7 +1090,11 @@ pub fn browse_domains_html(tld: &str, domains: &[(String, u64)], truncated: bool
     c.push_str("<p style=\"font-size:.85rem;color:var(--muted);margin-bottom:.875rem\">");
     push_esc(&mut c, &fmt_count(domains.len() as u64));
     c.push_str(" host");
-    if domains.len() != 1 { c.push_str("names"); } else { c.push_str("name"); }
+    if domains.len() != 1 {
+        c.push_str("names");
+    } else {
+        c.push_str("name");
+    }
     c.push_str(" under <strong>.");
     push_esc(&mut c, tld);
     c.push_str("</strong> — click to view captures.</p>\n");
@@ -1088,7 +1160,9 @@ pub fn browse_subdomains_html(
     c.push_str("<p style=\"font-size:.85rem;color:var(--muted);margin-bottom:.875rem\">");
     push_esc(&mut c, &fmt_count(hostnames.len() as u64));
     c.push_str(" hostname");
-    if hostnames.len() != 1 { c.push('s'); }
+    if hostnames.len() != 1 {
+        c.push('s');
+    }
     c.push_str(" under <strong>");
     push_esc(&mut c, registered_domain);
     c.push_str("</strong> — click to view captures.</p>\n");
@@ -1172,46 +1246,59 @@ pub fn browse_captures_html(
             e.count += 1;
             e.has_2xx |= is_2xx;
         } else {
-            all_urls.push(UrlEntry { url: rec.original_url.as_str(), count: 1, has_2xx: is_2xx });
+            all_urls.push(UrlEntry {
+                url: rec.original_url.as_str(),
+                count: 1,
+                has_2xx: is_2xx,
+            });
             last = Some(rec.original_url.as_str());
         }
     }
 
     let suppressed = all_urls.iter().filter(|e| !e.has_2xx).count();
-    let visible: Vec<&UrlEntry> = all_urls
-        .iter()
-        .filter(|e| show_all || e.has_2xx)
-        .collect();
+    let visible: Vec<&UrlEntry> = all_urls.iter().filter(|e| show_all || e.has_2xx).collect();
 
     // Build the toggle URL: /ui/browse?domain=<domain>[&all=1]
     let mut base_url = String::from("/ui/browse?domain=");
     push_url_encoded(&mut base_url, domain);
     let toggle_url = if show_all {
-        base_url.clone()                 // uncheck → remove &all=1
+        base_url.clone() // uncheck → remove &all=1
     } else {
-        format!("{base_url}&all=1")       // check → add &all=1
+        format!("{base_url}&all=1") // check → add &all=1
     };
 
     // Summary line + checkbox toggle
     c.push_str("<div style=\"display:flex;align-items:baseline;gap:1.2rem;flex-wrap:wrap;margin-bottom:.7rem\">\n");
     c.push_str("<p class=\"cap-count\" style=\"margin:0\">");
     push_esc(&mut c, &fmt_count(visible.len() as u64));
-    if truncated { c.push_str("+"); }
+    if truncated {
+        c.push_str("+");
+    }
     c.push_str(if visible.len() == 1 { " URL" } else { " URLs" });
     c.push_str(" &nbsp;·&nbsp; ");
     push_esc(&mut c, &fmt_count(records.len() as u64));
-    if truncated { c.push_str("+"); }
-    c.push_str(if records.len() == 1 { " capture" } else { " captures" });
+    if truncated {
+        c.push_str("+");
+    }
+    c.push_str(if records.len() == 1 {
+        " capture"
+    } else {
+        " captures"
+    });
     c.push_str(" under <strong>");
     push_esc(&mut c, domain);
     c.push_str("</strong></p>\n");
 
     // Checkbox — navigates to toggle URL on change (no form needed)
-    c.push_str("<label style=\"font-size:.85rem;color:var(--muted);cursor:pointer;white-space:nowrap\">\n");
+    c.push_str(
+        "<label style=\"font-size:.85rem;color:var(--muted);cursor:pointer;white-space:nowrap\">\n",
+    );
     c.push_str("  <input type=\"checkbox\" onchange=\"location.href='");
     push_esc(&mut c, &toggle_url);
     c.push_str("'\"");
-    if show_all { c.push_str(" checked"); }
+    if show_all {
+        c.push_str(" checked");
+    }
     c.push_str("> Show non-2xx");
     if suppressed > 0 && !show_all {
         c.push_str(" <span style=\"color:var(--muted)\">(");
@@ -1256,8 +1343,9 @@ pub fn browse_captures_html(
 pub fn push_url_encoded(out: &mut String, s: &str) {
     for byte in s.bytes() {
         match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9'
-            | b'-' | b'_' | b'.' | b'~' => out.push(byte as char),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char)
+            }
             b => {
                 out.push('%');
                 out.push(HEX[(b >> 4) as usize] as char);
@@ -1285,7 +1373,9 @@ pub fn skiplist_html(
 ) -> String {
     let mut c = String::with_capacity(4096 + source_lines.len() * 96);
 
-    c.push_str("<h1 style=\"font-size:1.15rem;font-weight:700;margin-bottom:.35rem\">Skip list</h1>\n");
+    c.push_str(
+        "<h1 style=\"font-size:1.15rem;font-weight:700;margin-bottom:.35rem\">Skip list</h1>\n",
+    );
     c.push_str(
         "<p style=\"color:var(--muted);font-size:.875rem;margin-bottom:1rem;max-width:60rem\">\
          What never enters the index. A match is skipped during ingest, purged from CDX and \
@@ -1314,7 +1404,11 @@ pub fn skiplist_html(
     // Counts.
     c.push_str("<div class=\"stat-grid\" style=\"margin-bottom:1.25rem\">\n");
     stat_card(&mut c, &fmt_count(domains.len() as u64), "domains");
-    stat_card(&mut c, &fmt_count(active_patterns.len() as u64), "URL patterns");
+    stat_card(
+        &mut c,
+        &fmt_count(active_patterns.len() as u64),
+        "URL patterns",
+    );
     if !rejected.is_empty() {
         stat_card(&mut c, &fmt_count(rejected.len() as u64), "rejected");
     }
@@ -1334,7 +1428,9 @@ pub fn skiplist_html(
     }
 
     // URL patterns, with the comments they were written with.
-    c.push_str("<h2 style=\"font-size:.95rem;font-weight:700;margin:0 0 .5rem\">URL patterns</h2>\n");
+    c.push_str(
+        "<h2 style=\"font-size:.95rem;font-weight:700;margin:0 0 .5rem\">URL patterns</h2>\n",
+    );
     if active_patterns.is_empty() {
         c.push_str("<div class=\"empty\">No URL patterns configured.</div>\n");
     } else {
@@ -1397,9 +1493,9 @@ pub struct ApiStats {
 
 #[derive(serde::Serialize)]
 pub struct ApiCdxStats {
-    pub total_records:    u64,
-    pub unique_urls:      u64,
-    pub warc_files:       u64,
+    pub total_records: u64,
+    pub unique_urls: u64,
+    pub warc_files: u64,
     pub oldest_timestamp: Option<String>,
     pub newest_timestamp: Option<String>,
 }
@@ -1417,9 +1513,9 @@ mod tests {
 
     fn basic() -> BasicStats {
         BasicStats {
-            total_records:    4_135_367,
-            unique_urls:      2_000_000,
-            warc_files:       637,
+            total_records: 4_135_367,
+            unique_urls: 2_000_000,
+            warc_files: 637,
             oldest_timestamp: Some("20200101120000".to_owned()),
             newest_timestamp: Some("20260811120000".to_owned()),
         }
@@ -1442,18 +1538,30 @@ mod tests {
         // it, and it is charged to replay and search too — one shared SQLite
         // connection.
         let html = homepage_html(&basic(), 2_053_279, &[]);
-        assert!(!html.contains("Content types"), "mime breakdown is a GROUP BY");
-        assert!(!html.contains("HTTP status codes"), "status breakdown is a GROUP BY");
-        assert!(html.contains("href=\"/ui/stats\""), "but it must link to where they live");
+        assert!(
+            !html.contains("Content types"),
+            "mime breakdown is a GROUP BY"
+        );
+        assert!(
+            !html.contains("HTTP status codes"),
+            "status breakdown is a GROUP BY"
+        );
+        assert!(
+            html.contains("href=\"/ui/stats\""),
+            "but it must link to where they live"
+        );
     }
-
 
     #[test]
     fn an_empty_query_with_hits_still_renders_them() {
         // Browsing a collection: no terms, but results. The page used to stop
         // at the search form and drop them on the floor, which is what made the
         // homepage collection cards look broken.
-        let mut h = hit("https://obst-pdfs.23.nu/monatshefte-ocr/Band_01.pdf", "20260814173550", "Band 01");
+        let mut h = hit(
+            "https://obst-pdfs.23.nu/monatshefte-ocr/Band_01.pdf",
+            "20260814173550",
+            "Band 01",
+        );
         h.collection = Some("monatshefte".to_owned());
         let html = search_html("", &[h], None, None, Some("monatshefte"), false);
         assert!(html.contains("Band 01"), "the hit must be rendered");
@@ -1462,12 +1570,26 @@ mod tests {
 
     #[test]
     fn browsing_a_collection_does_not_say_for_nothing() {
-        let mut h = hit("https://obst-pdfs.23.nu/monatshefte-ocr/Band_01.pdf", "20260814173550", "Band 01");
+        let mut h = hit(
+            "https://obst-pdfs.23.nu/monatshefte-ocr/Band_01.pdf",
+            "20260814173550",
+            "Band 01",
+        );
         h.collection = Some("monatshefte".to_owned());
         let html = search_html("", &[h], None, None, Some("monatshefte"), false);
-        assert!(html.contains("1 result from 1 domain ·"), "no dangling \"for\": {html:?}");
+        assert!(
+            html.contains("1 result from 1 domain ·"),
+            "no dangling \"for\": {html:?}"
+        );
         // With terms it still names them.
-        let html = search_html("Obstbau", &[hit("https://a.de/", "20240101120000", "A")], None, None, None, false);
+        let html = search_html(
+            "Obstbau",
+            &[hit("https://a.de/", "20240101120000", "A")],
+            None,
+            None,
+            None,
+            false,
+        );
         assert!(html.contains("for <strong>Obstbau</strong>"));
     }
 
@@ -1486,7 +1608,10 @@ mod tests {
         let html = homepage_html(
             &basic(),
             2_053_279,
-            &[("warc".to_owned(), 4_133_667), ("monatshefte".to_owned(), 54)],
+            &[
+                ("warc".to_owned(), 4_133_667),
+                ("monatshefte".to_owned(), 54),
+            ],
         );
         assert!(html.contains("<h2>Collections</h2>"));
         assert!(html.contains("coll-card\" href=\"/ui/search?q=&collection=monatshefte\""));
@@ -1505,8 +1630,14 @@ mod tests {
         let html = stats_html(
             &basic(),
             2_053_279,
-            &[("warc".to_owned(), 4_135_367), ("monatshefte".to_owned(), 54)],
-            &[("text/html".to_owned(), 3_000_000), ("application/pdf".to_owned(), 12_000)],
+            &[
+                ("warc".to_owned(), 4_135_367),
+                ("monatshefte".to_owned(), 54),
+            ],
+            &[
+                ("text/html".to_owned(), 3_000_000),
+                ("application/pdf".to_owned(), 12_000),
+            ],
             &[(Some(200), 3_500_000), (Some(404), 12_000), (None, 3)],
             2941,
         );
@@ -1541,7 +1672,11 @@ mod tests {
 
     #[test]
     fn collection_badge_renders_for_non_warc_hits() {
-        let mut h = hit("https://obst-pdfs.23.nu/1152-hochstamm.pdf", "20260227000000", "Hochstamm");
+        let mut h = hit(
+            "https://obst-pdfs.23.nu/1152-hochstamm.pdf",
+            "20260227000000",
+            "Hochstamm",
+        );
         h.mime = Some("application/pdf".to_owned());
         h.collection = Some("obst-pdfs".to_owned());
         let mut warc = hit("https://example.de/", "20260101000000", "Ex");
@@ -1564,10 +1699,22 @@ mod tests {
 
     #[test]
     fn url_domain_folds_subdomains_into_second_level() {
-        assert_eq!(url_domain("https://obstsorten.pomologen-verein.de/x"), "pomologen-verein.de");
-        assert_eq!(url_domain("http://www.pomologen-verein.de"), "pomologen-verein.de");
-        assert_eq!(url_domain("https://pomologen-verein.de/"), "pomologen-verein.de");
-        assert_eq!(url_domain("https://a.b.c.example.co/page?q=1#frag"), "example.co");
+        assert_eq!(
+            url_domain("https://obstsorten.pomologen-verein.de/x"),
+            "pomologen-verein.de"
+        );
+        assert_eq!(
+            url_domain("http://www.pomologen-verein.de"),
+            "pomologen-verein.de"
+        );
+        assert_eq!(
+            url_domain("https://pomologen-verein.de/"),
+            "pomologen-verein.de"
+        );
+        assert_eq!(
+            url_domain("https://a.b.c.example.co/page?q=1#frag"),
+            "example.co"
+        );
     }
 
     #[test]
@@ -1590,12 +1737,19 @@ mod tests {
         let groups = group_by_domain(&hits);
 
         // Domain order follows the first hit of each domain, not the timestamps.
-        assert_eq!(groups.iter().map(|g| g.domain.as_str()).collect::<Vec<_>>(), ["a.de", "b.de"]);
+        assert_eq!(
+            groups.iter().map(|g| g.domain.as_str()).collect::<Vec<_>>(),
+            ["a.de", "b.de"]
+        );
 
         // Newest capture represents the domain, the rest descend by date.
         assert_eq!(groups[0].newest.title, "a new");
         assert_eq!(
-            groups[0].rest.iter().map(|h| h.title.as_str()).collect::<Vec<_>>(),
+            groups[0]
+                .rest
+                .iter()
+                .map(|h| h.title.as_str())
+                .collect::<Vec<_>>(),
             ["a mid", "a old"],
         );
         assert!(groups[1].rest.is_empty());
@@ -1610,12 +1764,19 @@ mod tests {
         ];
         let html = search_html("Roter Berlepsch", &hits, None, None, None, false);
 
-        assert!(html.contains("3 results from 2 domains"), "count line: {html:.0}");
+        assert!(
+            html.contains("3 results from 2 domains"),
+            "count line: {html:.0}"
+        );
         // The newest capture of a.de is the visible row…
-        assert!(html.contains("class=\"result-title\" href=\"/web/20260101000000/https://obstsorten.a.de/2\""));
+        assert!(html.contains(
+            "class=\"result-title\" href=\"/web/20260101000000/https://obstsorten.a.de/2\""
+        ));
         // …and the older one is behind the disclosure, which names the domain.
         assert!(html.contains("1 more result from a.de"));
-        assert!(html.contains("class=\"more-item\" href=\"/web/20240101000000/https://www.a.de/1\""));
+        assert!(
+            html.contains("class=\"more-item\" href=\"/web/20240101000000/https://www.a.de/1\"")
+        );
         // A domain with a single hit gets no disclosure.
         assert_eq!(html.matches("<details class=\"more\">").count(), 1);
     }
@@ -1638,12 +1799,16 @@ mod tests {
         ];
         let html = browse_subdomains_html("de", "walnussmeisterei.de", &hosts, false);
 
-        assert!(html.contains("href=\"/ui/browse?host=walnussmeisterei.de\""),
-                "apex host must link to its captures");
+        assert!(
+            html.contains("href=\"/ui/browse?host=walnussmeisterei.de\""),
+            "apex host must link to its captures"
+        );
         assert!(html.contains("href=\"/ui/browse?host=www.walnussmeisterei.de\""));
         // No hostname card may point back at the hostname listing.
-        assert!(!html.contains("browse-card\" href=\"/ui/browse?domain="),
-                "a hostname card still links to the domain level");
+        assert!(
+            !html.contains("browse-card\" href=\"/ui/browse?domain="),
+            "a hostname card still links to the domain level"
+        );
     }
 
     #[test]
@@ -1685,10 +1850,18 @@ mod tests {
     #[test]
     fn surt_and_domain_round_trip() {
         assert_eq!(surt_to_domain("de,walnussmeisterei"), "walnussmeisterei.de");
-        assert_eq!(surt_to_domain("de,walnussmeisterei,www"), "www.walnussmeisterei.de");
-        assert_eq!(domain_to_surt_prefix("walnussmeisterei.de"), "de,walnussmeisterei)");
+        assert_eq!(
+            surt_to_domain("de,walnussmeisterei,www"),
+            "www.walnussmeisterei.de"
+        );
+        assert_eq!(
+            domain_to_surt_prefix("walnussmeisterei.de"),
+            "de,walnussmeisterei)"
+        );
         // The apex prefix must not swallow subdomains: a subdomain SURT continues
         // with ',' where the apex prefix has ')'.
-        assert!(!"de,walnussmeisterei,www)/".starts_with(&domain_to_surt_prefix("walnussmeisterei.de")));
+        assert!(
+            !"de,walnussmeisterei,www)/".starts_with(&domain_to_surt_prefix("walnussmeisterei.de"))
+        );
     }
 }

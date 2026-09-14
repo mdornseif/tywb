@@ -14,8 +14,8 @@ use tracing::{debug, error, info, warn};
 
 use warc_search_cdx::{CdxRecord, CdxStore};
 use warc_search_config::{CollectionConfig, IndexerConfig};
-use warc_search_search::{IndexDoc, SearchIndex};
 use warc_search_s3::{get_bytes, put_object, ListState, Lister};
+use warc_search_search::{IndexDoc, SearchIndex};
 
 use crate::pdf::{ExtractError, PdfExtractor};
 
@@ -28,6 +28,10 @@ pub struct CollStats {
     pub indexed: usize,
     pub skipped: usize,
     pub errors: usize,
+    /// The collection's public PDF URLs, for the run's URL export
+    /// (`indexer.pdf_url_export`). Every object here is a PDF — the whole
+    /// collection exists to be one.
+    pub pdf_urls: Vec<String>,
 }
 
 /// Index every new/changed PDF object in `coll`'s bucket.
@@ -102,7 +106,10 @@ pub async fn index_pdf_collection(
     for obj in &objects {
         // Not ours: leave it entirely alone, without marking it seen, so a
         // later collection over the same prefix still picks it up.
-        if key_pattern.as_ref().is_some_and(|re| !re.is_match(&obj.key)) {
+        if key_pattern
+            .as_ref()
+            .is_some_and(|re| !re.is_match(&obj.key))
+        {
             continue;
         }
         if !obj.is_pdf() {
@@ -117,6 +124,14 @@ pub async fn index_pdf_collection(
             stats.skipped += 1;
             state.mark_seen(&obj.key, obj.etag.clone());
             continue;
+        }
+
+        // PDF URL export (indexer.pdf_url_export): the run's export wants every
+        // PDF it sees, and an object of this collection is one by definition.
+        // Its public URL is what an external consumer can fetch — the S3 key
+        // behind it says nothing to a system outside this deployment.
+        if cfg.pdf_url_export.is_some() {
+            stats.pdf_urls.push(url.clone());
         }
 
         // `mark_seen` records that this object, at this ETag, has been dealt
@@ -149,7 +164,9 @@ pub async fn index_pdf_collection(
         }
     }
 
-    search.commit().context("search commit for PDF collection")?;
+    search
+        .commit()
+        .context("search commit for PDF collection")?;
     info!(
         name = %coll.name,
         objects = stats.objects, indexed = stats.indexed,
@@ -207,10 +224,13 @@ fn parse_text_sidecar(body: &str, etag: Option<&str>) -> Option<(String, String)
     let header = header.strip_prefix(TEXT_SIDECAR_MAGIC)?;
 
     let field = |name: &str| {
-        header
-            .split(&format!(" {name}="))
-            .nth(1)
-            .map(|rest| rest.split(" title=").next().unwrap_or(rest).trim().to_owned())
+        header.split(&format!(" {name}=")).nth(1).map(|rest| {
+            rest.split(" title=")
+                .next()
+                .unwrap_or(rest)
+                .trim()
+                .to_owned()
+        })
     };
     let stored_etag = field("source-etag")?;
     let want = etag.unwrap_or("-").trim_matches('"');
@@ -251,8 +271,7 @@ async fn index_one_pdf(
     search: &mut SearchIndex,
     extractor: Option<&PdfExtractor>,
 ) -> Result<PdfOutcome> {
-    let surt = warc_search_cdx::surt::to_surt(url)
-        .with_context(|| format!("SURT for {url}"))?;
+    let surt = warc_search_cdx::surt::to_surt(url).with_context(|| format!("SURT for {url}"))?;
     let timestamp = last_modified_to_ts(obj.last_modified.as_deref());
 
     let bytes = get_bytes(s3, &coll.bucket, &obj.key)
@@ -260,17 +279,17 @@ async fn index_one_pdf(
         .with_context(|| format!("GET {}", obj.key))?;
 
     let record = CdxRecord {
-        surt_url:     surt,
-        timestamp:    timestamp.clone(),
+        surt_url: surt,
+        timestamp: timestamp.clone(),
         original_url: url.to_owned(),
-        mime:         Some("application/pdf".to_owned()),
-        status:       Some(200),
-        digest:       None,
-        s3_key:       obj.key.clone(),
-        offset:       0,
-        length:       bytes.len() as u64,
-        c_offset:     None, // standalone object — replay reads the whole thing
-        collection:   coll.name.clone(),
+        mime: Some("application/pdf".to_owned()),
+        status: Some(200),
+        digest: None,
+        s3_key: obj.key.clone(),
+        offset: 0,
+        length: bytes.len() as u64,
+        c_offset: None, // standalone object — replay reads the whole thing
+        collection: coll.name.clone(),
     };
     cdx.upsert(&record).context("CDX upsert")?;
 
@@ -289,7 +308,9 @@ async fn index_one_pdf(
     // The deletion is unconditional, before extraction: this runs only for
     // objects the lister reports as new or changed, and text extracted from the
     // previous bytes no longer describes the object.
-    search.delete_s3_key(&obj.key).context("search delete_s3_key")?;
+    search
+        .delete_s3_key(&obj.key)
+        .context("search delete_s3_key")?;
 
     let Some(extractor) = extractor else {
         return Ok(PdfOutcome::NoText);
@@ -307,7 +328,16 @@ async fn index_one_pdf(
         Some((title, body)) => {
             debug!(key = %obj.key, chars = body.len(), "text read from sidecar — no extraction");
             let quality_ok = crate::pdf::looks_like_text(&body);
-            Ok(crate::pdf::PdfDoc { title, body, quality_ok })
+            Ok(crate::pdf::PdfDoc {
+                title,
+                body,
+                quality_ok,
+                // A sidecar holds the flattened text only. Retaining markup
+                // here would mean writing tens of megabytes per volume into
+                // somebody else's bucket, which is not this feature's call to
+                // make — so a collection's PDFs contribute no internal links.
+                xhtml: None,
+            })
         }
         None => {
             // Tika extraction is a blocking call; keep it off the async runtime.
@@ -317,7 +347,7 @@ async fn index_one_pdf(
             let url_owned = url.to_owned();
             let bytes_owned = bytes.to_vec();
             let extracted = tokio::task::spawn_blocking(move || {
-                extractor.try_extract(&url_owned, &bytes_owned, false)
+                extractor.try_extract(&url_owned, &bytes_owned, crate::pdf::ExtractOpts::default())
             })
             .await
             .context("spawn_blocking panicked")?;
@@ -337,8 +367,11 @@ async fn index_one_pdf(
     let pdf_doc = match doc {
         Ok(doc) if doc.quality_ok => doc,
         Ok(doc) => {
-            warn!(url, chars = doc.body.len(),
-                  "PDF text rejected by quality gate (likely OCR noise)");
+            warn!(
+                url,
+                chars = doc.body.len(),
+                "PDF text rejected by quality gate (likely OCR noise)"
+            );
             return Ok(PdfOutcome::NoText);
         }
         // The file itself, or a limit set for it: the same answer next time.
@@ -346,7 +379,9 @@ async fn index_one_pdf(
         // which is a fact about the document (a scan with no text layer, with
         // OCR off). Retrying it would re-download and re-parse hundreds of
         // megabytes every run to be told the same thing.
-        Err(e @ (ExtractError::TooLarge { .. } | ExtractError::Truncated | ExtractError::Empty)) => {
+        Err(
+            e @ (ExtractError::TooLarge { .. } | ExtractError::Truncated | ExtractError::Empty),
+        ) => {
             warn!(url, bytes = bytes.len(), reason = %e, "PDF not extracted");
             return Ok(PdfOutcome::NoText);
         }
@@ -360,17 +395,19 @@ async fn index_one_pdf(
 
     let ts: u64 = timestamp.parse().unwrap_or(0);
     let index_doc = IndexDoc {
-        url:       url.to_owned(),
+        url: url.to_owned(),
         timestamp: ts,
-        title:     pdf_doc.title,
-        body:      pdf_doc.body,
-        mime:      Some("application/pdf".to_owned()),
-        s3_key:    obj.key.clone(),
-        offset:    0,
-        length:    bytes.len() as u64,
+        title: pdf_doc.title,
+        body: pdf_doc.body,
+        mime: Some("application/pdf".to_owned()),
+        s3_key: obj.key.clone(),
+        offset: 0,
+        length: bytes.len() as u64,
         collection: coll.name.clone(),
     };
-    search.add_document(&index_doc).context("search add_document")?;
+    search
+        .add_document(&index_doc)
+        .context("search add_document")?;
     Ok(PdfOutcome::Indexed)
 }
 
@@ -414,7 +451,15 @@ async fn write_text_sidecar(
 ) {
     let sidecar = text_sidecar_key(key);
     let body = render_text_sidecar(etag, &doc.title, &doc.body);
-    match put_object(s3, bucket, &sidecar, body.into(), "text/plain; charset=utf-8").await {
+    match put_object(
+        s3,
+        bucket,
+        &sidecar,
+        body.into(),
+        "text/plain; charset=utf-8",
+    )
+    .await
+    {
         Ok(()) => info!(key = %sidecar, chars = doc.body.len(), "extracted text stored"),
         Err(e) => warn!(key = %sidecar, err = %e, "could not store extracted text"),
     }
@@ -446,11 +491,15 @@ mod tests {
             title: "Band 01".to_owned(),
             body: "Obst und Kirschen\nzweite Zeile".to_owned(),
             quality_ok: true,
+            xhtml: None,
         };
         let raw = render_text_sidecar(Some("\"abc123\""), &doc.title, &doc.body);
         let (title, text) = parse_text_sidecar(&raw, Some("\"abc123\"")).unwrap();
         assert_eq!(title, "Band 01");
-        assert_eq!(text, doc.body, "the text must come back byte for byte, newlines and all");
+        assert_eq!(
+            text, doc.body,
+            "the text must come back byte for byte, newlines and all"
+        );
     }
 
     #[test]
@@ -462,7 +511,10 @@ mod tests {
 
         let v2 = render_text_sidecar(Some("abc"), "T", "Seite eins\u{000c}Seite zwei");
         let (_, text) = parse_text_sidecar(&v2, Some("abc")).unwrap();
-        assert!(text.contains('\u{000c}'), "page separators must survive the round trip");
+        assert!(
+            text.contains('\u{000c}'),
+            "page separators must survive the round trip"
+        );
     }
 
     #[test]
@@ -475,8 +527,15 @@ mod tests {
 
     #[test]
     fn junk_in_the_sidecar_is_a_miss_not_a_crash() {
-        for body in ["", "no header at all", "tywb-text/9 source-etag=x\ntext", "\n"] {
-            assert!(parse_text_sidecar(body, Some("x")).is_none() || body.starts_with("tywb-text/1"));
+        for body in [
+            "",
+            "no header at all",
+            "tywb-text/9 source-etag=x\ntext",
+            "\n",
+        ] {
+            assert!(
+                parse_text_sidecar(body, Some("x")).is_none() || body.starts_with("tywb-text/1")
+            );
         }
     }
 
@@ -484,8 +543,10 @@ mod tests {
     fn the_sidecar_key_does_not_collide_with_other_tools() {
         // These buckets already carry `.txt` files from the OCR pipeline that
         // produced the PDFs; overwriting one would be a silent loss.
-        assert_eq!(text_sidecar_key("archive-org/10229044bsb/10229044bsb.pdf"),
-                   "archive-org/10229044bsb/10229044bsb.pdf.tywb.txt");
+        assert_eq!(
+            text_sidecar_key("archive-org/10229044bsb/10229044bsb.pdf"),
+            "archive-org/10229044bsb/10229044bsb.pdf.tywb.txt"
+        );
         assert_ne!(text_sidecar_key("a/b.pdf"), "a/b.txt");
     }
 
@@ -516,9 +577,15 @@ mod tests {
 
     #[test]
     fn last_modified_parses_rfc3339() {
-        assert_eq!(last_modified_to_ts(Some("2026-02-27T22:18:43Z")), "20260227221843");
+        assert_eq!(
+            last_modified_to_ts(Some("2026-02-27T22:18:43Z")),
+            "20260227221843"
+        );
         // AWS smithy sometimes renders a fractional second — parse_from_rfc3339 handles it.
-        assert_eq!(last_modified_to_ts(Some("2026-02-27T22:18:43.5Z")), "20260227221843");
+        assert_eq!(
+            last_modified_to_ts(Some("2026-02-27T22:18:43.5Z")),
+            "20260227221843"
+        );
     }
 
     #[test]

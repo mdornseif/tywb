@@ -8,6 +8,80 @@ this project does not yet publish tagged releases, so everything lands under
 
 ## [Unreleased]
 
+- **Each PDF URL export writes its own object.** The key defaults to
+  `pdf-urls-{timestamp}.txt` (`{timestamp}` → UTC `YYYYmmdd-HHMMSS`) instead of
+  one fixed `pdf-urls.txt`. Two producers write this list — an index run and
+  `export-pdf-urls` — and while they shared a key, an incremental run replaced
+  the complete list with the fragment it happened to see, taking with it
+  whatever the consumer had not read yet. Lexical order is chronological order,
+  so the last key in a bucket listing is the newest export; nothing prunes the
+  old ones. A key without the placeholder is still used verbatim, for whoever
+  wants the overwrite back.
+
+- **Tika's XHTML can be retained in the OCR cache** (`ocr_cache.keep_xhtml`,
+  off by default). The cache stores flattened text, and flattening is lossy in
+  one way that matters: the markup is gone, so the links *inside* a PDF — a
+  volume's bibliography, "download the next chapter" — cannot be recovered from
+  it, and neither can any structure a later improvement to `xhtml_to_text`
+  might want. Retention makes both a local disk read instead of another OCR
+  run, which is the argument the cache itself exists for, one level down. It is
+  a sibling file (`text/<xy>/<digest>.tywb.xhtml`) and deliberately *not* a
+  format version bump: a bump would make every entry written so far a miss and
+  bill the corpus's 17.5 hours of OCR again for nothing but markup. Entries
+  cached before retention was switched on stay valid hits and are not
+  re-extracted — they just have no links to give. `PdfDoc` carries the XHTML
+  only when asked (`ExtractOpts::keep_xhtml`), because an OCR'd volume's markup
+  runs to tens of megabytes where its text runs to two: `/text` and the
+  `pdf_bucket` path never build it.
+
+- **`export-pdf-urls --scan-links` decodes a record's whole body**, where ingest
+  stops at `max_text_bytes * 4`. The two are now deliberately different: the
+  ingest cap is a memory budget for a streaming loop over multi-GB WARCs and
+  says nothing about which links exist, while the scan holds one record at a
+  time. Eight records in this archive are over the cap and they are the big
+  portal homepages — `zdf.de` at 7.3 MB — that link to everything. A run exports
+  "the PDFs this run indexed"; the subcommand exports "every PDF the archive can
+  point at", a superset.
+
+- **`put_object` reports the real S3 error.** It mapped failures with the SDK's
+  own `Display`, which is famously terse, so a rejected upload logged as
+  `service error` and nothing else; `copy_object`, `delete_object` and
+  `put_object_from_path` already walked the `source()` chain via `chain()`. The
+  most-used write in the codebase was the one that could not say what went
+  wrong. Printing the chain is what turned it into `413 Content Too Large` — a
+  front-end that caps request bodies at 1 MiB, on the *fallback* endpoint used
+  while the production one was refusing TLS handshakes. The production endpoint
+  took the same 1.1 MiB object without complaint, so the limit was that
+  front-end's, not the archive's; without the chain there was no way to tell
+  the two apart.
+
+- **PDF URL export — this archive as a source for another one.** With
+  `indexer.pdf_url_export` (`bucket`, `key`) configured, an index run writes
+  every PDF URL it saw to a text file in S3 — one URL per line, deduplicated,
+  sorted — for an external consumer such as an ArchiveBox watcher on
+  `archivebox-in`. Two kinds of URL go in, and the second is the interesting
+  one: records that *are* PDFs, and the PDFs the indexed HTML *links to*, which
+  the crawl may never have fetched. Discovery runs where the decoded markup is
+  already in hand (`build_index_doc`), so it costs a second byte-scan of the
+  HTML and no extra fetch — and is skipped entirely when no export is
+  configured. Relative hrefs are resolved against the record's own URL by the
+  `url` crate rather than by string surgery, values are entity-decoded (`&amp;`
+  in a query string is the common case), the PDF test is the path's extension
+  because that is all a link carries, and comment/`<script>`/`<style>` bodies
+  are skipped exactly as `strip_html` skips them. Both halves pass the skip
+  list, so a wanted page pointing into a blacklisted site does not put that
+  site on a list somebody else will go and fetch from.
+
+  `tywb export-pdf-urls` produces the same artifact for the *whole* archive
+  without a re-index: the captured half is a `SELECT DISTINCT` over the CDX
+  (7,627 URLs in well under a second), and `--scan-links` reads the indexed
+  HTML back through one Range GET per record — the CDX coordinates, ~2 GB of
+  transfer against the corpus's 116 GB — where `index --force` would cost the
+  whole rebuild in days and re-queue OCR on the way. `--out` keeps a local
+  copy, `--dry-run` reports without uploading, `--jobs`/`--limit` steer the
+  scan. Links are not stored anywhere, so a CDX-only run cannot produce them;
+  that is what the scan is for. See `crates/tywb/src/pdf_url_export.rs`.
+
 - **OCR is no longer coupled to the index run.** A full rebuild on manas
   measured 63.7 of its 74.5 hours in gaps at multiples of the Tika timeout
   (25 min × 81, 2× × 20, 7× × 1), and the OCR results were discarded with the

@@ -1,7 +1,7 @@
 //! CDX record — one entry per WARC response record in the index.
 
-use chrono::{DateTime, NaiveDateTime, Utc};
 use crate::error::{CdxError, Result};
+use chrono::{DateTime, NaiveDateTime, Utc};
 use warc::WarcRecord;
 
 /// A single CDX index entry.
@@ -69,10 +69,7 @@ pub fn format_timestamp(dt: &DateTime<Utc>) -> String {
 ///
 /// Returns `None` if the WARC record is not a `response` or `resource` type
 /// (i.e. types we don't index in the CDX).
-pub fn from_warc_record(
-    warc: &WarcRecord,
-    s3_key: &str,
-) -> Result<Option<CdxRecord>> {
+pub fn from_warc_record(warc: &WarcRecord, s3_key: &str) -> Result<Option<CdxRecord>> {
     use warc::RecordType;
 
     let record_type = warc.header.record_type()?;
@@ -101,9 +98,10 @@ pub fn from_warc_record(
     // not the page.  Extract the real MIME from the HTTP response headers inside
     // the block instead.  Fall back to the WARC Content-Type for resource records
     // (PDFs, images, etc.) where it IS the actual MIME type.
-    let warc_ct = warc.header.content_type().map(|s| {
-        s.split(';').next().unwrap_or(s).trim().to_ascii_lowercase()
-    });
+    let warc_ct = warc
+        .header
+        .content_type()
+        .map(|s| s.split(';').next().unwrap_or(s).trim().to_ascii_lowercase());
     let mime = match warc_ct.as_deref() {
         Some("application/http") | None => extract_http_content_type(&warc.block),
         Some(_) => warc_ct,
@@ -144,7 +142,10 @@ pub fn from_warc_record(
 /// Returns `None` if the block doesn't look like an HTTP response.
 fn extract_http_status(block: &[u8]) -> Option<u16> {
     // First line ends at \r\n or \n
-    let end = block.iter().position(|&b| b == b'\n').unwrap_or(block.len());
+    let end = block
+        .iter()
+        .position(|&b| b == b'\n')
+        .unwrap_or(block.len());
     let line = std::str::from_utf8(&block[..end]).ok()?;
     // "HTTP/1.1 200 OK" — status is the second token
     let mut parts = line.split_whitespace();
@@ -158,16 +159,21 @@ fn extract_http_status(block: &[u8]) -> Option<u16> {
 /// the result.  Returns `None` if no `Content-Type` header is present.
 fn extract_http_content_type(block: &[u8]) -> Option<String> {
     // Find end of HTTP header section (\r\n\r\n).
-    let hdr_end = block.windows(4).position(|w| w == b"\r\n\r\n")
+    let hdr_end = block
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
         .unwrap_or(block.len());
     let hdr_str = std::str::from_utf8(&block[..hdr_end]).ok()?;
 
     // Skip the HTTP status line and scan headers.
     for line in hdr_str.lines().skip(1) {
-        if line.is_empty() { break; }
+        if line.is_empty() {
+            break;
+        }
         if let Some((name, val)) = line.split_once(':') {
             if name.trim().eq_ignore_ascii_case("content-type") {
-                let mime = val.trim()
+                let mime = val
+                    .trim()
                     .split(';')
                     .next()
                     .unwrap_or(val.trim())
@@ -187,8 +193,11 @@ fn extract_http_content_type(block: &[u8]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use warc::{WarcRecord, reader::{WarcReader, build_warc_record}};
     use std::io::Cursor;
+    use warc::{
+        reader::{build_warc_record, WarcReader},
+        WarcRecord,
+    };
 
     /// Build a WarcRecord from field pairs and a raw block, using the public
     /// `build_warc_record` helper.  `offset` is patched in after parsing.
@@ -475,8 +484,8 @@ mod tests {
         assert!(from_warc_record(&rec, "test.warc").is_err());
     }
 
-    use chrono::Timelike;
     use chrono::Datelike;
+    use chrono::Timelike;
 
     #[test]
     fn from_warc_prefers_the_payload_digest_for_responses() {
@@ -514,13 +523,17 @@ mod tests {
                 ("WARC-Refers-To", "<urn:uuid:orig-1>"),
                 ("WARC-Payload-Digest", "sha1:PAYLOADHASH"),
                 ("WARC-Block-Digest", "sha1:HEADERSONLY"),
-                ("WARC-Profile", "https://iana.org/assignments/warc/1.1/revisit/identical-payload-digest"),
+                (
+                    "WARC-Profile",
+                    "https://iana.org/assignments/warc/1.1/revisit/identical-payload-digest",
+                ),
                 ("Content-Type", "application/http; msgtype=response"),
             ],
             http,
             4242,
         );
-        let cdx = from_warc_record(&rec, "warc/zeno-00002.warc.gz").unwrap()
+        let cdx = from_warc_record(&rec, "warc/zeno-00002.warc.gz")
+            .unwrap()
             .expect("revisit records are now included in the CDX");
         assert_eq!(cdx.original_url, "https://obst.example/page");
         assert_eq!(cdx.timestamp, "20260720100000");

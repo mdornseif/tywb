@@ -138,6 +138,21 @@ The CDX index stores the S3 object key + byte offset + byte length for every
 WARC record. Replay fetches only those bytes via an HTTP Range request.
 A 10 GB WARC file costs one small Range GET to replay a single page.
 
+### A CDX prefix query stops at the `www` boundary
+
+`GET /cdx?url=example.de*` looks up the SURT prefix of `example.de`, which is
+`de,example,)`. That closing paren is part of the key, so the query does not
+match the `de,example,www)/` rows a site archived under `www.example.de`
+produces. Asking the bare domain therefore reports **no captures for a site the
+archive holds in full** — an empty row that is indistinguishable from a real
+zero. Measured on the running archive: `naturadb.de` returned 0 and
+`www.naturadb.de*` returned 265 HTML pages; `deutsche-genbank-obst.de`,
+`bundessortenamt.de`, `dlr.rlp.de` and `obstarche-reddelich.de` all read the
+same way. Ask both forms and merge on (urlkey, timestamp, original); a third
+question is needed for any other subdomain (`m.`, `blog.`), and no single query
+covers it. Any tool answering "is this host archived" gets this wrong by
+default, so check one against a site you know lives under `www`.
+
 ### SQLite for CDX (not Postgres, not Redis)
 CDX lookups are point queries and small range scans by (surt_url, timestamp).
 SQLite in WAL mode handles concurrent reads with zero daemon overhead.
@@ -320,6 +335,21 @@ archive: the same text the indexer read, at the same cost (milliseconds from
 disk). For `pdf_bucket` collections, `store_text` sidecars continue to provide
 the same function.
 
+`ocr_cache.keep_xhtml` retains Tika's XHTML beside that text, as
+`text/<xy>/<digest>.tywb.xhtml`. Flattening is lossy in one way that matters:
+the text has no markup left, so the links *inside* a PDF are unrecoverable from
+it — and any later improvement to `xhtml_to_text` (page structure, tables,
+links) would have to re-OCR the whole corpus to try itself out, which is the
+argument this cache exists for, one level down. Off by default, and not a
+formality: Tika emits a span per word for OCR'd pages, so a scanned volume's
+markup runs to tens of megabytes where its text runs to two.
+
+It is a sibling file and deliberately *not* a format version bump. A bump would
+make every entry written so far a miss and bill the 17.5 hours of OCR again for
+nothing but the markup. An entry from before retention has text and no XHTML:
+still a hit, still indexed, simply no links to give until something else makes
+it re-extract.
+
 ### One prefix, two collections
 `prefix` describes a contiguous run of keys; `key_pattern` (RE2, as in the skip
 list) narrows it further, for material that is interleaved rather than grouped —
@@ -350,6 +380,72 @@ adds further sources; type `pdf_bucket` indexes a bucket of standalone PDFs
 CDX record carries a `collection` name, which selects the bucket at replay
 time. Non-WARC collections are served directly from their bucket, not from a
 WARC container. See `crates/tywb/src/pdf_collection.rs`.
+
+### PDF URL export (`indexer.pdf_url_export`)
+With an `indexer.pdf_url_export` block (`bucket`, `key`) configured, an index
+run uploads every PDF URL it saw as one text file to `s3://<bucket>/<key>`
+(default `pdf-urls-{timestamp}.txt`): one URL per line, deduplicated and sorted,
+for an external consumer such as an ArchiveBox watcher — which is why the
+shipped `config.yaml` enables it for the `archivebox-in` bucket on Garage.
+
+`{timestamp}` in the key becomes the export's UTC time as `YYYYmmdd-HHMMSS`, so
+each export is an object of its own. That is not tidiness: two producers write
+this list, and while they shared one key an incremental index run — which sees
+only the objects it processed — replaced the complete list with a fragment of
+it, and whatever the consumer had not read yet was gone. Lexical order is
+chronological order, so the last key in a listing is the newest export. Nothing
+prunes the old ones; a key without the placeholder is used verbatim, for whoever
+wants the overwrite back.
+
+Three kinds of URL go into it, and the last two are the reason the feature
+exists:
+
+1. **captured** — records that *are* PDFs (`application/pdf` responses, and the
+   objects of `pdf_bucket` collections). The archive already holds these.
+2. **linked** — the PDFs the indexed HTML *points at*. A page linking to a
+   document is evidence the document exists whether or not the crawl fetched
+   it, so this half is what another archiver can still go and get.
+3. **linked from inside a PDF** — a volume's bibliography, "download the next
+   chapter". These live only in Tika's XHTML, which flattening to text
+   destroys, so they are recoverable only where `ocr_cache.keep_xhtml` retained
+   it — and then they cost a local disk read, not an extraction.
+
+Discovery runs inside `build_index_doc`, where the decoded markup is already in
+hand and about to be discarded (the index stores text, not HTML) — so it costs a
+second byte-scan and no extra fetch, and it is switched off entirely when no
+export is configured. `extract_pdf_links` is a scanner in the same family as
+`strip_html`: only `href` inside a tag, at an attribute boundary (`data-href` is
+another attribute), comment/`<script>`/`<style>` bodies skipped, values
+entity-decoded (`&amp;` in a query string is the common case), relative hrefs
+resolved against the record's own URL by the `url` crate rather than by string
+surgery, and the PDF test is the path's extension because that is all a link
+carries without fetching it. Both halves pass the skip list, so a wanted page
+pointing into a blacklisted site does not put that site on a list somebody else
+will fetch from. An empty run uploads nothing, so a quiet night never wipes the
+previous list, and the upload is best effort: it runs after the final search
+commit and must never fail an otherwise-successful run.
+
+Two producers, one artifact (`crates/tywb/src/pdf_url_export.rs`). A run only
+knows its own objects, so "all of them" would mean a re-index — days on this
+archive, and it re-queues OCR on the way. `tywb export-pdf-urls` gets the same
+list from what is already stored: the captured half is a `SELECT DISTINCT` over
+the CDX (7,627 URLs in well under a second), and `--scan-links` reads the
+indexed HTML back through one Range GET per record — the CDX coordinates, ~2 GB
+of transfer against the corpus's 116 GB, about an hour for 42,617 records — then
+adds the PDFs' own links out of the retained XHTML, which costs no network at
+all. Links are stored nowhere, so a CDX-only run cannot produce them; that is
+what the scan is for, and it is why the extractor is `pub(crate)` and shared by
+both paths.
+
+The scan decodes a record's *whole* body where ingest stops at
+`max_text_bytes * 4`. That is deliberate and not drift: the ingest cap is a
+memory budget for a streaming loop over multi-GB WARCs, and it says nothing
+about which links exist, while the scan holds one record at a time and can
+afford the lot. Eight records in this archive are over the cap, and they are
+exactly the big portal homepages that link to everything. So the two producers
+are not identical and should not be levelled — a run exports "the PDFs this run
+indexed", the subcommand "every PDF the archive can point at", a superset. `--out` keeps a local copy, `--dry-run` reports without uploading,
+`--jobs`/`--limit` steer the scan. Reach for the subcommand, not for `--force`.
 
 ### No async in `warc/`
 The core parser is sync (`std::io::Read`). Async callers wrap it in
@@ -390,12 +486,35 @@ cargo run --release -p tywb -- --config config.local.yaml server
 # Plain text:       GET /text?url=https://example.com/&timestamp=2024&output=json
 # CDX API:          GET /cdx?url=example.com/*&output=json
 
+# The deployment on manas answers without auth on its tailscale address, which
+# is what server.bind is set to there (the ansible play derives it from
+# `tailscale ip -4`), and it answers JSON to scripted clients:
+#   curl http://manas.vpn.foxel.org:8080/healthz      # = 100.64.0.22
+#   /healthz  /api/stats  /search?q=  /cdx?url=<host>*&output=json&limit<=10000
+#   /text?url=  /web/<ts>/<url>  /skiplist.zeno  /ui/{search,browse,url,files,skiplist,stats}
+# The public https://tywb.foxel.org is Authelia-gated on every path, from inside
+# the tailnet too (302 to auth.foxel.org) — so a job that must not stall on a
+# login page uses the tailscale URL. obstdoc keeps the address in $OBSTDOC_TYWB
+# (default http://100.64.0.22:8080); its own client is internal/tywb.
+
 # 4a. Prefill the OCR text cache (fill the queue) — run before a rebuild:
 #     (requires indexer.ocr_cache + indexer.tika in config.yaml)
 cargo run --release -p tywb -- --config config.local.yaml ocr-worker --prefill
 
 # 4b. Drain the OCR queue (extract deferred PDFs):
 cargo run --release -p tywb -- --config config.local.yaml ocr-worker
+
+# 4c. Export every PDF URL the index knows, and upload it to
+#     indexer.pdf_url_export's bucket. Without a flag this is the captured half
+#     only (a CDX read, under a second):
+cargo run --release -p tywb -- --config config.local.yaml export-pdf-urls
+#     Add --scan-links for the PDFs the indexed HTML points at — one Range GET
+#     per record, ~an hour for 42k records, and no re-index:
+cargo run --release -p tywb -- --config config.local.yaml \
+    export-pdf-urls --scan-links --jobs 24
+#     Sample or inspect it locally first:
+cargo run --release -p tywb -- --config config.local.yaml \
+    export-pdf-urls --scan-links --limit 300 --dry-run --out /tmp/pdf-urls.txt
 
 # 5. Repair whole-file-gzip WARCs (see "Record-per-member .warc.gz" below)
 cargo run --release -p tywb -- --config config.local.yaml recompress --scan-only
@@ -433,4 +552,4 @@ CI should fail on any clippy warning. Run both before opening a PR.
 | `cdx`              | ✅ complete  | SURT, SQLite store, closest-match lookup, CDX builder from WarcRecord, `warc_files` metadata table |
 | `s3_store`         | ✅ complete  | Client builder, paginated listing, ETag state, streaming GET, Range GET |
 | `search`           | ✅ complete  | Tantivy schema, writer + reader, timestamp filter, per-file replace, forward-compatible open of older schemas |
-| `tywb`             | 🔄 in progress | `index` working (streaming, throughput, SIGINFO, limits, +digest-keyed OCR cache decoupling); `server` serving UI, `/search`, `/text` (+cache read), replay, CDX; `stats` complete; `recompress` complete; `scan-wire-format` complete; `ocr-worker` complete (prefill + drain) |
+| `tywb`             | 🔄 in progress | `index` working (streaming, throughput, SIGINFO, limits, +digest-keyed OCR cache decoupling); `server` serving UI, `/search`, `/text` (+cache read), replay, CDX; `stats` complete; `export-pdf-urls` complete; `recompress` complete; `scan-wire-format` complete; `ocr-worker` complete (prefill + drain) |

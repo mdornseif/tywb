@@ -40,13 +40,46 @@ use warc_search_config::TikaConfig;
 /// Extracted text for one PDF.
 pub struct PdfDoc {
     pub title: String,
-    pub body:  String,
+    pub body: String,
     /// Whether [`looks_like_text`] accepted the body.
     ///
     /// The indexer drops a document that fails the gate; the `/text` endpoint
     /// hands it to the caller anyway, flagged, because a human asking for one
     /// specific document can judge OCR noise for themselves.
     pub quality_ok: bool,
+    /// Tika's XHTML for the document — `None` unless the caller asked for it
+    /// with [`ExtractOpts::keep_xhtml`].
+    ///
+    /// [`body`](Self::body) is what a reader searches, and flattening it is
+    /// lossy in one way that matters: the flattened text has no markup, so the
+    /// links *inside* the PDF are gone from it. Keeping the XHTML is what lets
+    /// those links be recovered later — out of the OCR cache, without paying for
+    /// the extraction again — and, more generally, what would let a later
+    /// improvement to text handling be replayed from the cache instead of
+    /// re-OCR'd. That is the same argument the cache itself exists for.
+    pub xhtml: Option<String>,
+}
+
+/// What a caller wants out of one extraction.
+///
+/// Both fields are decisions with a cost, which is why they are stated per call
+/// rather than configured once on the extractor.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ExtractOpts {
+    /// Send a PDF with no `%%EOF` trailer to Tika regardless.
+    ///
+    /// The indexer never does that: OCR of a cut-off capture produces noise the
+    /// quality gate drops anyway, and the attempt is what makes indexing crawl.
+    /// A single on-demand request can afford it.
+    pub allow_truncated: bool,
+    /// Also return Tika's XHTML in [`PdfDoc::xhtml`].
+    ///
+    /// Not a formality: for an OCR'd volume Tika emits a span per word, so the
+    /// XHTML runs to tens of megabytes where the text runs to two. Building it
+    /// is a memory decision and keeping it a disk one, so the two callers that
+    /// want the structure — the OCR cache, and link discovery — ask for it
+    /// explicitly and nobody else pays.
+    pub keep_xhtml: bool,
 }
 
 /// Why a PDF yielded no text.
@@ -65,11 +98,12 @@ pub enum ExtractError {
 impl fmt::Display for ExtractError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::TooLarge { bytes, limit } =>
-                write!(f, "PDF is {bytes} bytes, over the {limit}-byte limit"),
+            Self::TooLarge { bytes, limit } => {
+                write!(f, "PDF is {bytes} bytes, over the {limit}-byte limit")
+            }
             Self::Truncated => write!(f, "PDF is truncated (no %%EOF trailer)"),
-            Self::Tika(e)   => write!(f, "Tika extraction failed: {e}"),
-            Self::Empty     => write!(f, "Tika returned no text"),
+            Self::Tika(e) => write!(f, "Tika extraction failed: {e}"),
+            Self::Empty => write!(f, "Tika returned no text"),
         }
     }
 }
@@ -80,9 +114,9 @@ impl fmt::Display for ExtractError {
 /// `Send + Sync`, so it can be moved into the blocking parse task.
 #[derive(Clone)]
 pub struct PdfExtractor {
-    agent:         ureq::Agent,
-    endpoint:      String,      // {url}/rmeta/text
-    ocr_strategy:  String,
+    agent: ureq::Agent,
+    endpoint: String, // {url}/rmeta/text
+    ocr_strategy: String,
     ocr_languages: String,
     max_pdf_bytes: usize,
 }
@@ -102,8 +136,8 @@ impl PdfExtractor {
             // boundaries (`<div class="page">`). Plain text arrives as one
             // undivided block, and a corpus of 400-page volumes cannot be cut
             // into per-cultivar excerpts without knowing where a page ends.
-            endpoint:      format!("{base}/rmeta"),
-            ocr_strategy:  cfg.ocr_strategy.clone(),
+            endpoint: format!("{base}/rmeta"),
+            ocr_strategy: cfg.ocr_strategy.clone(),
             ocr_languages: cfg.ocr_languages.clone(),
             max_pdf_bytes: cfg.max_pdf_bytes,
         }
@@ -116,12 +150,15 @@ impl PdfExtractor {
     /// caller needs to know *why*.
     ///
     /// [`try_extract`]: PdfExtractor::try_extract
-    pub fn extract(&self, url: &str, pdf: &[u8]) -> Option<PdfDoc> {
-        match self.try_extract(url, pdf, false) {
+    pub fn extract(&self, url: &str, pdf: &[u8], opts: ExtractOpts) -> Option<PdfDoc> {
+        match self.try_extract(url, pdf, opts) {
             Ok(doc) if doc.quality_ok => Some(doc),
             Ok(doc) => {
-                warn!(url, chars = doc.body.len(),
-                      "PDF text rejected by quality gate (likely OCR noise)");
+                warn!(
+                    url,
+                    chars = doc.body.len(),
+                    "PDF text rejected by quality gate (likely OCR noise)"
+                );
                 None
             }
             // A size limit is a configuration decision that silently drops a
@@ -150,24 +187,24 @@ impl PdfExtractor {
     /// Extract text from PDF bytes, reporting the reason for any failure.
     ///
     /// The returned [`PdfDoc`] carries `quality_ok = false` when the text does
-    /// not read like prose — the caller decides whether to use it anyway.
-    ///
-    /// `allow_truncated` sends a PDF with no `%%EOF` trailer to Tika regardless.
-    /// The indexer never does that: OCR of a cut-off capture produces noise the
-    /// quality gate drops anyway, and the attempt is what makes indexing crawl.
-    /// A single on-demand request can afford it.
+    /// not read like prose — the caller decides whether to use it anyway — and
+    /// its [`xhtml`](PdfDoc::xhtml) only when [`ExtractOpts::keep_xhtml`] asked
+    /// for it.
     pub fn try_extract(
         &self,
         url: &str,
         pdf: &[u8],
-        allow_truncated: bool,
+        opts: ExtractOpts,
     ) -> Result<PdfDoc, ExtractError> {
         if pdf.len() > self.max_pdf_bytes {
-            return Err(ExtractError::TooLarge { bytes: pdf.len(), limit: self.max_pdf_bytes });
+            return Err(ExtractError::TooLarge {
+                bytes: pdf.len(),
+                limit: self.max_pdf_bytes,
+            });
         }
         // Truncated PDFs (e.g. CommonCrawl/wayback capped at ~1 MiB) have no
         // `%%EOF` trailer.
-        if !allow_truncated && !pdf_has_eof(pdf) {
+        if !opts.allow_truncated && !pdf_has_eof(pdf) {
             return Err(ExtractError::Truncated);
         }
 
@@ -183,12 +220,13 @@ impl PdfExtractor {
             .send_bytes(pdf);
 
         let body = match resp {
-            Ok(r) => r.into_string()
+            Ok(r) => r
+                .into_string()
                 .map_err(|e| ExtractError::Tika(format!("reading response: {e}")))?,
             Err(e) => return Err(ExtractError::Tika(e.to_string())),
         };
 
-        let (title, text) = parse_rmeta(&body)
+        let (title, text, xhtml) = parse_rmeta(&body, opts.keep_xhtml)
             .ok_or_else(|| ExtractError::Tika("unparseable /rmeta/text response".to_owned()))?;
 
         if text.trim().is_empty() {
@@ -204,16 +242,25 @@ impl PdfExtractor {
         } else {
             title.trim().chars().take(256).collect()
         };
-        Ok(PdfDoc { title, body: text, quality_ok })
+        Ok(PdfDoc {
+            title,
+            body: text,
+            quality_ok,
+            xhtml,
+        })
     }
 }
 
-/// Pull `(title, text)` out of Tika's `/rmeta/text` JSON.
+/// Pull `(title, text, xhtml)` out of Tika's `/rmeta` JSON.
 ///
 /// The response is an array of documents (the PDF plus any embedded files); the
 /// first entry is the PDF itself. Text from embedded entries is appended so an
 /// attached document's content is searchable too.
-fn parse_rmeta(json: &str) -> Option<(String, String)> {
+///
+/// The XHTML is returned only when `keep_xhtml` asks for it, and is the same
+/// concatenation the text is flattened from — one document's markup after
+/// another — so links found in it line up with the text a reader searches.
+fn parse_rmeta(json: &str, keep_xhtml: bool) -> Option<(String, String, Option<String>)> {
     let docs: Value = serde_json::from_str(json).ok()?;
     let arr = docs.as_array()?;
     let first = arr.first()?;
@@ -225,15 +272,20 @@ fn parse_rmeta(json: &str) -> Option<(String, String)> {
         .to_owned();
 
     let mut text = String::new();
+    let mut xhtml = keep_xhtml.then(String::new);
     for doc in arr {
         if let Some(c) = doc.get("X-TIKA:content").and_then(Value::as_str) {
             text.push_str(&xhtml_to_text(c));
             text.push('\n');
+            if let Some(x) = xhtml.as_mut() {
+                x.push_str(c);
+                x.push('\n');
+            }
         }
     }
     // Collapse the runs of whitespace Tika emits between layout blocks.
     let text = normalize_ws(&text);
-    Some((title, text))
+    Some((title, text, xhtml))
 }
 
 /// Flatten Tika's XHTML into text, keeping the one thing only it knows: where
@@ -283,8 +335,15 @@ fn strip_tags_into(xhtml: &str, out: &mut String) {
             return;
         };
         let tag = &rest[lt + 1..lt + gt];
-        let name = tag.trim_start_matches('/').split([' ', '/']).next().unwrap_or("");
-        if matches!(name, "p" | "div" | "br" | "li" | "tr" | "h1" | "h2" | "h3" | "table") {
+        let name = tag
+            .trim_start_matches('/')
+            .split([' ', '/'])
+            .next()
+            .unwrap_or("");
+        if matches!(
+            name,
+            "p" | "div" | "br" | "li" | "tr" | "h1" | "h2" | "h3" | "table"
+        ) {
             out.push('\n');
         }
         rest = &rest[lt + gt + 1..];
@@ -361,7 +420,9 @@ fn normalize_ws_page(s: &str) -> String {
             // Collapse the intra-line runs of spaces Tika leaves between glyphs.
             let mut first = true;
             for word in line.split_whitespace() {
-                if !first { out.push(' '); }
+                if !first {
+                    out.push(' ');
+                }
                 out.push_str(word);
                 first = false;
             }
@@ -376,9 +437,17 @@ fn normalize_ws_page(s: &str) -> String {
 fn title_from_url(url: &str) -> String {
     let path = url.split(['?', '#']).next().unwrap_or(url);
     let name = path.rsplit('/').find(|s| !s.is_empty()).unwrap_or(url);
-    let name = name.strip_suffix(".pdf").or_else(|| name.strip_suffix(".PDF")).unwrap_or(name);
+    let name = name
+        .strip_suffix(".pdf")
+        .or_else(|| name.strip_suffix(".PDF"))
+        .unwrap_or(name);
     // Filenames often use _ or %20 as spaces.
-    name.replace(['_', '+'], " ").replace("%20", " ").trim().chars().take(256).collect()
+    name.replace(['_', '+'], " ")
+        .replace("%20", " ")
+        .trim()
+        .chars()
+        .take(256)
+        .collect()
 }
 
 /// A complete PDF ends with a `%%EOF` trailer within its last stretch of bytes.
@@ -409,13 +478,13 @@ fn pdf_has_eof(pdf: &[u8]) -> bool {
 pub fn normalise_historic_forms(s: &str) -> String {
     fn replacement(c: char) -> Option<&'static str> {
         Some(match c {
-            'ſ' => "s",   // U+017F LATIN SMALL LETTER LONG S
+            'ſ' => "s", // U+017F LATIN SMALL LETTER LONG S
             'ﬀ' => "ff",
             'ﬁ' => "fi",
             'ﬂ' => "fl",
             'ﬃ' => "ffi",
             'ﬄ' => "ffl",
-            'ﬅ' => "st",  // long s + t
+            'ﬅ' => "st", // long s + t
             'ﬆ' => "st",
             _ => return None,
         })
@@ -471,7 +540,11 @@ pub fn looks_like_text(s: &str) -> bool {
     }
 
     let alnum_ratio = alnum as f64 / non_ws as f64;
-    let word_ratio  = if tokens > 0 { word_tokens as f64 / tokens as f64 } else { 0.0 };
+    let word_ratio = if tokens > 0 {
+        word_tokens as f64 / tokens as f64
+    } else {
+        0.0
+    };
     alnum_ratio >= 0.55 && word_ratio >= 0.4
 }
 
@@ -483,7 +556,10 @@ mod tests {
     fn the_long_s_becomes_an_s() {
         // The finding that made 22 OCR'd volumes unfindable: an index built
         // from Fraktur answers "Obſt" and not "Obst".
-        assert_eq!(normalise_historic_forms("Obſt und Kirſchen"), "Obst und Kirschen");
+        assert_eq!(
+            normalise_historic_forms("Obſt und Kirſchen"),
+            "Obst und Kirschen"
+        );
         assert_eq!(normalise_historic_forms("Waſſer"), "Wasser");
     }
 
@@ -496,7 +572,12 @@ mod tests {
 
     #[test]
     fn ordinary_text_is_returned_unchanged() {
-        for s in ["Obst und Kirschen", "", "plain ascii 123", "Äpfel, Birnen — Größe 5"] {
+        for s in [
+            "Obst und Kirschen",
+            "",
+            "plain ascii 123",
+            "Äpfel, Birnen — Größe 5",
+        ] {
             assert_eq!(normalise_historic_forms(s), s);
         }
     }
@@ -526,8 +607,7 @@ mod tests {
 
     #[test]
     fn rejects_ocr_letter_salad() {
-        let noise = "l1 ﬁ 3 rn |\\| . ,, '' ° ~ \\ / ] [ ; : rn1 l|l ¢ ° ﬂ 4 5 ‚‚ „ "
-            .repeat(6);
+        let noise = "l1 ﬁ 3 rn |\\| . ,, '' ° ~ \\ / ] [ ; : rn1 l|l ¢ ° ﬂ 4 5 ‚‚ „ ".repeat(6);
         assert!(!looks_like_text(&noise));
     }
 
@@ -584,7 +664,10 @@ mod tests {
         let text = xhtml_to_text(xhtml);
         assert!(text.contains("Größe & G"), "got: {text:?}");
         assert!(text.contains("<1 kg>"));
-        assert!(text.contains("&uuml;"), "an unknown entity is left as written");
+        assert!(
+            text.contains("&uuml;"),
+            "an unknown entity is left as written"
+        );
     }
 
     #[test]
@@ -624,7 +707,10 @@ mod tests {
     #[test]
     fn block_tags_keep_paragraphs_apart() {
         let text = xhtml_to_text("<div class=\"page\"><p>Apfel</p><p>Birne</p></div>");
-        assert!(text.contains("Apfel\nBirne") || text.contains("Apfel\n\nBirne"), "got: {text:?}");
+        assert!(
+            text.contains("Apfel\nBirne") || text.contains("Apfel\n\nBirne"),
+            "got: {text:?}"
+        );
     }
 
     #[test]
@@ -633,11 +719,45 @@ mod tests {
             {"dc:title":"Sortenliste","X-TIKA:content":"Roter  Berlepsch\n\n\nBoskoop"},
             {"X-TIKA:content":"angehängtes Dokument"}
         ]"#;
-        let (title, text) = parse_rmeta(json).unwrap();
+        let (title, text, xhtml) = parse_rmeta(json, false).unwrap();
         assert_eq!(title, "Sortenliste");
         assert!(text.contains("Roter Berlepsch"));
         assert!(text.contains("angehängtes Dokument"));
-        assert!(!text.contains("\n\n\n"), "whitespace not collapsed: {text:?}");
+        assert!(
+            !text.contains("\n\n\n"),
+            "whitespace not collapsed: {text:?}"
+        );
+        assert!(xhtml.is_none(), "nobody asked for the markup");
+    }
+
+    #[test]
+    fn the_markup_is_kept_only_when_asked_and_yields_the_links() {
+        // Flattening is lossy in exactly one way that matters here: an `<a
+        // href>` has no flattened form. Retention is what makes the links inside
+        // a PDF recoverable from the cache instead of from another OCR run.
+        let json = r#"[{
+            "dc:title": "Band 30",
+            "X-TIKA:content": "<html><body><p>Text</p><a href=\"band31.pdf\">nächster Band</a></body></html>"
+        }]"#;
+
+        let (_, text, xhtml) = parse_rmeta(json, true).unwrap();
+        let xhtml = xhtml.expect("keep_xhtml asked for it");
+        assert!(xhtml.contains("band31.pdf"), "{xhtml}");
+        assert!(
+            !text.contains("href"),
+            "the flattened text has no markup left in it: {text:?}",
+        );
+
+        // And they come back out with the same scanner the HTML path uses,
+        // resolved against the document's own URL.
+        let mut links = Vec::new();
+        crate::index::extract_pdf_links(&xhtml, "https://example.com/band30.pdf", &mut links);
+        assert_eq!(links, ["https://example.com/band31.pdf"]);
+
+        // Unasked, the same response yields no markup at all — which is the
+        // point: an OCR'd volume's XHTML is tens of megabytes, and `/text` has
+        // no use for it.
+        assert!(parse_rmeta(json, false).unwrap().2.is_none());
     }
 
     #[test]
