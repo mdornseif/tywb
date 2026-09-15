@@ -8,6 +8,18 @@ this project does not yet publish tagged releases, so everything lands under
 
 ## [Unreleased]
 
+- **The OCR worker's Tika settings are an override, not a replacement.**
+  `indexer.ocr_cache.tika` was a full `TikaConfig`, so changing one number meant
+  restating the URL, the OCR strategy, the languages and the size limit — and
+  the number that most needed changing was the timeout. A 400 MB scan
+  (`Pomologia Romaniaei.pdf`, archive.org) ran into the global 300 seconds and
+  was rescheduled for it, with no way to raise it for the worker alone. It is
+  now `WorkerTikaConfig`: every field optional, merged over the global block by
+  `TikaConfig::with_worker_override`, so `tika:\n  timeout_secs: 3600` is the
+  whole change. The URL *is* overridable here and still is not for a collection
+  — a collection says how its documents are parsed, the worker is another
+  process and may say where. Existing full blocks keep parsing unchanged.
+
 - **Each PDF URL export writes its own object.** The key defaults to
   `pdf-urls-{timestamp}.txt` (`{timestamp}` → UTC `YYYYmmdd-HHMMSS`) instead of
   one fixed `pdf-urls.txt`. Two producers write this list — an index run and
@@ -34,7 +46,7 @@ this project does not yet publish tagged releases, so everything lands under
   runs to tens of megabytes where its text runs to two: `/text` and the
   `pdf_bucket` path never build it.
 
-- **`export-pdf-urls --scan-links` decodes a record's whole body**, where ingest
+- **`export-pdf-urls` decodes a record's whole body**, where ingest
   stops at `max_text_bytes * 4`. The two are now deliberately different: the
   ingest cap is a memory budget for a streaming loop over multi-GB WARCs and
   says nothing about which links exist, while the scan holds one record at a
@@ -74,7 +86,7 @@ this project does not yet publish tagged releases, so everything lands under
 
   `tywb export-pdf-urls` produces the same artifact for the *whole* archive
   without a re-index: the captured half is a `SELECT DISTINCT` over the CDX
-  (7,627 URLs in well under a second), and `--scan-links` reads the indexed
+  (7,627 URLs in well under a second), and the link scan reads the indexed
   HTML back through one Range GET per record — the CDX coordinates, ~2 GB of
   transfer against the corpus's 116 GB — where `index --force` would cost the
   whole rebuild in days and re-queue OCR on the way. `--out` keeps a local

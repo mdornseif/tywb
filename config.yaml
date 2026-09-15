@@ -174,9 +174,13 @@ indexer:
   #   # format bump — entries cached before it was switched on stay valid hits
   #   # and are *not* re-extracted; they simply have no markup to give.
   #   keep_xhtml: true
-  #   # The worker's own Tika backend — a full `tika` block, URL included, so it
-  #   # can run against its own server with a generous timeout. Unset: the
-  #   # global indexer.tika above.
+  #   # The worker's Tika settings, layered over the global block above: state
+  #   # what differs, inherit the rest. Unlike a collection's override this one
+  #   # may also name its own `url`, because the worker is another process and
+  #   # may run against another server. Raising just the timeout for the big
+  #   # scans is one line:
+  #   #   tika:
+  #   #     timeout_secs: 3600
   #   tika:
   #     url: "http://127.0.0.1:9998"
   #     timeout_secs: 21600
@@ -260,8 +264,8 @@ indexer:
   #
   # The list holds what the run *processed*: an incremental run exports the
   # newly seen PDFs, `tywb index --force` the whole archive. For the whole
-  # archive without a re-index, use `tywb export-pdf-urls` (add `--scan-links`
-  # for half 2).
+  # archive without a re-index, use `tywb export-pdf-urls` — it always collects
+  # half 2 and 3 as well.
   #
   # `{timestamp}` in the key becomes the export's UTC time (YYYYmmdd-HHMMSS), so
   # every export is an object of its own. Two producers write this list, and one

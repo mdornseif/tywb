@@ -546,7 +546,7 @@ pub async fn run(cfg: Config, args: IndexArgs) -> anyhow::Result<()> {
     // records' HTML *linked to* — the ones the crawl may never have fetched.
     //
     // This covers what the run processed; `tywb export-pdf-urls` produces the
-    // same list for the whole archive (CDX plus `--scan-links`) through the very
+    // same list for the whole archive (CDX plus the link scan) through the very
     // same merge, render and upload code.
     if cfg.indexer.pdf_url_export.is_some() {
         let report = crate::pdf_url_export::merge(

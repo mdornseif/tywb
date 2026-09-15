@@ -235,13 +235,13 @@ pub struct OcrCacheConfig {
     /// rescheduling it.
     #[serde(default = "default_ocr_max_attempts")]
     pub max_attempts: u32,
-    /// The worker's own Tika backend. A full `tika` block, URL included —
-    /// unlike a collection's override, the URL *may* differ, because this is
-    /// a *where* question: the worker can run against its own tika-server
-    /// with a generous timeout while the indexer needs no Tika at all.
-    /// Unset: the global `indexer.tika`.
+    /// The worker's text-extraction settings, layered over the global
+    /// `indexer.tika`: state what differs, inherit the rest. Unlike a
+    /// collection's override this one *may* move the URL — the worker is another
+    /// process, and can run against its own server while the indexer needs no
+    /// Tika at all. See [`WorkerTikaConfig`].
     #[serde(default)]
-    pub tika: Option<TikaConfig>,
+    pub tika: Option<WorkerTikaConfig>,
     /// Retain Tika's XHTML beside the extracted text, as
     /// `text/<xy>/<digest>.tywb.xhtml`.
     ///
@@ -383,6 +383,67 @@ impl TikaConfig {
             timeout_secs: o.timeout_secs.unwrap_or(self.timeout_secs),
         }
     }
+
+    /// This configuration with the OCR worker's overrides applied.
+    ///
+    /// The same rule as [`with_override`] — unset fields keep the global value —
+    /// with one difference: the URL is overridable here. A collection says how
+    /// its documents are parsed; the worker is a separate process and may also
+    /// say where it parses them. See [`WorkerTikaConfig`].
+    ///
+    /// [`with_override`]: Self::with_override
+    pub fn with_worker_override(&self, o: &WorkerTikaConfig) -> TikaConfig {
+        TikaConfig {
+            url: o.url.clone().unwrap_or_else(|| self.url.clone()),
+            ocr_strategy: o
+                .ocr_strategy
+                .clone()
+                .unwrap_or_else(|| self.ocr_strategy.clone()),
+            ocr_languages: o
+                .ocr_languages
+                .clone()
+                .unwrap_or_else(|| self.ocr_languages.clone()),
+            max_pdf_bytes: o.max_pdf_bytes.unwrap_or(self.max_pdf_bytes),
+            timeout_secs: o.timeout_secs.unwrap_or(self.timeout_secs),
+        }
+    }
+}
+
+/// The OCR worker's text-extraction settings, layered over the global
+/// [`IndexerConfig::tika`].
+///
+/// Every field is optional, *including the URL*, and that is the difference from
+/// a collection's [`TikaOverride`]: a collection says how its documents are
+/// parsed and must not move the endpoint, while the worker is another process —
+/// possibly on another machine, with no index loop to keep responsive — so
+/// *where* and *how long* are legitimately its own questions.
+///
+/// This used to be a full [`TikaConfig`], which meant restating the URL, the OCR
+/// strategy, the languages and the size limit to change one number. The document
+/// that made that hurt was a 400 MB scan whose extraction ran into the global
+/// 300-second timeout and was rescheduled for it: the only knob that could have
+/// helped was the one that could not be turned without repeating the whole
+/// backend.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerTikaConfig {
+    /// The worker's own `tika-server`. Unset: the global one.
+    #[serde(default)]
+    pub url: Option<String>,
+    /// `no_ocr`, `auto` or `ocr_only`. Unset: the global one.
+    #[serde(default)]
+    pub ocr_strategy: Option<String>,
+    /// Tesseract languages, e.g. `deu+frk`. Unset: the global one.
+    #[serde(default)]
+    pub ocr_languages: Option<String>,
+    /// Size ceiling. The worker has no ingest loop standing behind it, so it can
+    /// afford a higher one than the index run.
+    #[serde(default)]
+    pub max_pdf_bytes: Option<usize>,
+    /// Per-document timeout. This is the knob that the 300-second default turns
+    /// into a failure on big scans; raise it here rather than for the indexer.
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
 }
 
 /// Configuration for the optional Apache Tika text-extraction backend.
@@ -1110,11 +1171,102 @@ indexer:
         // jobs after three attempts.
         assert_eq!(ocr.workers, 2);
         assert_eq!(ocr.max_attempts, 3);
-        // The worker's own backend, URL included.
-        let tika = ocr.tika.as_ref().unwrap();
-        assert_eq!(tika.url, "http://127.0.0.1:9999");
-        assert_eq!(tika.timeout_secs, 21600);
-        assert_eq!(tika.ocr_strategy, "auto", "unstated fields fall back");
+        // The worker's settings are layered over the global block, not a
+        // replacement for it: it names a server and a timeout, and inherits the
+        // rest — which is what makes changing one number a one-line change.
+        let merged = cfg
+            .indexer
+            .tika
+            .as_ref()
+            .unwrap()
+            .with_worker_override(ocr.tika.as_ref().unwrap());
+        assert_eq!(
+            merged.url, "http://127.0.0.1:9999",
+            "the worker may point at its own server",
+        );
+        assert_eq!(merged.timeout_secs, 21600);
+        assert_eq!(merged.ocr_strategy, "auto", "unstated fields fall back");
+        assert_eq!(merged.ocr_languages, "deu+frk+eng");
+        assert_eq!(merged.max_pdf_bytes, 100 * 1024 * 1024);
+    }
+
+    #[test]
+    fn the_worker_states_only_the_number_it_wants_to_change() {
+        // The case that was impossible before: a 400 MB scan running into the
+        // global 300-second timeout, with the one knob that could help buried
+        // under a full backend definition that had to be repeated to turn it.
+        let cfg = Config::from_yaml(
+            "s3:\n  bucket: warc\nindexer:\n  tika:\n    url: 'http://127.0.0.1:9998'\n    \
+             ocr_strategy: no_ocr\n    max_pdf_bytes: 629145600\n    timeout_secs: 300\n  \
+             ocr_cache:\n    path: /tmp/c\n    tika:\n      timeout_secs: 3600\n",
+        )
+        .unwrap();
+        let merged = cfg.indexer.tika.as_ref().unwrap().with_worker_override(
+            cfg.indexer
+                .ocr_cache
+                .as_ref()
+                .unwrap()
+                .tika
+                .as_ref()
+                .unwrap(),
+        );
+        assert_eq!(merged.timeout_secs, 3600, "the one number stated");
+        assert_eq!(merged.url, "http://127.0.0.1:9998", "the rest inherited");
+        assert_eq!(merged.ocr_strategy, "no_ocr");
+        assert_eq!(merged.max_pdf_bytes, 629145600);
+    }
+
+    #[test]
+    fn a_worker_backend_stands_alone_when_there_is_no_global_one() {
+        // The indexer needs no Tika at all when the worker has one — so the
+        // worker's block must be able to be the whole story.
+        let cfg = Config::from_yaml(
+            "s3:\n  bucket: warc\nindexer:\n  ocr_cache:\n    path: /tmp/c\n    tika:\n      \
+             url: 'http://worker:9998'\n",
+        )
+        .unwrap();
+        assert!(cfg.indexer.tika.is_none());
+        let over = cfg
+            .indexer
+            .ocr_cache
+            .as_ref()
+            .unwrap()
+            .tika
+            .as_ref()
+            .unwrap();
+        let merged = TikaConfig::default().with_worker_override(over);
+        assert_eq!(merged.url, "http://worker:9998");
+        assert_eq!(merged.timeout_secs, 300, "defaults fill in the rest");
+    }
+
+    #[test]
+    fn a_collection_still_may_not_move_the_url() {
+        // The worker's new freedom is not a general one. A collection says how
+        // its documents are parsed; where they are parsed is one service.
+        let err = Config::from_yaml(
+            "s3:\n  bucket: warc\nindexer:\n  collections:\n    - name: c\n      type: pdf_bucket\n      \
+             bucket: b\n      tika:\n        url: 'http://other:9998'\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("url"),
+            "error should name the stray key: {err}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_key_inside_the_worker_tika_is_an_error() {
+        let err = Config::from_yaml(
+            "s3:\n  bucket: warc\nindexer:\n  ocr_cache:\n    path: /tmp/c\n    tika:\n      \
+             timeout: 60\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("timeout"),
+            "error should name the stray key: {err}"
+        );
     }
 
     #[test]

@@ -83,16 +83,26 @@ pub async fn run(cfg: Config, args: WorkerArgs) -> Result<()> {
         .as_ref()
         .context("indexer.ocr_cache is not configured — set indexer.ocr_cache.path")?;
 
-    let tika = ocr_cfg
-        .tika
-        .as_ref()
-        .or(cfg.indexer.tika.as_ref())
-        .context(
-            "no Tika backend — set indexer.ocr_cache.tika (or indexer.tika, if the index \
-             process shares one) to extract text from PDFs",
-        )?;
-    info!(url = %tika.url, timeout_secs = tika.timeout_secs, "ocr-worker starting");
-    let extractor = PdfExtractor::new(tika);
+    // The worker's settings are layered over the global ones: it states what
+    // differs — usually a longer timeout, optionally its own server — and
+    // inherits the rest. With no global block the defaults stand in, which is
+    // what lets the indexer run without Tika at all while the worker has one;
+    // a missing URL is then the thing to name.
+    let global = cfg.indexer.tika.clone().unwrap_or_default();
+    let tika = match &ocr_cfg.tika {
+        Some(over) => global.with_worker_override(over),
+        None => global,
+    };
+    if tika.url.is_empty() {
+        anyhow::bail!(
+            "no Tika backend — set indexer.tika.url, or indexer.ocr_cache.tika.url for the \
+             worker's own server; nothing can extract text from PDFs without one"
+        );
+    }
+    info!(url = %tika.url, timeout_secs = tika.timeout_secs, ocr = %tika.ocr_strategy,
+          max_pdf_bytes = tika.max_pdf_bytes,
+          overridden = ocr_cfg.tika.is_some(), "ocr-worker starting");
+    let extractor = PdfExtractor::new(&tika);
 
     let cache = OcrCache::open(Path::new(&ocr_cfg.path))
         .with_context(|| format!("opening the OCR text cache at {}", ocr_cfg.path))?;

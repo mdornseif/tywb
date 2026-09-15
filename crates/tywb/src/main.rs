@@ -85,27 +85,23 @@ enum Command {
     /// Write every PDF URL the index knows to a text file and upload it to
     /// `indexer.pdf_url_export`'s bucket.
     ///
-    /// Two halves: the records that *are* PDFs (a `SELECT DISTINCT` over the
-    /// CDX, under a second) and — with `--scan-links` — the PDFs the indexed
-    /// HTML points at, read back through one Range GET per record. That is the
-    /// complete list, every collection, without a re-index; `index --force`
-    /// would collect the same URLs at the cost of the whole rebuild (days on a
-    /// large archive) and re-queue OCR on the way.
+    /// Always both halves: the records that *are* PDFs (a `SELECT DISTINCT` over
+    /// the CDX) and the PDFs the archive *points at* — out of the indexed HTML,
+    /// read back through one Range GET per record, and out of the markup the OCR
+    /// cache retained. That is the complete list without a re-index; `index
+    /// --force` would collect the same URLs at the cost of the whole rebuild
+    /// (days on a large archive) and re-queue OCR on the way.
     ExportPdfUrls {
         /// Also write the list to this local file.
         #[arg(long)]
         out: Option<PathBuf>,
-        /// Read the CDX and report the counts, but do not upload.
+        /// Read, scan and report the counts, but do not upload.
         #[arg(long)]
         dry_run: bool,
-        /// Also read the indexed HTML back out of S3 and collect the PDFs it
-        /// links to — the documents the crawl may never have fetched.
-        #[arg(long)]
-        scan_links: bool,
-        /// Records fetched concurrently by `--scan-links`.
+        /// Records fetched concurrently.
         #[arg(long, default_value_t = 8)]
         jobs: usize,
-        /// Stop `--scan-links` after this many HTML records.
+        /// Stop the HTML scan after this many records — a sample, not a mode.
         #[arg(long)]
         limit: Option<usize>,
     },
@@ -259,7 +255,6 @@ async fn main() -> anyhow::Result<()> {
         Command::ExportPdfUrls {
             out,
             dry_run,
-            scan_links,
             jobs,
             limit,
         } => {
@@ -268,7 +263,6 @@ async fn main() -> anyhow::Result<()> {
                 pdf_url_export::ExportArgs {
                     out,
                     dry_run,
-                    scan_links,
                     jobs,
                     limit,
                 },

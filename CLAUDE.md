@@ -429,7 +429,7 @@ Two producers, one artifact (`crates/tywb/src/pdf_url_export.rs`). A run only
 knows its own objects, so "all of them" would mean a re-index — days on this
 archive, and it re-queues OCR on the way. `tywb export-pdf-urls` gets the same
 list from what is already stored: the captured half is a `SELECT DISTINCT` over
-the CDX (7,627 URLs in well under a second), and `--scan-links` reads the
+the CDX (7,627 URLs in well under a second), and the link scan reads the
 indexed HTML back through one Range GET per record — the CDX coordinates, ~2 GB
 of transfer against the corpus's 116 GB, about an hour for 42,617 records — then
 adds the PDFs' own links out of the retained XHTML, which costs no network at
@@ -505,16 +505,14 @@ cargo run --release -p tywb -- --config config.local.yaml ocr-worker --prefill
 cargo run --release -p tywb -- --config config.local.yaml ocr-worker
 
 # 4c. Export every PDF URL the index knows, and upload it to
-#     indexer.pdf_url_export's bucket. Without a flag this is the captured half
-#     only (a CDX read, under a second):
-cargo run --release -p tywb -- --config config.local.yaml export-pdf-urls
-#     Add --scan-links for the PDFs the indexed HTML points at — one Range GET
-#     per record, ~an hour for 42k records, and no re-index:
-cargo run --release -p tywb -- --config config.local.yaml \
-    export-pdf-urls --scan-links --jobs 24
+#     indexer.pdf_url_export's bucket. Always both halves: the records that are
+#     PDFs (a CDX read) and the PDFs the archive points at — out of the indexed
+#     HTML, one Range GET per record (~an hour for 42k records, no re-index),
+#     and out of the markup the OCR cache retained (local disk, seconds):
+cargo run --release -p tywb -- --config config.local.yaml export-pdf-urls --jobs 24
 #     Sample or inspect it locally first:
 cargo run --release -p tywb -- --config config.local.yaml \
-    export-pdf-urls --scan-links --limit 300 --dry-run --out /tmp/pdf-urls.txt
+    export-pdf-urls --limit 300 --dry-run --out /tmp/pdf-urls.txt
 
 # 5. Repair whole-file-gzip WARCs (see "Record-per-member .warc.gz" below)
 cargo run --release -p tywb -- --config config.local.yaml recompress --scan-only

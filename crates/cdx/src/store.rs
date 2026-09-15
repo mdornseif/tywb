@@ -681,7 +681,7 @@ impl CdxStore {
     /// Stream every HTML-ish record of the primary WARC collection through `f`.
     /// Returns how many records were seen.
     ///
-    /// The population `tywb export-pdf-urls --scan-links` parses for links to
+    /// The population `tywb export-pdf-urls` parses for links to
     /// PDFs — the same MIME set the indexer treats as markup. Restricted to
     /// `collection = 'warc'`: a `pdf_bucket` collection holds standalone PDFs
     /// and no HTML to read links out of. Unlike [`for_each_warc_pdf`] there is

@@ -3,22 +3,30 @@
 //! The list has two halves, and they answer different questions:
 //!
 //! * **captured** — URLs of records that *are* PDFs. The archive holds these;
-//!   the CDX knows every one of them, in every collection.
-//! * **linked** — URLs the indexed HTML *points at*. These are the interesting
-//!   ones for an external archiver: a page linking to a document is evidence
-//!   the document exists whether or not the crawl ever fetched it.
+//!   the CDX knows every one of them, in every collection. A `SELECT DISTINCT`,
+//!   under a second.
+//! * **linked** — URLs the indexed HTML *points at*, plus the ones inside the
+//!   archive's own PDFs. These are the interesting ones for an external
+//!   archiver: a page linking to a document is evidence the document exists
+//!   whether or not the crawl ever fetched it.
 //!
 //! Both are collected during indexing, where the decoded bytes are already in
 //! hand (`index.rs`). This subcommand exists because a run only knows its own
 //! objects, so "all of them" would otherwise mean a full re-index — days on a
 //! large archive, and it re-queues OCR on the way. Instead:
 //!
-//! * the captured half is a `SELECT DISTINCT` over the CDX, under a second;
-//! * the linked half, with `--scan-links`, reads the indexed HTML back through
-//!   one Range GET per record — the CDX coordinates, not a re-download of the
-//!   WARC objects. On the corpus this was written against that is ~2 GB of
-//!   transfer instead of 116 GB, which turns a background job of minutes into
-//!   the answer instead of a rebuild.
+//! * the linked half from HTML reads the records back through one Range GET
+//!   each — the CDX coordinates, not a re-download of the WARC objects. On the
+//!   corpus this was written against that is ~2 GB of transfer instead of 116
+//!   GB, which turns a background job of minutes into the answer instead of a
+//!   rebuild;
+//! * the linked half from PDFs reads the markup the OCR cache retained
+//!   (`ocr_cache.keep_xhtml`) — local disk, no network, no extraction.
+//!
+//! Both halves always run, and there is deliberately no mode that produces only
+//! the captured URLs: a list that quietly omits the links is a wrong answer
+//! shaped like a right one, and the cheap captured-only list is what an index
+//! run already uploads at the end of every run anyway.
 //!
 //! Every path renders and uploads through the same functions, so a list from
 //! the CDX, a list from a run and a list from a scan are indistinguishable.
@@ -38,14 +46,11 @@ use warc_search_s3::{build_client, put_object};
 pub struct ExportArgs {
     /// Also write the list to this local file.
     pub out: Option<PathBuf>,
-    /// Read the CDX and report, but do not upload.
+    /// Read, scan and report, but do not upload.
     pub dry_run: bool,
-    /// Also read the indexed HTML back out of S3 and collect the PDFs it links
-    /// to — one Range GET per record.
-    pub scan_links: bool,
-    /// Records fetched concurrently by `--scan-links`.
+    /// Records fetched concurrently.
     pub jobs: usize,
-    /// Stop `--scan-links` after this many HTML records.
+    /// Stop the HTML scan after this many records (a sample, not a mode).
     pub limit: Option<usize>,
 }
 
@@ -373,18 +378,12 @@ pub async fn run(cfg: Config, args: ExportArgs) -> anyhow::Result<()> {
         .pdf_urls()
         .context("reading the PDF URLs out of the CDX")?;
 
-    let linked = if args.scan_links {
-        let mut found = scan_links(&cfg, &cdx, args.jobs, args.limit).await?;
-        // The archive's own PDFs link out too, and their markup is on local
-        // disk rather than in S3 — no fetch, no extraction.
-        found.extend(cached_pdf_links(&cfg, &cdx)?);
-        found
-    } else {
-        if !args.dry_run || args.out.is_some() {
-            info!("not scanning the HTML for links — pass --scan-links for the PDFs the archive points at");
-        }
-        Vec::new()
-    };
+    // Both halves, always — see the module docs for why there is no mode that
+    // skips the links.
+    let mut linked = scan_links(&cfg, &cdx, args.jobs, args.limit).await?;
+    // The archive's own PDFs link out too, and their markup is on local disk
+    // rather than in S3 — no fetch, no extraction.
+    linked.extend(cached_pdf_links(&cfg, &cdx)?);
 
     let report = merge(captured, linked, |url| cfg.indexer.is_url_blacklisted(url));
     info!(
