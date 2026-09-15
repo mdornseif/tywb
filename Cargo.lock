@@ -3173,7 +3173,7 @@ checksum = "562d481066bde0658276a35467c4af00bdc6ee726305698a55b86e61d7ad82bb"
 
 [[package]]
 name = "tywb"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "aws-sdk-s3",
@@ -3323,7 +3323,7 @@ dependencies = [
 
 [[package]]
 name = "warc"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "bytes",
  "chrono",
@@ -3333,7 +3333,7 @@ dependencies = [
 
 [[package]]
 name = "warc-search-cdx"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "chrono",
  "rusqlite",
@@ -3346,7 +3346,7 @@ dependencies = [
 
 [[package]]
 name = "warc-search-config"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "regex",
  "serde",
@@ -3356,7 +3356,7 @@ dependencies = [
 
 [[package]]
 name = "warc-search-s3"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "async-compression",
  "aws-config",
@@ -3375,7 +3375,7 @@ dependencies = [
 
 [[package]]
 name = "warc-search-search"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "serde",
  "serde_json",

@@ -8,6 +8,17 @@ this project does not yet publish tagged releases, so everything lands under
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [0.3.0] - 2026-09-15
+
+Everything accumulated under *Unreleased* since the `v0.2.0` tag (2026-09-03,
+which carried no section here and no version bump in `Cargo.toml` — both are
+fixed by this one). It ships as a single version because the parts depend on
+each other: the digest-keyed OCR cache, the XHTML retained in it, the
+wire-format peeling every reader shares, and the PDF URL export that reads the
+result back out.
+
 - **Tika's answer has its own limit, and it is ours.** `max_response_bytes`
   (default 64 MiB, overridable per collection and per worker) bounds the response
   where `max_pdf_bytes` bounds the document — and the two are not proportional:
