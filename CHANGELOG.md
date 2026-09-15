@@ -8,6 +8,27 @@ this project does not yet publish tagged releases, so everything lands under
 
 ## [Unreleased]
 
+- **Tika's answer has its own limit, and it is ours.** `max_response_bytes`
+  (default 64 MiB, overridable per collection and per worker) bounds the response
+  where `max_pdf_bytes` bounds the document — and the two are not proportional:
+  a large volume's text can be small, and a modest scan's markup is not. Reading
+  the body was `ureq::Response::into_string`, which caps at a hardcoded 10 MiB
+  and reports only "response too big for into_string". A 400 MB scan
+  (`Pomologia Romaniaei.pdf`) failed three times for it and was parked; with the
+  limit raised it extracts 16,073,212 characters in about five minutes. Over the
+  limit is a fact about the configuration, not the document, so it is reported
+  with the number to raise and deliberately *not* cached as a negative entry — a
+  digest-keyed "no text" never expires, and would have hidden the book forever,
+  including after the fix.
+
+- **A rescheduled job is no longer reported as a parked one.** Every failure
+  counted as `parked` while `Counters::rescheduled` sat unused, and the
+  reschedule itself logged at `debug` — so a run summarised `parked=1` with an
+  empty `failed/` and a job still in the queue, and the reason it was failing
+  was reachable only at `RUST_LOG=debug`. Both outcomes are now counted and
+  logged separately, at WARN, with the reason. That is what made the 10 MiB cap
+  above findable at all.
+
 - **The OCR worker's Tika settings are an override, not a replacement.**
   `indexer.ocr_cache.tika` was a full `TikaConfig`, so changing one number meant
   restating the URL, the OCR strategy, the languages and the size limit — and

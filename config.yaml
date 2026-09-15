@@ -142,6 +142,12 @@ indexer:
   #   max_pdf_bytes: 104857600  # 100 MiB
   #   # Per-document timeout; OCR of a big scan can be slow.
   #   timeout_secs: 300
+  #   # Ceiling on Tika's *answer*, which is not proportional to the document:
+  #   # a large volume's text can be small, and a modest scan's markup is not
+  #   # (with ocr_cache.keep_xhtml, one span per OCR'd word). ureq's own
+  #   # into_string() stops at a hardcoded 10 MiB and says only "response too
+  #   # big", which is what parked a 400 MB scan three times over.
+  #   max_response_bytes: 67108864  # 64 MiB
 
   # ── OCR text cache (optional) ──────────────────────────────────────────────
   # Decouples OCR from the index run: with this block set, `tywb index` never

@@ -209,6 +209,19 @@ quality gate (`pdf::looks_like_text`) drops OCR noise before it reaches the
 index. With `tika` unset, PDFs stay browsable but unsearchable — no external
 dependency. See `crates/tywb/src/pdf.rs` and `playbooks/tika.yml` (ops repo).
 
+Two limits, and they are not the same limit. `max_pdf_bytes` bounds the
+document going in; `max_response_bytes` bounds Tika's answer coming back, and
+the answer is not proportional to the question — a large volume's text can be
+small, and a modest scan's markup is not. Reading that answer used to be
+`ureq::Response::into_string`, which caps at a hardcoded 10 MiB and reports
+only "response too big for into_string": a 400 MB scan (`Pomologia Romaniaei`,
+16 MB of text once read) failed three times for it and was parked, with the
+cause reachable only at `RUST_LOG=debug`. `pdf::read_tika_response` reads the
+body under our own limit and names the knob to raise. Over the limit is a
+statement about the configuration, not the document, so it is *not* cached as a
+negative entry — a digest-keyed "no text" would outlive the fix and hide the
+book forever.
+
 ### The stored body is not the content
 A WARC holds the HTTP response exactly as it came off the wire: after the
 headers can come `Transfer-Encoding: chunked` framing, and inside that a
@@ -318,6 +331,20 @@ optionally against the worker's own Tika server, so the index machine needs no
 Tika at all. The digest dedupes: the same PDF collected in two crawls lands in
 the queue once and is extracted once. `tywb ocr-worker --prefill` scans the CDX
 for PDF records not yet in the cache and fills the queue before a rebuild.
+
+`indexer.ocr_cache.tika` is an *override*, not a replacement: state the one
+number that differs — usually `timeout_secs`, sometimes `max_response_bytes` —
+and inherit the rest. It may also name its own `url`, which a collection's
+override may not, because the worker is a separate process and *where* it parses
+is legitimately its own question. The worker logs the settings actually in force
+at startup, so a timeout that came from an override is not one anybody has to
+guess at.
+
+A job that fails is rescheduled, and a job that exhausts `max_attempts` is
+parked in `failed/`; the two are counted separately and both are logged at WARN
+with the reason. They were once one counter labelled `parked` and one `debug`
+line, which reported a document as given up on while it sat in the queue waiting
+for its next attempt — and hid the reason it was failing at all.
 
 Failures of the *file* (too large, truncated, empty, undecodable) are cached as
 empty entries (`source-digest=… title=\n`) rather than retried: the answer will

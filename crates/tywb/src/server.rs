@@ -1301,6 +1301,10 @@ async fn extract_capture_text(
                 let status = match e {
                     ExtractError::TooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
                     ExtractError::Tika(_) => StatusCode::BAD_GATEWAY,
+                    // Our limit, not the upstream's: Tika answered and we
+                    // refused to read all of it. A 502 would send whoever looks
+                    // at this off debugging Tika, and the fix is a config value.
+                    ExtractError::ResponseTooLarge { .. } => StatusCode::INTERNAL_SERVER_ERROR,
                     ExtractError::Empty | ExtractError::Truncated => {
                         StatusCode::UNPROCESSABLE_ENTITY
                     }

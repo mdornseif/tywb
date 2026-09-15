@@ -93,6 +93,13 @@ pub enum ExtractError {
     Tika(String),
     /// Tika parsed the file but returned no text at all.
     Empty,
+    /// Tika's answer was larger than `tika.max_response_bytes`.
+    ///
+    /// Not a fact about the document — with a higher limit it would parse — so
+    /// it is deliberately *not* cached as a negative entry: a digest-keyed "no
+    /// text" would outlive the config change and hide the document forever.
+    /// Reported with the number to raise, and parked after the retries.
+    ResponseTooLarge { bytes: usize, limit: usize },
 }
 
 impl fmt::Display for ExtractError {
@@ -104,6 +111,11 @@ impl fmt::Display for ExtractError {
             Self::Truncated => write!(f, "PDF is truncated (no %%EOF trailer)"),
             Self::Tika(e) => write!(f, "Tika extraction failed: {e}"),
             Self::Empty => write!(f, "Tika returned no text"),
+            Self::ResponseTooLarge { bytes, limit } => write!(
+                f,
+                "Tika's response was {bytes} bytes, over the {limit}-byte limit — raise \
+                 indexer.tika.max_response_bytes (or the worker's own)"
+            ),
         }
     }
 }
@@ -119,6 +131,7 @@ pub struct PdfExtractor {
     ocr_strategy: String,
     ocr_languages: String,
     max_pdf_bytes: usize,
+    max_response_bytes: usize,
 }
 
 impl PdfExtractor {
@@ -140,6 +153,7 @@ impl PdfExtractor {
             ocr_strategy: cfg.ocr_strategy.clone(),
             ocr_languages: cfg.ocr_languages.clone(),
             max_pdf_bytes: cfg.max_pdf_bytes,
+            max_response_bytes: cfg.max_response_bytes,
         }
     }
 
@@ -220,9 +234,7 @@ impl PdfExtractor {
             .send_bytes(pdf);
 
         let body = match resp {
-            Ok(r) => r
-                .into_string()
-                .map_err(|e| ExtractError::Tika(format!("reading response: {e}")))?,
+            Ok(r) => read_tika_response(r, self.max_response_bytes)?,
             Err(e) => return Err(ExtractError::Tika(e.to_string())),
         };
 
@@ -249,6 +261,36 @@ impl PdfExtractor {
             xhtml,
         })
     }
+}
+
+/// Read Tika's response body, bounded by `limit`.
+///
+/// Not `Response::into_string()`: ureq caps that at a hardcoded 10 MiB
+/// (`INTO_STRING_LIMIT`) and says only "response too big for into_string". A
+/// 400 MB volume's parse produces more than that — and with `keep_xhtml` on, so
+/// does a much smaller one, because the markup of an OCR'd page carries a span
+/// per word. The failure reads like a transport problem, so it was retried
+/// three times and parked with the cause visible only at `RUST_LOG=debug`.
+/// Reading the body here makes the limit ours to set and the message ours to
+/// write.
+fn read_tika_response(resp: ureq::Response, limit: usize) -> Result<String, ExtractError> {
+    use std::io::Read as _;
+
+    let mut buf = Vec::new();
+    // One byte past the limit, so "exactly at it" and "over it" differ.
+    resp.into_reader()
+        .take(limit as u64 + 1)
+        .read_to_end(&mut buf)
+        .map_err(|e| ExtractError::Tika(format!("reading response: {e}")))?;
+    if buf.len() > limit {
+        return Err(ExtractError::ResponseTooLarge {
+            bytes: buf.len(),
+            limit,
+        });
+    }
+    // Tika answers JSON, so UTF-8; a stray invalid byte must not cost the whole
+    // document.
+    Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
 /// Pull `(title, text, xhtml)` out of Tika's `/rmeta` JSON.
@@ -758,6 +800,22 @@ mod tests {
         // point: an OCR'd volume's XHTML is tens of megabytes, and `/text` has
         // no use for it.
         assert!(parse_rmeta(json, false).unwrap().2.is_none());
+    }
+
+    #[test]
+    fn a_too_large_response_names_the_knob_to_raise() {
+        // The failure that cost a 400 MB volume three attempts and a park in
+        // `failed/`: ureq's own wording, "response too big for into_string",
+        // names a function nobody calls and a limit nobody can set. Ours has to
+        // say which number to change.
+        let e = ExtractError::ResponseTooLarge {
+            bytes: 71 * 1024 * 1024,
+            limit: 64 * 1024 * 1024,
+        };
+        let s = e.to_string();
+        assert!(s.contains("max_response_bytes"), "{s}");
+        assert!(s.contains("74448896"), "the size it actually got: {s}");
+        assert!(s.contains("67108864"), "the limit that was in force: {s}");
     }
 
     #[test]

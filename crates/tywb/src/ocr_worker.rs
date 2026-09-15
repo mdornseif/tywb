@@ -60,7 +60,12 @@ enum Outcome {
     AlreadyInCache,
     Extracted(usize, u64), // (chars, secs)
     NoText,
-    Failed,
+    /// A failure of the *run* — S3, Tika, a limit set too low for this
+    /// document. The job stays queued for its next attempt.
+    Rescheduled,
+    /// The same after `max_attempts`: moved to `failed/`, where it stays visible
+    /// instead of looping.
+    Parked,
 }
 
 /// Summary counters.
@@ -100,7 +105,7 @@ pub async fn run(cfg: Config, args: WorkerArgs) -> Result<()> {
         );
     }
     info!(url = %tika.url, timeout_secs = tika.timeout_secs, ocr = %tika.ocr_strategy,
-          max_pdf_bytes = tika.max_pdf_bytes,
+          max_pdf_bytes = tika.max_pdf_bytes, max_response_bytes = tika.max_response_bytes,
           overridden = ocr_cfg.tika.is_some(), "ocr-worker starting");
     let extractor = PdfExtractor::new(&tika);
 
@@ -212,7 +217,10 @@ pub async fn run(cfg: Config, args: WorkerArgs) -> Result<()> {
                           "PDF has no extractable text — cached as such");
                     counters.lock().unwrap().no_text += 1;
                 }
-                Outcome::Failed => {
+                Outcome::Rescheduled => {
+                    counters.lock().unwrap().rescheduled += 1;
+                }
+                Outcome::Parked => {
                     counters.lock().unwrap().parked += 1;
                 }
                 Outcome::AlreadyInCache => {
@@ -233,6 +241,7 @@ pub async fn run(cfg: Config, args: WorkerArgs) -> Result<()> {
         extracted = cnt.extracted,
         no_text = cnt.no_text,
         from_cache = cnt.from_cache,
+        rescheduled = cnt.rescheduled,
         parked = cnt.parked,
         "OCR worker finished",
     );
@@ -260,7 +269,7 @@ async fn run_job(
             if let Err(e) = cache.put(&job.digest, &doc.title, &doc.body) {
                 error!(digest = %job.digest, err = %e,
                        "could not store the extracted text — job stays queued");
-                return Outcome::Failed;
+                return Outcome::Rescheduled;
             }
             // The markup, beside the text. Written second and best effort: the
             // text is what makes the entry a hit, and a document whose XHTML
@@ -282,15 +291,18 @@ async fn run_job(
             if let Err(e) = cache.put(&job.digest, "", "") {
                 error!(digest = %job.digest, err = %e,
                        "could not cache the negative answer — job will be retried");
-                return Outcome::Failed;
+                return Outcome::Rescheduled;
             }
             cache.remove_job(path);
             Outcome::NoText
         }
         Err(reason) => {
-            // A transient failure — S3, Tika, or a restarted worker.
+            // A failure of the run, not of the file — S3, Tika, or a limit set
+            // too low for this document. `retry` has already said which and why;
+            // the distinction the caller needs is whether it will be tried again.
             match cache.retry(path, job, &reason, max_attempts) {
-                JobRetry::Rescheduled | JobRetry::Parked => Outcome::Failed,
+                JobRetry::Rescheduled => Outcome::Rescheduled,
+                JobRetry::Parked => Outcome::Parked,
             }
         }
     }
@@ -366,6 +378,60 @@ async fn fetch_and_extract(
 mod tests {
     use super::*;
     use crate::ocr_cache::OcrJob;
+
+    // ── Which failures are the file's, and which are the run's ────────────
+
+    /// Mirrors the classification `fetch_and_extract` makes: a fact about the
+    /// *file* is cached as a negative entry so nobody pays for it again, a fact
+    /// about the *run* is retried.
+    fn is_a_fact_about_the_file(e: &ExtractError) -> bool {
+        matches!(
+            e,
+            ExtractError::TooLarge { .. } | ExtractError::Truncated | ExtractError::Empty
+        )
+    }
+
+    #[test]
+    fn a_too_large_response_is_retried_not_cached_as_no_text() {
+        // The trap this classification exists to avoid: a negative entry is
+        // keyed by content digest and never expires, so caching "no text" for a
+        // document that only failed because a limit was set too low would hide
+        // it forever — including after the limit is raised, which is the one
+        // thing that would have fixed it.
+        assert!(
+            !is_a_fact_about_the_file(&ExtractError::ResponseTooLarge { bytes: 1, limit: 0 }),
+            "a limit is our configuration, not a property of the document",
+        );
+        assert!(!is_a_fact_about_the_file(&ExtractError::Tika(
+            "timed out".to_owned()
+        )));
+        // And the three that really are about the file stay cached.
+        assert!(is_a_fact_about_the_file(&ExtractError::Empty));
+        assert!(is_a_fact_about_the_file(&ExtractError::Truncated));
+        assert!(is_a_fact_about_the_file(&ExtractError::TooLarge {
+            bytes: 1,
+            limit: 0
+        }));
+    }
+
+    #[test]
+    fn a_rescheduled_job_is_not_reported_as_parked() {
+        // The summary once counted every failure as `parked`, so a run that had
+        // merely retried a document reported it as given up on — and `failed/`
+        // was empty, which is the contradiction that hid a real failure for a
+        // whole backfill.
+        assert_ne!(
+            std::mem::discriminant(&Outcome::Rescheduled),
+            std::mem::discriminant(&Outcome::Parked),
+        );
+        let mut c = Counters::default();
+        match Outcome::Rescheduled {
+            Outcome::Rescheduled => c.rescheduled += 1,
+            Outcome::Parked => c.parked += 1,
+            _ => unreachable!(),
+        }
+        assert_eq!((c.rescheduled, c.parked), (1, 0));
+    }
 
     // ── Prefill ─────────────────────────────────────────────────────────────
 

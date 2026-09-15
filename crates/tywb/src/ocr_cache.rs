@@ -271,8 +271,13 @@ impl OcrCache {
             }
             return JobRetry::Parked;
         }
-        debug!(digest = %job.digest, url = %job.url, attempts, reason,
-               "extraction failed — job rescheduled");
+        // Warn, not debug: a job that failed and will be tried again is the one
+        // thing about this cache that an operator needs to see, and the reason
+        // lives only in this line. It is rare enough not to be noise — and the
+        // alternative is a document silently missing from the index, with the
+        // cause reachable only at `RUST_LOG=debug`.
+        warn!(digest = %job.digest, url = %job.url, attempts, reason,
+              "extraction failed — job rescheduled");
         let mut job = job.clone();
         job.attempts = attempts;
         let body =

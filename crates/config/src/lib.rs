@@ -361,6 +361,10 @@ pub struct TikaOverride {
     /// connection instead of a deadline.
     #[serde(default)]
     pub timeout_secs: Option<u64>,
+    /// Ceiling on Tika's response, for a collection whose documents are large
+    /// enough that the default does not fit.
+    #[serde(default)]
+    pub max_response_bytes: Option<usize>,
 }
 
 impl TikaConfig {
@@ -381,6 +385,7 @@ impl TikaConfig {
                 .unwrap_or_else(|| self.ocr_languages.clone()),
             max_pdf_bytes: o.max_pdf_bytes.unwrap_or(self.max_pdf_bytes),
             timeout_secs: o.timeout_secs.unwrap_or(self.timeout_secs),
+            max_response_bytes: o.max_response_bytes.unwrap_or(self.max_response_bytes),
         }
     }
 
@@ -405,6 +410,7 @@ impl TikaConfig {
                 .unwrap_or_else(|| self.ocr_languages.clone()),
             max_pdf_bytes: o.max_pdf_bytes.unwrap_or(self.max_pdf_bytes),
             timeout_secs: o.timeout_secs.unwrap_or(self.timeout_secs),
+            max_response_bytes: o.max_response_bytes.unwrap_or(self.max_response_bytes),
         }
     }
 }
@@ -444,6 +450,10 @@ pub struct WorkerTikaConfig {
     /// into a failure on big scans; raise it here rather than for the indexer.
     #[serde(default)]
     pub timeout_secs: Option<u64>,
+    /// Ceiling on Tika's response. The worker is where the big documents go, so
+    /// this is where the limit most often needs raising.
+    #[serde(default)]
+    pub max_response_bytes: Option<usize>,
 }
 
 /// Configuration for the optional Apache Tika text-extraction backend.
@@ -468,6 +478,19 @@ pub struct TikaConfig {
     /// can be slow, so this is generous. Default 300.
     #[serde(default = "default_tika_timeout_secs")]
     pub timeout_secs: u64,
+    /// Ceiling on Tika's *response*, in bytes. Default 64 MiB.
+    ///
+    /// Separate from [`max_pdf_bytes`], and easy to forget: the answer is not
+    /// proportional to the question. A large volume's text can be small, and a
+    /// modest scan's markup is not — with `ocr_cache.keep_xhtml` Tika returns a
+    /// span per OCR'd word, so the response of a 400-page volume runs well past
+    /// the 10 MiB that `ureq::Response::into_string` silently caps at. Over the
+    /// limit the document is reported with the number to raise, not cached as
+    /// having no text.
+    ///
+    /// [`max_pdf_bytes`]: Self::max_pdf_bytes
+    #[serde(default = "default_max_response_bytes")]
+    pub max_response_bytes: usize,
 }
 
 impl Default for TikaConfig {
@@ -478,6 +501,7 @@ impl Default for TikaConfig {
             ocr_languages: default_tika_ocr_languages(),
             max_pdf_bytes: default_max_pdf_bytes(),
             timeout_secs: default_tika_timeout_secs(),
+            max_response_bytes: default_max_response_bytes(),
         }
     }
 }
@@ -933,6 +957,9 @@ fn default_max_pdf_bytes() -> usize {
 fn default_tika_timeout_secs() -> u64 {
     300
 }
+fn default_max_response_bytes() -> usize {
+    64 * 1024 * 1024
+}
 fn default_collection_type() -> String {
     "pdf_bucket".to_owned()
 }
@@ -1237,6 +1264,58 @@ indexer:
         let merged = TikaConfig::default().with_worker_override(over);
         assert_eq!(merged.url, "http://worker:9998");
         assert_eq!(merged.timeout_secs, 300, "defaults fill in the rest");
+    }
+
+    #[test]
+    fn the_response_ceiling_has_a_default_and_can_be_raised_per_worker() {
+        // ureq caps `into_string()` at a hardcoded 10 MiB, so the default has to
+        // sit well above it, and the worker — which is where the big volumes go
+        // — has to be able to raise it without restating the backend.
+        let cfg = Config::from_yaml(
+            "s3:\n  bucket: warc\nindexer:\n  tika:\n    url: 'http://127.0.0.1:9998'\n  \
+             ocr_cache:\n    path: /tmp/c\n    tika:\n      max_response_bytes: 268435456\n",
+        )
+        .unwrap();
+        let global = cfg.indexer.tika.as_ref().unwrap();
+        assert_eq!(
+            global.max_response_bytes,
+            64 * 1024 * 1024,
+            "the default is above ureq's 10 MiB, not at it",
+        );
+        let merged = global.with_worker_override(
+            cfg.indexer
+                .ocr_cache
+                .as_ref()
+                .unwrap()
+                .tika
+                .as_ref()
+                .unwrap(),
+        );
+        assert_eq!(
+            merged.max_response_bytes, 268435456,
+            "raised for the worker"
+        );
+        assert_eq!(
+            merged.url, "http://127.0.0.1:9998",
+            "and nothing else moved"
+        );
+        assert_eq!(merged.timeout_secs, 300);
+    }
+
+    #[test]
+    fn a_collection_can_raise_its_response_ceiling_too() {
+        let cfg = Config::from_yaml(COLLECTION_YAML).unwrap();
+        let tika = cfg.indexer.tika.as_ref().unwrap();
+        let over = TikaOverride {
+            max_response_bytes: Some(128 * 1024 * 1024),
+            ..TikaOverride::default()
+        };
+        let merged = tika.with_override(&over);
+        assert_eq!(merged.max_response_bytes, 128 * 1024 * 1024);
+        assert_eq!(
+            merged.url, tika.url,
+            "a collection still cannot move the URL"
+        );
     }
 
     #[test]
