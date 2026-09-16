@@ -39,6 +39,36 @@ It is designed to be published as a standalone crate on crates.io later.
 
 ---
 
+## Version control — jj, never git
+
+This is a colocated Jujutsu checkout (`.jj` beside `.git`). Use `jj` for
+everything; do not `git commit`, `git tag` or `git push`.
+
+```bash
+jj st                            # status; also imports anything git did
+jj describe -m "…"               # message for the current change (amends in place)
+jj new                           # start the next change
+jj log -r 'ancestors(@, 10)'
+jj tag set v0.4.0 -r @           # release tags — jj has native tag support
+jj bookmark set main -r @        # `main` is a bookmark, not a branch
+jj git push                      # publishes bookmarks and tags to origin
+```
+
+Commits made with `git` are imported on the next `jj` invocation, so mixing does
+not lose work — it just leaves two histories to read. The working copy is always
+a commit (usually an empty one) on top of `main`; describing it and moving the
+bookmark is the whole of a commit.
+
+Push the tag along with the bookmark: the Ansible deploy checks out
+`-e tywb_git_version=v0.3.0` from the forge remote, so a tag that exists only
+here does not exist for production.
+
+The ops repo (`~/forge/my_ansible`, playbooks and config templates) has **no**
+version control at all — edits there are on-disk only, with no history and no
+rollback beyond the `backup: true` copy the play leaves on the target host.
+
+---
+
 ## Build
 
 ```bash
