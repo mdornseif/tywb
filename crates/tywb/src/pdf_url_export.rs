@@ -418,7 +418,10 @@ pub async fn run(cfg: Config, args: ExportArgs) -> anyhow::Result<()> {
     };
 
     let s3 = build_client(&cfg.s3).await;
-    info!(bucket = %exp.bucket, key = %exp.key, "uploading the PDF URL list");
+    // The key is named by `upload` once resolved. Logging the pattern here as
+    // well would put two different object names in one run's log, and the one
+    // that is not the object is the one somebody greps for.
+    info!(bucket = %exp.bucket, urls = report.urls.len(), "uploading the PDF URL list");
     upload(&s3, &cfg.indexer.pdf_url_export, &report.urls).await;
 
     Ok(())
